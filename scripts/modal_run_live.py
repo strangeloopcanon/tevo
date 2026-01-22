@@ -31,6 +31,10 @@ HF_VOL = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
 
 def _ignore_repo_path(path: Path) -> bool:
     # Keep the image small and avoid bundling local artifacts.
+    if path.name.startswith(".env"):
+        return True
+    if path.name in {".coverage", "htmlcov"}:
+        return True
     parts = set(path.parts)
     blocked = {
         ".git",
