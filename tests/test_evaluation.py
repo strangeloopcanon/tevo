@@ -1,4 +1,4 @@
-from transformer_evolution_llm.dsl import ArchitectureSpec
+from transformer_evolution_llm.dsl import ArchitectureSpec, HyperConnectionsConfig
 from transformer_evolution_llm.evaluation import (
     StaticChecker,
     estimate_params,
@@ -42,3 +42,14 @@ def test_static_checker_sparsity_bounds(tiny_spec: ArchitectureSpec) -> None:
     assert not result2.ok
     assert any("local_global requires positive sliding_window" in r for r in result2.reasons)
     assert any("local_global requires 0 < global_stride <= seq_len" in r for r in result2.reasons)
+
+
+def test_estimate_params_includes_hyper_connections(tiny_spec: ArchitectureSpec) -> None:
+    base = estimate_params(tiny_spec)
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.hyper = HyperConnectionsConfig(
+        streams=4, diag_bias=4.0, noise_std=0.0, update_scale=4.0
+    )
+    hyper = estimate_params(spec)
+    expected = float(spec.model.n_layers * (4 * 4 + 2 * 4) + 4)
+    assert hyper == base + expected

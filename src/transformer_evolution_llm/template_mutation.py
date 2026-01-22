@@ -27,7 +27,21 @@ from .dsl import (
     SSMConfig,
 )
 
-TEMPLATE_PATH = Path("configs/mutation_templates.yaml")
+TEMPLATE_PATH_DEFAULT = Path("configs/mutation_templates.yaml")
+TEMPLATE_PATH_ACTIVE = TEMPLATE_PATH_DEFAULT
+
+_TEMPLATE_LEARNING_ENABLED = False
+_TEMPLATE_LEARNING_ETA = 0.2
+_TEMPLATE_LEARNING_MIN_WEIGHT = 0.05
+_TEMPLATE_LEARNING_MAX_WEIGHT = 5.0
+_TEMPLATE_LEARNING_MAX_TEMPLATES = 128
+_TEMPLATE_LEARNING_SAVE_EVERY = 20
+_TEMPLATE_LEARNING_PROMOTE_MIN_DELTA = 0.0
+_TEMPLATE_LEARNING_UPDATES = 0
+_TEMPLATE_LEARNING_DIRTY = False
+_TEMPLATE_WEIGHT_OVERRIDES: dict[str, float] = {}
+_TEMPLATE_RECENT: dict[str, MutationTemplate] = {}
+_TEMPLATE_POSITIVE: dict[str, int] = {}
 
 
 class TemplateAction(TypedDict, total=False):
@@ -66,11 +80,19 @@ class MutationTemplate:
     conditions: dict[str, Any]
     actions: list[ActionMap]
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "weight": float(self.weight),
+            "conditions": self.conditions,
+            "actions": self.actions,
+        }
+
 
 def load_templates() -> list[MutationTemplate]:
-    if not TEMPLATE_PATH.exists():
+    if not TEMPLATE_PATH_ACTIVE.exists():
         return _seed_templates()
-    data = yaml.safe_load(TEMPLATE_PATH.read_text())
+    data = yaml.safe_load(TEMPLATE_PATH_ACTIVE.read_text())
     templates = []
     for entry in data.get("templates", []):
         templates.append(
@@ -84,7 +106,105 @@ def load_templates() -> list[MutationTemplate]:
     return templates
 
 
-def apply_template_mutation(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+def configure_template_learning(
+    *,
+    enabled: bool,
+    path: Path = TEMPLATE_PATH_DEFAULT,
+    eta: float = 0.2,
+    min_weight: float = 0.05,
+    max_weight: float = 5.0,
+    max_templates: int = 128,
+    save_every: int = 20,
+    promote_min_delta: float = 0.0,
+) -> None:
+    global TEMPLATE_PATH_ACTIVE
+    global _TEMPLATE_LEARNING_ENABLED
+    global _TEMPLATE_LEARNING_ETA
+    global _TEMPLATE_LEARNING_MIN_WEIGHT
+    global _TEMPLATE_LEARNING_MAX_WEIGHT
+    global _TEMPLATE_LEARNING_MAX_TEMPLATES
+    global _TEMPLATE_LEARNING_SAVE_EVERY
+    global _TEMPLATE_LEARNING_PROMOTE_MIN_DELTA
+    global _TEMPLATE_LEARNING_UPDATES
+    global _TEMPLATE_LEARNING_DIRTY
+
+    TEMPLATE_PATH_ACTIVE = Path(path)
+    _TEMPLATE_LEARNING_ENABLED = bool(enabled)
+    _TEMPLATE_LEARNING_ETA = float(eta)
+    _TEMPLATE_LEARNING_MIN_WEIGHT = float(min_weight)
+    _TEMPLATE_LEARNING_MAX_WEIGHT = float(max_weight)
+    _TEMPLATE_LEARNING_MAX_TEMPLATES = int(max_templates)
+    _TEMPLATE_LEARNING_SAVE_EVERY = int(save_every)
+    _TEMPLATE_LEARNING_PROMOTE_MIN_DELTA = float(promote_min_delta)
+    _TEMPLATE_LEARNING_UPDATES = 0
+    _TEMPLATE_LEARNING_DIRTY = False
+    _TEMPLATE_WEIGHT_OVERRIDES.clear()
+    _TEMPLATE_RECENT.clear()
+    _TEMPLATE_POSITIVE.clear()
+
+    if _TEMPLATE_LEARNING_ENABLED and not TEMPLATE_PATH_ACTIVE.exists():
+        _persist_templates(_seed_templates())
+
+
+def flush_template_learning() -> None:
+    if not _TEMPLATE_LEARNING_ENABLED:
+        return
+    if not _TEMPLATE_LEARNING_DIRTY:
+        return
+    merged = _merge_persisted_templates(load_templates())
+    _persist_templates(merged)
+
+
+def record_template_result(template_name: str, delta: float) -> None:
+    global _TEMPLATE_LEARNING_UPDATES
+    global _TEMPLATE_LEARNING_DIRTY
+
+    if not _TEMPLATE_LEARNING_ENABLED:
+        return
+
+    improved = float(delta) > float(_TEMPLATE_LEARNING_PROMOTE_MIN_DELTA)
+    templates = load_templates()
+    by_name: dict[str, MutationTemplate] = {tpl.name: tpl for tpl in templates}
+    tpl = by_name.get(template_name)
+    if tpl is None:
+        candidate = _TEMPLATE_RECENT.get(template_name)
+        if candidate is None or not improved:
+            return
+        tpl = MutationTemplate(
+            name=candidate.name,
+            weight=float(candidate.weight),
+            conditions=candidate.conditions,
+            actions=candidate.actions,
+        )
+        templates.append(tpl)
+        by_name[tpl.name] = tpl
+
+    current = float(_TEMPLATE_WEIGHT_OVERRIDES.get(template_name, tpl.weight))
+    eta = max(0.0, min(1.0, float(_TEMPLATE_LEARNING_ETA)))
+    if improved:
+        updated = current * (1.0 + eta)
+        _TEMPLATE_POSITIVE[template_name] = int(_TEMPLATE_POSITIVE.get(template_name, 0)) + 1
+    else:
+        updated = current * (1.0 - eta)
+    updated = max(
+        float(_TEMPLATE_LEARNING_MIN_WEIGHT),
+        min(float(_TEMPLATE_LEARNING_MAX_WEIGHT), updated),
+    )
+    _TEMPLATE_WEIGHT_OVERRIDES[template_name] = updated
+    by_name[template_name].weight = updated
+
+    templates = _cap_templates(list(by_name.values()))
+    _TEMPLATE_LEARNING_UPDATES += 1
+    _TEMPLATE_LEARNING_DIRTY = True
+    if _TEMPLATE_LEARNING_UPDATES % max(1, int(_TEMPLATE_LEARNING_SAVE_EVERY)) == 0:
+        merged = _merge_persisted_templates(templates)
+        _persist_templates(merged)
+        _TEMPLATE_LEARNING_DIRTY = False
+
+
+def apply_template_mutation_with_name(
+    spec: ArchitectureSpec, rng: random.Random
+) -> tuple[str, ArchitectureSpec]:
     base_templates = load_templates()
     dynamic_templates: list[MutationTemplate] = []
     for tpl in base_templates:
@@ -94,12 +214,59 @@ def apply_template_mutation(spec: ArchitectureSpec, rng: random.Random) -> Archi
     templates = base_templates + dynamic_templates
     eligible = [tpl for tpl in templates if _matches_conditions(spec, tpl.conditions)]
     if not eligible:
-        return spec
-    template = rng.choices(eligible, weights=[tpl.weight for tpl in eligible], k=1)[0]
+        return "none", spec
+    weights = [float(_TEMPLATE_WEIGHT_OVERRIDES.get(tpl.name, tpl.weight)) for tpl in eligible]
+    template = rng.choices(eligible, weights=weights, k=1)[0]
     new_spec = spec.model_copy(deep=True)
     for action in template.actions:
         _apply_action(new_spec, action, rng)
-    return new_spec
+    _TEMPLATE_RECENT[template.name] = template
+    return template.name, new_spec
+
+
+def apply_template_mutation(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    _, mutated = apply_template_mutation_with_name(spec, rng)
+    return mutated
+
+
+def _merge_persisted_templates(templates: list[MutationTemplate]) -> list[MutationTemplate]:
+    merged: dict[str, MutationTemplate] = {tpl.name: tpl for tpl in templates}
+    for name, tpl in _TEMPLATE_RECENT.items():
+        if name in merged:
+            continue
+        if int(_TEMPLATE_POSITIVE.get(name, 0)) <= 0:
+            continue
+        merged[name] = MutationTemplate(
+            name=tpl.name,
+            weight=float(_TEMPLATE_WEIGHT_OVERRIDES.get(name, tpl.weight)),
+            conditions=tpl.conditions,
+            actions=tpl.actions,
+        )
+    return _cap_templates(list(merged.values()))
+
+
+def _cap_templates(templates: list[MutationTemplate]) -> list[MutationTemplate]:
+    cap = int(_TEMPLATE_LEARNING_MAX_TEMPLATES)
+    if cap <= 0 or len(templates) <= cap:
+        return templates
+    protected = {tpl.name for tpl in templates if tpl.name.startswith("seed-")}
+    removable = [tpl for tpl in templates if tpl.name not in protected]
+    removable.sort(key=lambda tpl: float(getattr(tpl, "weight", 0.0)))
+    keep = list(templates)
+    drop_n = max(0, len(templates) - cap)
+    dropped = 0
+    for tpl in removable:
+        if dropped >= drop_n:
+            break
+        keep = [k for k in keep if k.name != tpl.name]
+        dropped += 1
+    return keep
+
+
+def _persist_templates(templates: list[MutationTemplate]) -> None:
+    payload = {"templates": [tpl.to_dict() for tpl in templates]}
+    TEMPLATE_PATH_ACTIVE.parent.mkdir(parents=True, exist_ok=True)
+    TEMPLATE_PATH_ACTIVE.write_text(yaml.safe_dump(payload, sort_keys=False))
 
 
 def _matches_conditions(spec: ArchitectureSpec, conditions: dict[str, Any]) -> bool:
@@ -240,6 +407,13 @@ def _add_extra(spec: ArchitectureSpec, params: TemplateAction, rng: random.Rando
                     "source_block": source,
                     "strength": extra_params.get("strength", 0.1),
                 },
+            )
+        )
+    elif extra_type == "graph_module":
+        block.extras.append(
+            CustomModuleConfig(
+                name="graph_module",
+                params={"ops": [{"op": "rmsnorm"}, {"op": "mlp", "hidden_mult": 2.0}]},
             )
         )
     else:
@@ -410,6 +584,7 @@ def _generate_random_template(spec: ArchitectureSpec, rng: random.Random) -> Mut
                         "branch_router",
                         "layer_scale",
                         "feedback",
+                        "graph_module",
                     ]
                 ),
                 "params": {

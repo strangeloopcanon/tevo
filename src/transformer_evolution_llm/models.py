@@ -19,6 +19,7 @@ from .dsl import (
     ChunkMemoryConfig,
     CustomModuleConfig,
     GatedModuleConfig,
+    HyperConnectionsConfig,
     LayerScaleConfig,
     MemoryTokensConfig,
     ModelConfig,
@@ -1009,6 +1010,11 @@ class EvolutionBlock(nn.Module):
         return x.new_tensor(1.0)
 
     def forward(self, x: Tensor) -> Tensor:
+        return x + self.delta(x)
+
+    def delta(self, x: Tensor) -> Tensor:
+        """Return the block's residual update (x_out - x_in)."""
+        x_in = x
         if self.router is None:
             if self.attn:
                 out = self.attn(self.norm(x))
@@ -1028,7 +1034,7 @@ class EvolutionBlock(nn.Module):
                 x = x + out * self._gate_scale("memory", out)
             for extra in self.extras:
                 x = x + extra(self.norm(x))  # nosec B610 - pure tensor gating, no SQL context
-            return x
+            return cast(Tensor, x - x_in)
 
         x_norm = self.norm(x)
         weights = self.router(x_norm)
@@ -1052,7 +1058,70 @@ class EvolutionBlock(nn.Module):
         x = x + mixed
         for extra in self.extras:
             x = x + extra(self.norm(x))  # nosec B610 - pure tensor gating, no SQL context
-        return x
+        return cast(Tensor, x - x_in)
+
+
+class HyperConnections(nn.Module):
+    """Hyper-residual controller: N residual lanes + per-layer mixing."""
+
+    def __init__(self, cfg: HyperConnectionsConfig, *, layers: int, dim: int):
+        super().__init__()
+        self.streams = int(getattr(cfg, "streams", 1) or 1)
+        self.layers = int(layers)
+        self.dim = int(dim)
+        self.update_scale = float(getattr(cfg, "update_scale", 1.0) or 1.0)
+        self.diag_bias = float(getattr(cfg, "diag_bias", 4.0) or 4.0)
+        self.noise_std = float(getattr(cfg, "noise_std", 0.0) or 0.0)
+
+        self.pre_logits = nn.Parameter(torch.zeros(self.layers, self.streams))
+        self.post_logits = nn.Parameter(torch.zeros(self.layers, self.streams))
+        self.res_logits = nn.Parameter(torch.zeros(self.layers, self.streams, self.streams))
+        self.out_logits = nn.Parameter(torch.zeros(self.streams))
+
+        self._init_logits()
+
+    def _init_logits(self) -> None:
+        if self.layers <= 0 or self.streams <= 1:
+            return
+        with torch.no_grad():
+            self.pre_logits.zero_()
+            self.post_logits.zero_()
+            self.out_logits.zero_()
+            self.res_logits.zero_()
+            eye = torch.eye(self.streams)
+            self.res_logits.add_(eye[None, :, :] * self.diag_bias)
+            if self.noise_std > 0.0:
+                self.pre_logits.add_(torch.randn_like(self.pre_logits) * self.noise_std)
+                self.post_logits.add_(torch.randn_like(self.post_logits) * self.noise_std)
+                self.out_logits.add_(torch.randn_like(self.out_logits) * self.noise_std)
+                self.res_logits.add_(torch.randn_like(self.res_logits) * self.noise_std)
+
+    def enabled(self) -> bool:
+        return self.streams > 1
+
+    def init_streams(self, x: Tensor) -> Tensor:
+        # x: (B, T, D) -> (B, T, N, D)
+        return x.unsqueeze(2).repeat(1, 1, self.streams, 1)
+
+    def _pre(self, layer_idx: int, *, ref: Tensor) -> Tensor:
+        weights = torch.softmax(self.pre_logits[layer_idx], dim=-1)
+        return weights.to(dtype=ref.dtype, device=ref.device)
+
+    def _post(self, layer_idx: int, *, ref: Tensor) -> Tensor:
+        weights = torch.softmax(self.post_logits[layer_idx], dim=-1)
+        return weights.to(dtype=ref.dtype, device=ref.device)
+
+    def _res(self, layer_idx: int, *, ref: Tensor) -> Tensor:
+        # Row-normalized mixing (each row sums to 1).
+        weights = torch.softmax(self.res_logits[layer_idx], dim=-1)
+        return weights.to(dtype=ref.dtype, device=ref.device)
+
+    def readout(self, streams: Tensor) -> Tensor:
+        # streams: (B, T, N, D) -> (B, T, D)
+        weights = torch.softmax(self.out_logits, dim=-1).to(
+            dtype=streams.dtype, device=streams.device
+        )
+        return cast(Tensor, (streams * weights.view(1, 1, -1, 1)).sum(dim=2))
 
 
 class EvolutionModel(nn.Module):
@@ -1069,6 +1138,10 @@ class EvolutionModel(nn.Module):
         self.blocks = nn.ModuleList(
             [EvolutionBlock(cfg.emb.dim, block, norm_type=cfg.norm) for block in cfg.blocks]
         )
+        self.hyper: HyperConnections | None = None
+        hyper_cfg = getattr(cfg, "hyper", None)
+        if isinstance(hyper_cfg, HyperConnectionsConfig) and hyper_cfg.streams > 1:
+            self.hyper = HyperConnections(hyper_cfg, layers=len(cfg.blocks), dim=cfg.emb.dim)
         self.norm = _norm_layer(cfg.norm, cfg.emb.dim)
         self.lm_head = nn.Linear(cfg.emb.dim, cfg.head.vocab)
         if self.lm_head.bias is not None:
@@ -1086,11 +1159,14 @@ class EvolutionModel(nn.Module):
         )
         self.recurrence_adapters = nn.ModuleList()
         self.recurrence_steps: dict[int, int] = {}
+        recurrence_dim = cfg.emb.dim
+        if self.hyper is not None and self.hyper.enabled():
+            recurrence_dim = cfg.emb.dim * self.hyper.streams
         for idx, rec_cfg in self._recurrence_order:
-            concat_dim = cfg.emb.dim * 2 if rec_cfg.concat_prelude else cfg.emb.dim
+            concat_dim = recurrence_dim * 2 if rec_cfg.concat_prelude else recurrence_dim
             adapter = RecurrenceAdapter(
                 input_dim=concat_dim,
-                dim=cfg.emb.dim,
+                output_dim=recurrence_dim,
                 kind=rec_cfg.adapter,
             )
             self.recurrence_adapters.append(adapter)
@@ -1099,6 +1175,31 @@ class EvolutionModel(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         x = self.embed(input_ids)
         x = cast(Tensor, self.emb_dropout(x))
+        if self.hyper is not None and self.hyper.enabled():
+            streams = self.hyper.init_streams(x)
+            if not self._recurrence_order:
+                for idx, block in enumerate(self.blocks):
+                    streams = self._run_hyper_block(idx, cast(EvolutionBlock, block), streams)
+            else:
+                idx = 0
+                order_pos = 0
+                while idx < len(self.blocks):
+                    if (
+                        order_pos < len(self._recurrence_order)
+                        and idx == self._recurrence_order[order_pos][1].start
+                    ):
+                        spec_idx, rec_cfg = self._recurrence_order[order_pos]
+                        streams = self._run_recurrence_hyper(spec_idx, rec_cfg, streams)
+                        idx = rec_cfg.end
+                        order_pos += 1
+                        continue
+                    streams = self._run_hyper_block(
+                        idx, cast(EvolutionBlock, self.blocks[idx]), streams
+                    )
+                    idx += 1
+            x = self.hyper.readout(streams)
+            x = self.norm(x)
+            return cast(Tensor, self.lm_head(x))
         if not self._recurrence_order:
             for block in self.blocks:
                 x = self._run_block(block, x)
@@ -1134,6 +1235,33 @@ class EvolutionModel(nn.Module):
                 return cast(Tensor, checkpoint(block, x))
         return cast(Tensor, block(x))
 
+    def _run_hyper_block(self, layer_idx: int, block: EvolutionBlock, streams: Tensor) -> Tensor:
+        if self.hyper is None:
+            raise RuntimeError("hyper block requested without hyper configuration")
+        if self._grad_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+
+            def _fn(state: Tensor) -> Tensor:
+                return self._hyper_step(layer_idx, block, state)
+
+            try:
+                return cast(Tensor, checkpoint(_fn, streams, use_reentrant=False))
+            except TypeError:
+                return cast(Tensor, checkpoint(_fn, streams))
+        return self._hyper_step(layer_idx, block, streams)
+
+    def _hyper_step(self, layer_idx: int, block: EvolutionBlock, streams: Tensor) -> Tensor:
+        if self.hyper is None:
+            raise RuntimeError("hyper step requested without hyper configuration")
+        pre = self.hyper._pre(layer_idx, ref=streams)
+        x_pre = cast(Tensor, (streams * pre.view(1, 1, -1, 1)).sum(dim=2))
+        delta = block.delta(x_pre)
+        post = self.hyper._post(layer_idx, ref=streams)
+        update = delta.unsqueeze(2) * post.view(1, 1, -1, 1) * float(self.hyper.update_scale)
+        res = self.hyper._res(layer_idx, ref=streams)
+        mixed = torch.einsum("ij,btjd->btid", res, streams)
+        return cast(Tensor, mixed + update)
+
     def set_recurrence_steps(self, steps: dict[int, int]) -> None:
         for idx, value in steps.items():
             self.recurrence_steps[idx] = max(1, int(value))
@@ -1160,6 +1288,38 @@ class EvolutionModel(nn.Module):
             state = adapter(adapter_input, h)
         return state
 
+    def _run_recurrence_hyper(
+        self,
+        spec_idx: int,
+        rec_cfg: RecurrenceConfig,
+        prelude_output: Tensor,
+    ) -> Tensor:
+        if self.hyper is None or not self.hyper.enabled():
+            raise RuntimeError("hyper recurrence requested without hyper configuration")
+        end_idx = min(rec_cfg.end, len(self.blocks))
+        start_idx = min(rec_cfg.start, max(0, end_idx - 1))
+        if end_idx - start_idx <= 1:
+            return prelude_output
+        current_steps = max(1, self.recurrence_steps.get(spec_idx, rec_cfg.train_recurrence))
+        state = self._init_recurrence_state(rec_cfg, prelude_output)
+        adapter = self.recurrence_adapters[self._adapter_position(spec_idx)]
+        b, t, n, d = prelude_output.shape
+        flat_dim = n * d
+        prelude_flat = prelude_output.reshape(b, t, flat_dim)
+        for _ in range(current_steps):
+            h = state
+            for block_idx in range(start_idx, end_idx):
+                h = self._run_hyper_block(
+                    block_idx, cast(EvolutionBlock, self.blocks[block_idx]), h
+                )
+            h_flat = h.reshape(b, t, flat_dim)
+            adapter_input = (
+                torch.cat([prelude_flat, h_flat], dim=-1) if rec_cfg.concat_prelude else h_flat
+            )
+            state_flat = adapter(adapter_input, h_flat)
+            state = state_flat.view(b, t, n, d)
+        return state
+
     def _init_recurrence_state(self, cfg: RecurrenceConfig, reference: Tensor) -> Tensor:
         if cfg.init_state == "noise":
             return cast(Tensor, torch.randn_like(reference) * cfg.noise_std)
@@ -1173,14 +1333,14 @@ class EvolutionModel(nn.Module):
 
 
 class RecurrenceAdapter(nn.Module):
-    def __init__(self, input_dim: int, dim: int, kind: str = "linear"):
+    def __init__(self, input_dim: int, output_dim: int, kind: str = "linear"):
         super().__init__()
         self.kind = kind
         if kind == "linear":
-            self.proj = nn.Linear(input_dim, dim)
+            self.proj = nn.Linear(input_dim, output_dim)
         elif kind == "gated":
-            self.val = nn.Linear(input_dim, dim)
-            self.gate = nn.Linear(input_dim, dim)
+            self.val = nn.Linear(input_dim, output_dim)
+            self.gate = nn.Linear(input_dim, output_dim)
         else:
             raise ValueError(f"Unsupported adapter kind '{kind}'")
 

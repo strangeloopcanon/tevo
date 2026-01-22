@@ -23,6 +23,8 @@ The goal is to use laptop-scale surrogates (~65–100M params) as a fast "archit
 - **Weight Inheritance**: "Lamarckian" evolution where child models inherit trained weights from parents, significantly reducing the compute needed to validate new designs.
 - **Multi-Objective Optimization**: Uses Pareto frontiers to trade off conflicting goals like Perplexity vs. Throughput vs. Parameter Count.
 - **Rich Mutation Primitives**: Includes structural mutations (add/remove blocks, split layers), component swaps (Attention ↔ MoE ↔ SSM), and hyperparameter tuning.
+- **Template Learning (experimental)**: Optionally adjusts and persists mutation templates based on which template mutations improve objectives (`evolution.template_learning`, `evolution.template_learning_save_path`).
+- **Graph Module Primitive (experimental)**: A built-in `graph_module` component that can be inserted as a custom extra so search can explore small operator graphs, not just fixed blocks.
 - **Audit Lineage**: Every discovery comes with a full JSON lineage and visualization tools, explaining exactly *how* a specific architecture was derived.
 
 ## Installation
@@ -102,6 +104,28 @@ If you want to archive the discovered specs and reclaim disk immediately after t
 
 ```bash
 python scripts/archive_run.py "$RUN" --delete-checkpoints
+```
+
+## Run Folder: What’s What
+
+Each run directory under `runs/` is self-contained. The key artifacts are:
+
+- `frontier.json`: The final Pareto frontier (the candidates worth looking at). Each entry includes a full `spec` (the architecture), `metrics`, and an `id`.
+- `frontier_lineage.json`: The full genealogy graph (parents, mutations/crossover, checkpoints, and whether nodes completed). Use this to explain *how* an architecture was derived.
+- `frontier.manifest.json`: Run metadata (config path, generations/steps, device, git commit, output paths).
+- `frontier.state.json`: Internal search state (archive/map-elites bins, RNG state, etc). Useful for debugging/restarts; not usually needed for sharing results.
+- `checkpoints/`: Training checkpoints (often pruned down to just frontier members if `--prune-checkpoints-to-frontier` was used).
+- `live.log`: Full run log (training/eval events, errors, throughput, etc).
+- `motifs.txt`: A human-readable motif summary (attempted vs completed vs frontier coverage).
+
+Helpful commands:
+
+```bash
+# Motif summary + example IDs
+python scripts/report_motifs.py runs/<RUN>/frontier.json --lineage runs/<RUN>/frontier_lineage.json --top 15
+
+# Reclaim disk after you’ve archived what you want
+python scripts/archive_run.py runs/<RUN> --delete-checkpoints
 ```
 
 ## System Architecture

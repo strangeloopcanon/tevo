@@ -303,6 +303,31 @@ class ResidualConfig(BaseModel):
         return self
 
 
+class HyperConnectionsConfig(BaseModel):
+    """Hyper-residual stream configuration.
+
+    When enabled (streams > 1), the model maintains multiple residual "lanes"
+    and learns per-layer mixing weights that generalize standard residual
+    connections. The runtime wiring lives in ``models.py``.
+    """
+
+    streams: int = Field(default=1, ge=1, le=16)
+    diag_bias: float = Field(
+        default=4.0,
+        ge=0.0,
+        description=(
+            "Initialization bias for the diagonal of H_res logits "
+            "(higher => closer to identity)."
+        ),
+    )
+    noise_std: float = Field(
+        default=1e-3,
+        ge=0.0,
+        description="Stddev of initialization noise added to hyper mixing logits.",
+    )
+    update_scale: float = Field(default=1.0, ge=0.0)
+
+
 class HierarchyLevelConfig(BaseModel):
     """One hierarchy level (declarative)."""
 
@@ -730,6 +755,7 @@ class ModelConfig(BaseModel):
     blocks: list[BlockConfig]
     head: HeadConfig
     norm: Literal["layernorm", "rmsnorm"] = "layernorm"
+    hyper: HyperConnectionsConfig | None = None
     kv_policy: KVPolicyConfig | None = None
     macro: MacroConfig | None = None
     recurrences: list[RecurrenceConfig] = Field(default_factory=list)
@@ -781,6 +807,15 @@ class EvolutionConfig(BaseModel):
     adaptive_mutation_min_weight: float = Field(default=0.05, gt=0.0)
     adaptive_mutation_max_weight: float = Field(default=5.0, gt=0.0)
     weight_inheritance: Literal["parent", "init", "scratch"] = "parent"
+    # Operator invention v1: learn weights for mutation templates and optionally persist/promote
+    template_learning: bool = False
+    template_learning_eta: float = Field(default=0.2, gt=0.0, le=1.0)
+    template_learning_min_weight: float = Field(default=0.05, gt=0.0)
+    template_learning_max_weight: float = Field(default=5.0, gt=0.0)
+    template_learning_max_templates: int = Field(default=128, ge=0)
+    template_learning_save_every: int = Field(default=20, ge=1)
+    template_learning_save_path: str = "configs/mutation_templates.yaml"
+    template_learning_promote_min_delta: float = Field(default=0.0)
 
     @model_validator(mode="after")
     def validate_rung_tokens(self) -> EvolutionConfig:
@@ -810,6 +845,8 @@ class ArchitectureSpec(BaseModel):
 
     def summary(self) -> dict[str, Any]:
         """Return a JSON-friendly summary for logging."""
+        hyper = getattr(self.model, "hyper", None)
+        hyper_streams = int(getattr(hyper, "streams", 1) or 1) if hyper is not None else 1
         return {
             "name": self.model.name,
             "layers": self.model.n_layers,
@@ -817,6 +854,7 @@ class ArchitectureSpec(BaseModel):
             "seq_len": self.data.seq_len,
             "population": self.evolution.population,
             "custom_modules": sum(len(block.extras) for block in self.model.blocks),
+            "hyper_streams": hyper_streams,
         }
 
 

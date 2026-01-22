@@ -59,6 +59,38 @@ class FullWeightTrainer:
         self.improvement_tolerance = improvement_tolerance
         self._eval_module_cache: dict[str, DataModule] = {}
 
+    def _get_eval_module(self, spec: ArchitectureSpec) -> tuple[DataModule, int]:
+        """Return a deterministic eval DataModule + token budget.
+
+        If `data.eval_shards` is provided, use it. Otherwise, reuse the training
+        shards but sample with a different RNG seed so `ppl_eval` isn't identical
+        to the training stream.
+        """
+        eval_shards = getattr(spec.data, "eval_shards", []) or []
+        eval_cfg = spec.data.model_copy(deep=True)
+        if eval_shards:
+            eval_cfg.shards = list(eval_shards)
+        eval_cfg.healing_shards = []
+        eval_cfg.healing_tokens = None
+
+        eval_tokens_cfg = getattr(spec.data, "eval_tokens", None)
+        if isinstance(eval_tokens_cfg, int) and eval_tokens_cfg > 0:
+            eval_tokens = int(eval_tokens_cfg)
+        else:
+            eval_tokens = (
+                int(spec.data.seq_len) * int(spec.data.batch_size) * max(1, self.eval_batches)
+            )
+
+        seed_val = int(getattr(spec.train, "seed", 0) or 0)
+        cache_key = std_json.dumps(eval_cfg.model_dump(mode="python"), sort_keys=True)
+        cache_key = f"{seed_val + 1}:{cache_key}"
+        eval_module = self._eval_module_cache.get(cache_key)
+        if eval_module is None:
+            eval_module = DataModule(eval_cfg, seed=seed_val + 1)
+            self._eval_module_cache[cache_key] = eval_module
+        eval_module.reset_rng(seed_val + 1)
+        return eval_module, eval_tokens
+
     def _checkpoint_torch_dtype(self) -> torch.dtype:
         key = (self.checkpoint_dtype or "fp16").lower()
         if key in {"fp16", "float16"}:
@@ -268,27 +300,20 @@ class FullWeightTrainer:
         model.set_recurrence_steps(self._recurrence_schedule(spec, self.steps, total_steps))
         ppl_train = self._evaluate_perplexity(model, spec, batch_iter, criterion)
         ppl_eval = ppl_train
-        eval_shards = getattr(spec.data, "eval_shards", []) or []
-        eval_tokens = getattr(spec.data, "eval_tokens", None)
-        if eval_shards:
-            eval_cfg = spec.data.model_copy(deep=True)
-            eval_cfg.shards = list(eval_shards)
-            eval_cfg.healing_shards = []
-            eval_cfg.healing_tokens = None
-            seed_val = int(getattr(spec.train, "seed", 0) or 0)
-            cache_key = std_json.dumps(eval_cfg.model_dump(mode="python"), sort_keys=True)
-            cache_key = f"{seed_val + 1}:{cache_key}"
-            eval_module = self._eval_module_cache.get(cache_key)
-            if eval_module is None:
-                eval_module = DataModule(eval_cfg, seed=seed_val + 1)
-                self._eval_module_cache[cache_key] = eval_module
-            eval_module.reset_rng(seed_val + 1)
+        ppl_eval_error = 0.0
+        try:
+            eval_module, eval_tokens = self._get_eval_module(spec)
             ppl_eval = self._evaluate_perplexity(
                 model,
                 spec,
                 eval_module.batches(max_tokens=eval_tokens),
                 criterion,
             )
+        except Exception:
+            # Best-effort: if eval dataset shards are unavailable (common in unit tests
+            # or offline environments), fall back to the training-stream perplexity.
+            ppl_eval = ppl_train
+            ppl_eval_error = 1.0
         perplexity = ppl_eval
         long_recall_proxy = _estimate_long_recall(spec)
         passkey_metrics = self._passkey_probe(model, spec)
@@ -355,11 +380,15 @@ class FullWeightTrainer:
             reason_code = 4.0
         elif stop_reason == "data_exhausted":
             reason_code = 5.0
+        moe_penalty = 1.0 + 0.01 * spec.model.moe_block_count()
         metrics = {
             "ppl_code": perplexity,
             "ppl_train": ppl_train,
             "ppl_eval": ppl_eval,
-            "ppl_math": perplexity * (1.0 + 0.01 * spec.model.moe_block_count()),
+            "ppl_eval_error": ppl_eval_error,
+            "ppl": perplexity,
+            "ppl_math": perplexity * moe_penalty,
+            "ppl_math_proxy": perplexity * moe_penalty,
             "throughput": throughput,
             "params": float(count_parameters(model)),
             "ram": float(count_parameters(model) * 2 / (1024**3)),

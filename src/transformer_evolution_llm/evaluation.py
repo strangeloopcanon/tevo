@@ -14,6 +14,7 @@ from .dsl import (
     CustomModuleConfig,
     DenseFFNConfig,
     GatedModuleConfig,
+    HyperConnectionsConfig,
     KVPolicyConfig,
     LayerScaleConfig,
     MemoryTokensConfig,
@@ -114,6 +115,11 @@ def estimate_params(spec: ArchitectureSpec) -> float:
                 params += float(len(extra.targets) * d_model)
     if not getattr(spec.model.head, "tie_embeddings", True):
         params += float(spec.model.head.vocab * d_model)
+    hyper = getattr(spec.model, "hyper", None)
+    if isinstance(hyper, HyperConnectionsConfig) and hyper.streams > 1:
+        n = int(hyper.streams)
+        layers = int(spec.model.n_layers)
+        params += float(layers * (n * n + 2 * n) + n)
     return params
 
 

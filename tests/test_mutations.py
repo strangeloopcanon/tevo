@@ -13,6 +13,7 @@ from transformer_evolution_llm.mutations import (
     make_gqa,
     mutate_topk,
     toggle_gated_mix,
+    toggle_hyper_connections,
 )
 
 
@@ -53,3 +54,12 @@ def test_toggle_gated_mix_adds_gate(tiny_spec: ArchitectureSpec):
     rng = random.Random(5)  # noqa: S311 - deterministic unit tests
     child = toggle_gated_mix(tiny_spec, rng=rng)
     assert child.model.blocks[0].extras
+
+
+def test_toggle_hyper_connections_toggles_streams(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(6)  # noqa: S311 - deterministic unit tests
+    enabled = toggle_hyper_connections(tiny_spec, rng=rng)
+    assert enabled.model.hyper is not None
+    assert enabled.model.hyper.streams > 1
+    disabled = toggle_hyper_connections(enabled, rng=rng)
+    assert disabled.model.hyper is None
