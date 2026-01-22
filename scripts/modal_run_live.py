@@ -155,7 +155,8 @@ def run_live(
         "run_id": run_name,
         "frontier": f"{run_name}/frontier.json",
         "state": f"{run_name}/frontier.state.json",
-        "lineage": f"{run_name}/lineage.json" if lineage else "",
+        "lineage": f"{run_name}/frontier_lineage.json",
+        "manifest": f"{run_name}/frontier.manifest.json",
     }
 
 
@@ -188,11 +189,10 @@ def main(
 
     if not download:
         return
-    RUNS_VOL.reload()
     out_root = Path(local_out_dir) / str(result["run_id"])
     out_root.mkdir(parents=True, exist_ok=True)
 
-    for key in ("frontier", "state", "lineage"):
+    for key in ("frontier", "state", "lineage", "manifest"):
         remote_path = result.get(key) or ""
         if not remote_path:
             continue
