@@ -69,7 +69,6 @@ IMAGE = (
         "typer[all]>=0.12",
         "ujson>=5.9",
     )
-    .add_local_dir(str(REPO_ROOT), remote_path="/repo", ignore=_ignore_repo_path)
     .env(
         {
             "PYTHONPATH": "/repo/src",
@@ -78,6 +77,7 @@ IMAGE = (
             "TRANSFORMERS_CACHE": "/hf/transformers",
         }
     )
+    .add_local_dir(str(REPO_ROOT), remote_path="/repo", ignore=_ignore_repo_path)
 )
 
 app = modal.App("transformer-evolution-llm-live")
