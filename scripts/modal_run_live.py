@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GPU = os.environ.get("TEVO_MODAL_GPU", "A10G")
 TIMEOUT_S = int(os.environ.get("TEVO_MODAL_TIMEOUT_S", str(60 * 60 * 12)))
 PYTORCH_INDEX_URL = os.environ.get("TEVO_TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu124")
-TORCH_VERSION = os.environ.get("TEVO_TORCH_VERSION", "2.8.0")
+TORCH_VERSION = os.environ.get("TEVO_TORCH_VERSION", "2.6.0+cu124")
 
 RUNS_VOLUME_NAME = os.environ.get("TEVO_MODAL_RUNS_VOLUME", "tevo-runs")
 HF_VOLUME_NAME = os.environ.get("TEVO_MODAL_HF_VOLUME", "tevo-hf-cache")
