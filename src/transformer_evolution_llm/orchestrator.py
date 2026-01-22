@@ -45,6 +45,12 @@ def default_objectives() -> ObjectiveDir:
         "novelty": "max",
         "instability": "min",
         "graph_entropy": "max",
+        "passkey_acc": "max",
+        "passkey_loss": "min",
+        "speedrun_steps_to_target": "min",
+        "speedrun_tokens_to_target": "min",
+        "speedrun_time_to_target": "min",
+        "speedrun_best_eval_loss": "min",
     }
 
 

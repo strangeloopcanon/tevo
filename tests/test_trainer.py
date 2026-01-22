@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import torch
@@ -62,3 +63,29 @@ def test_full_weight_trainer_passkey_probe(tmp_path: Path, tiny_spec) -> None:
     assert 0.0 <= float(metrics["passkey_acc"]) <= 1.0
     assert float(metrics["passkey_loss"]) >= 0.0
     assert float(metrics["long_recall"]) == float(metrics["passkey_acc"])
+
+
+def test_full_weight_trainer_speedrun_metrics(tmp_path: Path, tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.speedrun_eval_interval = 10_000
+    spec.train.speedrun_eval_batches = 1
+    spec.train.speedrun_target_loss = 1e-3
+
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=2, eval_batches=1, device="cpu")
+    candidate = Candidate(ident="cand-speedrun", spec=spec)
+    metrics, _ = trainer.train(
+        candidate,
+        spec,
+        synthetic_batches(spec.model.head.vocab, spec.data.seq_len, steps=4),
+    )
+
+    for key in (
+        "speedrun_reached",
+        "speedrun_steps_to_target",
+        "speedrun_tokens_to_target",
+        "speedrun_time_to_target",
+        "speedrun_best_eval_loss",
+        "speedrun_error",
+    ):
+        assert key in metrics
+        assert math.isfinite(float(metrics[key]))

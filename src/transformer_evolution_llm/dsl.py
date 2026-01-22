@@ -692,9 +692,35 @@ class TrainSchedule(BaseModel):
     passkey_eval_vocab_limit: int | None = Field(
         default=None, gt=0, description="Optional cap on synthetic passkey token range."
     )
+    # Optional speedrun-style probe: measure time/tokens to hit a target eval loss/ppl.
+    speedrun_eval_interval: int = Field(
+        default=0,
+        ge=0,
+        description="If >0, run a periodic eval check every N training steps for speedrun metrics.",
+    )
+    speedrun_eval_batches: int = Field(
+        default=4, ge=1, description="How many eval batches to use per speedrun check."
+    )
+    speedrun_target_loss: float | None = Field(
+        default=None, gt=0.0, description="Target eval loss threshold for the speedrun probe."
+    )
+    speedrun_target_ppl: float | None = Field(
+        default=None, gt=0.0, description="Target eval perplexity threshold for the speedrun probe."
+    )
 
     model_config = {"populate_by_name": True}
     optimizer: OptimizerConfig = Field(default_factory=lambda: OptimizerConfig())
+
+    @model_validator(mode="after")
+    def _validate_speedrun(self) -> TrainSchedule:
+        if self.speedrun_eval_interval > 0:
+            if self.speedrun_target_loss is None and self.speedrun_target_ppl is None:
+                raise ValueError(
+                    "speedrun_eval_interval requires speedrun_target_loss or speedrun_target_ppl"
+                )
+            if self.speedrun_target_loss is not None and self.speedrun_target_ppl is not None:
+                raise ValueError("Provide only one of speedrun_target_loss or speedrun_target_ppl")
+        return self
 
 
 class OptimizerConfig(BaseModel):

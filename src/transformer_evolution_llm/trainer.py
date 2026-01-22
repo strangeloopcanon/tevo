@@ -59,13 +59,17 @@ class FullWeightTrainer:
         self.improvement_tolerance = improvement_tolerance
         self._eval_module_cache: dict[str, DataModule] = {}
 
-    def _get_eval_module(self, spec: ArchitectureSpec) -> tuple[DataModule, int]:
+    def _get_eval_module(
+        self, spec: ArchitectureSpec, *, eval_batches: int | None = None
+    ) -> tuple[DataModule, int]:
         """Return a deterministic eval DataModule + token budget.
 
         If `data.eval_shards` is provided, use it. Otherwise, reuse the training
         shards but sample with a different RNG seed so `ppl_eval` isn't identical
         to the training stream.
         """
+        batches = int(self.eval_batches if eval_batches is None else eval_batches)
+        batches = max(1, batches)
         eval_shards = getattr(spec.data, "eval_shards", []) or []
         eval_cfg = spec.data.model_copy(deep=True)
         if eval_shards:
@@ -77,9 +81,7 @@ class FullWeightTrainer:
         if isinstance(eval_tokens_cfg, int) and eval_tokens_cfg > 0:
             eval_tokens = int(eval_tokens_cfg)
         else:
-            eval_tokens = (
-                int(spec.data.seq_len) * int(spec.data.batch_size) * max(1, self.eval_batches)
-            )
+            eval_tokens = int(spec.data.seq_len) * int(spec.data.batch_size) * batches
 
         seed_val = int(getattr(spec.train, "seed", 0) or 0)
         cache_key = std_json.dumps(eval_cfg.model_dump(mode="python"), sort_keys=True)
@@ -118,7 +120,8 @@ class FullWeightTrainer:
         batch_iter: Iterable[TokenBatch],
         seed_state_path: Path | None = None,
     ) -> tuple[dict[str, float], Path]:
-        torch.manual_seed(int(getattr(spec.train, "seed", 0) or 0))
+        seed_val = int(getattr(spec.train, "seed", 0) or 0)
+        torch.manual_seed(seed_val)
         model = EvolutionModel(spec.model).to(self.device)
         model.train()
         model.set_grad_checkpointing(bool(getattr(spec.train, "grad_checkpoint", False)))
@@ -189,6 +192,36 @@ class FullWeightTrainer:
         if self.device.type in {"cuda", "mps"}:
             dtype = torch.bfloat16 if bool(getattr(spec.train, "bf16", True)) else torch.float16
             autocast_ctx = torch.autocast(device_type=self.device.type, dtype=dtype)
+        speedrun_interval = int(getattr(spec.train, "speedrun_eval_interval", 0) or 0)
+        speedrun_eval_batches = int(
+            getattr(spec.train, "speedrun_eval_batches", self.eval_batches) or self.eval_batches
+        )
+        speedrun_target_loss: float | None = None
+        speedrun_target_loss_raw = getattr(spec.train, "speedrun_target_loss", None)
+        if speedrun_target_loss_raw is not None:
+            try:
+                speedrun_target_loss = float(speedrun_target_loss_raw)
+            except (TypeError, ValueError):
+                speedrun_target_loss = None
+        speedrun_target_ppl: float | None = None
+        speedrun_target_ppl_raw = getattr(spec.train, "speedrun_target_ppl", None)
+        if speedrun_target_ppl_raw is not None:
+            try:
+                speedrun_target_ppl = float(speedrun_target_ppl_raw)
+            except (TypeError, ValueError):
+                speedrun_target_ppl = None
+        if speedrun_target_loss is None and speedrun_target_ppl is not None:
+            speedrun_target_loss = math.log(speedrun_target_ppl)
+        speedrun_enabled = speedrun_interval > 0 and speedrun_target_loss is not None
+        speedrun_eval_failed = False
+        speedrun_eval_module: DataModule | None = None
+        speedrun_eval_tokens = 0
+        speedrun_error = 0.0
+        speedrun_reached = False
+        speedrun_best_loss = float("inf")
+        speedrun_steps_to_target = 0.0
+        speedrun_tokens_to_target = 0.0
+        speedrun_time_to_target = 0.0
         for step_idx in range(self.steps):
             if spec.model.recurrences:
                 model.set_recurrence_steps(self._recurrence_schedule(spec, step_idx, total_steps))
@@ -272,6 +305,42 @@ class FullWeightTrainer:
                 tokens_seen += int(attn_mask.sum().item())
             except Exception:
                 tokens_seen += input_ids.numel()
+            if (
+                speedrun_enabled
+                and not speedrun_reached
+                and not speedrun_eval_failed
+                and (step_idx + 1) % speedrun_interval == 0
+            ):
+                if speedrun_eval_module is None:
+                    try:
+                        speedrun_eval_module, speedrun_eval_tokens = self._get_eval_module(
+                            spec, eval_batches=speedrun_eval_batches
+                        )
+                    except Exception:
+                        speedrun_error = 1.0
+                        speedrun_eval_failed = True
+                        continue
+                try:
+                    speedrun_eval_module.reset_rng(seed_val + 1)
+                    loss_val = self._evaluate_loss(
+                        model,
+                        spec,
+                        speedrun_eval_module.batches(max_tokens=speedrun_eval_tokens),
+                        criterion,
+                        eval_batches=speedrun_eval_batches,
+                        empty_value=1e9,
+                    )
+                except Exception:
+                    speedrun_error = 1.0
+                    speedrun_eval_failed = True
+                    loss_val = 1e9
+                if loss_val < speedrun_best_loss:
+                    speedrun_best_loss = loss_val
+                if speedrun_target_loss is not None and loss_val <= speedrun_target_loss:
+                    speedrun_reached = True
+                    speedrun_steps_to_target = float(step_idx + 1)
+                    speedrun_tokens_to_target = float(tokens_seen)
+                    speedrun_time_to_target = max(time.perf_counter() - start_time, 1e-6)
             # Router entropy guard
             step_entropy = _average_router_entropy(model)
             if step_entropy is not None and step_entropy < self.entropy_threshold:
@@ -406,6 +475,26 @@ class FullWeightTrainer:
             "nan_seen": 1.0 if nan_or_inf else 0.0,
             "loss_spike": max(0.0, max_loss_jump),
         }
+        if speedrun_enabled:
+            missing_penalty = 1e9
+            metrics.update(
+                {
+                    "speedrun_reached": 1.0 if speedrun_reached else 0.0,
+                    "speedrun_steps_to_target": (
+                        speedrun_steps_to_target if speedrun_reached else missing_penalty
+                    ),
+                    "speedrun_tokens_to_target": (
+                        speedrun_tokens_to_target if speedrun_reached else missing_penalty
+                    ),
+                    "speedrun_time_to_target": (
+                        speedrun_time_to_target if speedrun_reached else missing_penalty
+                    ),
+                    "speedrun_best_eval_loss": (
+                        speedrun_best_loss if math.isfinite(speedrun_best_loss) else missing_penalty
+                    ),
+                    "speedrun_error": speedrun_error,
+                }
+            )
         metrics.update(passkey_metrics)
         if spec.model.recurrences:
             metrics.update(self._recurrence_evaluations(model, spec, batch_iter, criterion))
@@ -456,14 +545,31 @@ class FullWeightTrainer:
         batch_iter: Iterable[TokenBatch],
         criterion: nn.Module,
     ) -> float:
+        loss = self._evaluate_loss(
+            model, spec, batch_iter, criterion, eval_batches=self.eval_batches, empty_value=0.0
+        )
+        if not math.isfinite(loss) or loss >= 1e8:
+            return 1e9
+        return float(torch.exp(torch.tensor(loss)).item())
+
+    def _evaluate_loss(
+        self,
+        model: nn.Module,
+        spec: ArchitectureSpec,
+        batch_iter: Iterable[TokenBatch],
+        criterion: nn.Module,
+        *,
+        eval_batches: int,
+        empty_value: float,
+    ) -> float:
         eval_loss = 0.0
-        eval_batches = 0
+        batches = 0
         was_training = bool(getattr(model, "training", False))
         try:
             model.eval()
             with torch.no_grad():
                 iterator = iter(batch_iter)
-                for _ in range(self.eval_batches):
+                for _ in range(max(1, int(eval_batches))):
                     try:
                         batch = next(iterator)
                     except StopIteration:
@@ -485,13 +591,13 @@ class FullWeightTrainer:
                     if not math.isfinite(loss_val):
                         return 1e9
                     eval_loss += loss_val
-                    eval_batches += 1
+                    batches += 1
         finally:
             if was_training:
                 model.train()
-        if eval_batches == 0:
-            return 1.0
-        return float(torch.exp(torch.tensor(eval_loss / eval_batches)).item())
+        if batches == 0:
+            return float(empty_value)
+        return float(eval_loss / batches)
 
     def _recurrence_evaluations(
         self,
