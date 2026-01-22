@@ -1,0 +1,128 @@
+model:
+  name: m4-longctx-discovery-seed
+  emb:
+    dim: 512
+    vocab: 50257
+    dropout: 0.0
+  blocks:
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+      extras:
+        - { type: assoc_memory, heads: 4, head_dim: 32, feature_map: elu, dropout: 0.0, gating_weight: 0.2 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 2, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+  head:
+    tie_embeddings: true
+    vocab: 50257
+  norm: rmsnorm
+train:
+  lr: 0.0008
+  warmup: 500
+  clip: 1.0
+  bf16: false
+  grad_ckpt: true
+  max_tokens: 600000
+  weight_decay: 0.02
+  seed: 4242
+  router_lb_coeff: 0.01
+  router_entropy_coeff: 0.005
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 50.0
+  no_improve_patience: 40
+  improvement_tolerance: 0.001
+  ppl_stop_threshold: null
+  # Long-context "learning to remember" probe: we optimize passkey_loss (min).
+  passkey_eval_steps: 8
+  passkey_eval_batches: 6
+  passkey_eval_seq_len: 1024
+  passkey_eval_min_distance: 768
+  passkey_eval_batch_size: 1
+  passkey_eval_lr: 0.001
+  passkey_eval_vocab_limit: 256
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  seq_len: 512
+  batch_size: 1
+  workers: 0
+  shards:
+    - name: ag_news
+      split: train
+      weight: 0.25
+    - name: wikitext
+      split: wikitext-2-raw-v1
+      weight: 0.35
+    - name: mbpp
+      split: train
+      weight: 0.4
+  eval_shards:
+    - name: ag_news
+      split: test
+      weight: 1.0
+    - name: wikitext
+      split: wikitext-2-raw-v1:test
+      weight: 1.0
+    - name: mbpp
+      split: test
+      weight: 1.0
+  eval_tokens: 16384
+  healing_shards: []
+  healing_tokens: null
+evolution:
+  rung0_thresholds:
+    max_params: 300000000
+    max_kv_bytes_per_token: 32000
+    min_throughput_proxy: 5.0
+    # Force the search to keep at least one explicit memory primitive.
+    min_memory_blocks: 1.0
+    gate_entropy_min: 0.0
+    gate_entropy_max: 4.0
+  rung1_tokens: 200000
+  rung2_tokens: 600000
+  population: 24
+  topk_keep: 0.45
+  crossover_prob: 0.4
+  parent_selection: map_elites
+  archive_max_elites: 32
+  adaptive_mutation: true
+  adaptive_mutation_eta: 0.1
+  adaptive_mutation_min_weight: 0.05
+  adaptive_mutation_max_weight: 5.0
+  template_learning: true
+  template_learning_eta: 0.2
+  template_learning_min_weight: 0.05
+  template_learning_max_weight: 5.0
+  template_learning_max_templates: 96
+  template_learning_save_every: 10
+  template_learning_save_path: runs/template_learning/exp_longctx_discovery_templates.json
+  template_learning_promote_min_delta: 0.0
+  weight_inheritance: parent
+  # Long-context objectives: long-context loss + base eval loss + resource tradeoffs.
+  objectives:
+    ppl_code: min
+    passkey_loss: min
+    throughput: max
+    ram: min
+  composite_metrics:
+    - name: longctx_score
+      op: weighted_sum
+      terms:
+        ppl_code: 1.0
+        passkey_loss: 2000.0
+        ram: 500.0
+        throughput: -2.0
+      epsilon: 1.0e-6

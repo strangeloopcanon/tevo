@@ -6,6 +6,7 @@ from transformer_evolution_llm.dsl import (
     ChunkMemoryConfig,
     CustomModuleConfig,
     GatedModuleConfig,
+    HyperConnectionsConfig,
     LayerScaleConfig,
     MemoryTokensConfig,
     MoEFFNConfig,
@@ -82,3 +83,47 @@ def test_multihead_attention_with_rope() -> None:
     x = torch.randint(0, 32, (2, 16))
     out = model(x)
     assert out.shape == (2, 16, 32)
+
+
+def test_evolution_model_forward_with_hyper_connections() -> None:
+    cfg = ArchitectureSpec(
+        model={
+            "name": "hyper-test",
+            "emb": {"dim": 32, "vocab": 64},
+            "hyper": {"streams": 3, "diag_bias": 4.0, "noise_std": 1e-3, "update_scale": 3.0},
+            "blocks": [
+                {
+                    "attn": {"kind": "GQA", "heads": 2, "head_dim": 16},
+                    "ffn": {"type": "dense", "hidden": 64},
+                },
+                {
+                    "attn": {"kind": "GQA", "heads": 2, "head_dim": 16},
+                    "ffn": {"type": "dense", "hidden": 64},
+                },
+                {
+                    "attn": {"kind": "GQA", "heads": 2, "head_dim": 16},
+                    "ffn": {"type": "dense", "hidden": 64},
+                },
+                {
+                    "attn": {"kind": "GQA", "heads": 2, "head_dim": 16},
+                    "ffn": {"type": "dense", "hidden": 64},
+                },
+            ],
+            "recurrences": [{"start": 1, "end": 4, "adapter": "gated", "concat_prelude": True}],
+            "head": {"vocab": 64, "tie_embeddings": True},
+        },
+        train={"lr": 1e-3, "warmup": 1, "clip": 1.0, "grad_ckpt": False},
+        data={
+            "tokenizer": "gpt2",
+            "seq_len": 8,
+            "batch_size": 2,
+            "workers": 0,
+            "shards": [{"name": "ag_news", "split": "train", "weight": 1.0}],
+        },
+    )
+    assert isinstance(cfg.model.hyper, HyperConnectionsConfig)
+    model = EvolutionModel(cfg.model)
+    x = torch.randint(0, 64, (2, cfg.data.seq_len))
+    out = model(x)
+    assert out.shape == (2, cfg.data.seq_len, 64)
+    assert torch.isfinite(out).all()

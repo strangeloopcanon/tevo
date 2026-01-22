@@ -21,6 +21,11 @@ from .evaluation import StaticChecker, estimate_params
 from .mutations import REGISTRY as MUTATION_REGISTRY
 from .mutations import mutate
 from .simulators import evaluator_for_mode
+from .template_mutation import (
+    configure_template_learning,
+    flush_template_learning,
+    record_template_result,
+)
 from .trainer import FullWeightTrainer
 
 console = Console()
@@ -200,6 +205,24 @@ class EvolutionRunner:
             getattr(self.cfg, "promotion_min_recurrence_gain", 0.0) or 0.0
         )
         self._promotion_max_instability = getattr(self.cfg, "promotion_max_instability", None)
+        self._template_learning = bool(getattr(self.cfg, "template_learning", False))
+        if self._template_learning:
+            save_path_raw = getattr(self.cfg, "template_learning_save_path", None)
+            save_path = Path(str(save_path_raw or "configs/mutation_templates.yaml"))
+            configure_template_learning(
+                enabled=True,
+                path=save_path,
+                eta=float(getattr(self.cfg, "template_learning_eta", 0.2) or 0.2),
+                min_weight=float(getattr(self.cfg, "template_learning_min_weight", 0.05) or 0.05),
+                max_weight=float(getattr(self.cfg, "template_learning_max_weight", 5.0) or 5.0),
+                max_templates=int(getattr(self.cfg, "template_learning_max_templates", 128) or 128),
+                save_every=int(getattr(self.cfg, "template_learning_save_every", 20) or 20),
+                promote_min_delta=float(
+                    getattr(self.cfg, "template_learning_promote_min_delta", 0.0) or 0.0
+                ),
+            )
+        else:
+            configure_template_learning(enabled=False)
 
     def _cleanup_seed_state(self, candidate: Candidate) -> None:
         """Remove intermediate crossover seed checkpoints when no longer needed."""
@@ -256,12 +279,14 @@ class EvolutionRunner:
             if candidate.status == "completed":
                 self._update_archive(candidate)
                 self._maybe_update_mutation_weights(candidate)
+                self._maybe_update_template_learning(candidate)
             if candidate.status == "completed":
                 survivors.append(candidate)
             self.pool.append(candidate)
             self._history.append(candidate)
             self._trim_pool()
             self._garbage_collect_checkpoints()
+        flush_template_learning()
         return survivors
 
     def _evaluate_candidate(self, candidate: Candidate) -> None:
@@ -584,6 +609,12 @@ class EvolutionRunner:
         for idx in range(min(len(rec_a), len(rec_b))):
             if rec_a[idx] != rec_b[idx]:
                 diff += 0.5
+        hyper_a = getattr(a.model, "hyper", None)
+        hyper_b = getattr(b.model, "hyper", None)
+        streams_a = int(getattr(hyper_a, "streams", 1) or 1) if hyper_a is not None else 1
+        streams_b = int(getattr(hyper_b, "streams", 1) or 1) if hyper_b is not None else 1
+        if streams_a != streams_b:
+            diff += 0.5
         denom = max(1.0, 0.5 * float(la + lb))
         return float(diff) / denom
 
@@ -628,6 +659,10 @@ class EvolutionRunner:
         import math
 
         tokens: list[str] = []
+        hyper = getattr(spec.model, "hyper", None)
+        streams = int(getattr(hyper, "streams", 1) or 1) if hyper is not None else 1
+        if streams > 1:
+            tokens.append(f"hyper:{streams}")
         for block in spec.model.blocks:
             if block.attn:
                 tokens.append(f"attn:{block.attn.kind}")
@@ -870,6 +905,23 @@ class EvolutionRunner:
             lo = max(1e-6, self._adaptive_mutation_min)
             hi = max(lo, self._adaptive_mutation_max)
             self.mutation_weights[name] = lo + (hi - lo) * updated
+
+    def _maybe_update_template_learning(self, candidate: Candidate) -> None:
+        if not self._template_learning or not candidate.parent:
+            return
+        parent = next((c for c in self.pool if c.ident == candidate.parent), None)
+        if parent is None:
+            parent = next((c for c in self._history if c.ident == candidate.parent), None)
+        if parent is None:
+            return
+        delta = float(candidate.score(self.score_weights) - parent.score(self.score_weights))
+        label = candidate.ident.rsplit("-", 2)[0]
+        for segment in label.split("+"):
+            if not segment.startswith("tpl_"):
+                continue
+            template_name = segment[4:]
+            if template_name and template_name != "none":
+                record_template_result(template_name, delta)
 
     def _trim_pool(self) -> None:
         if len(self.pool) <= self.cfg.population:

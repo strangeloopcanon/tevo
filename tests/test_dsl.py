@@ -13,6 +13,7 @@ from transformer_evolution_llm.dsl import (
     DepthRouterConfig,
     HierarchyConfig,
     HierarchyLevelConfig,
+    HyperConnectionsConfig,
     KVPolicyConfig,
     MacroConfig,
     MixerConfig,
@@ -96,3 +97,16 @@ def test_macro_primitives_roundtrip(tiny_spec: ArchitectureSpec, tmp_path: Path)
     assert loaded.model.macro.cond is not None
     assert loaded.model.macro.cond.source is not None
     assert loaded.model.macro.cond.source.kind == "pool_mlp"
+
+
+def test_hyper_connections_roundtrip(tiny_spec: ArchitectureSpec, tmp_path: Path) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.hyper = HyperConnectionsConfig(
+        streams=4, diag_bias=6.0, noise_std=1e-3, update_scale=4.0
+    )
+    spec_path = tmp_path / "spec.yaml"
+    api.save_spec(spec, spec_path)
+    loaded = api.load_spec(spec_path)
+    assert loaded.model.hyper is not None
+    assert loaded.model.hyper.streams == 4
+    assert loaded.summary()["hyper_streams"] == 4

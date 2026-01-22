@@ -15,6 +15,7 @@ from .dsl import (
     CustomModuleConfig,
     DenseFFNConfig,
     GatedModuleConfig,
+    HyperConnectionsConfig,
     KVPolicyConfig,
     LayerScaleConfig,
     MemoryTokensConfig,
@@ -23,9 +24,10 @@ from .dsl import (
     RetroConfig,
     SSMConfig,
 )
-from .template_mutation import apply_template_mutation
+from .template_mutation import apply_template_mutation_with_name
 
-MutationFn = Callable[[ArchitectureSpec, random.Random], ArchitectureSpec]
+MutationResult = ArchitectureSpec | tuple[str, ArchitectureSpec]
+MutationFn = Callable[[ArchitectureSpec, random.Random], MutationResult]
 
 
 def clone_spec(spec: ArchitectureSpec) -> ArchitectureSpec:
@@ -172,6 +174,23 @@ def insert_custom_module(spec: ArchitectureSpec, rng: random.Random) -> Architec
     )
     block.extras.append(module)
     return child
+
+
+def insert_graph_module(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    block = rng.choice(child.model.blocks)
+    module = CustomModuleConfig(
+        name="graph_module",
+        params={"ops": [{"op": "rmsnorm"}, {"op": "mlp", "hidden_mult": 2.0}]},
+    )
+    block.extras.append(module)
+    return child
+
+
+def template_mutation(spec: ArchitectureSpec, rng: random.Random) -> tuple[str, ArchitectureSpec]:
+    template_name, mutated = apply_template_mutation_with_name(spec, rng)
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in template_name)
+    return f"tpl_{safe}", mutated
 
 
 def insert_assoc_memory(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
@@ -578,6 +597,52 @@ def toggle_kv_policy(spec: ArchitectureSpec, rng: random.Random) -> Architecture
     return child
 
 
+def toggle_hyper_connections(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Toggle multi-lane hyper-residual streams on/off."""
+
+    child = clone_spec(spec)
+    current = getattr(child.model, "hyper", None)
+    if isinstance(current, HyperConnectionsConfig) and current.streams > 1:
+        child.model.hyper = None
+        return child
+    streams = int(rng.choice([2, 3, 4]))
+    child.model.hyper = HyperConnectionsConfig(
+        streams=streams,
+        diag_bias=float(rng.choice([2.0, 4.0, 6.0])),
+        noise_std=float(rng.choice([0.0, 1e-4, 1e-3])),
+        update_scale=float(rng.choice([1.0, float(streams)])),
+    )
+    return child
+
+
+def tune_hyper_connections(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Jitter hyper stream count and mixing init knobs."""
+
+    child = clone_spec(spec)
+    current = getattr(child.model, "hyper", None)
+    if not isinstance(current, HyperConnectionsConfig) or current.streams <= 1:
+        return toggle_hyper_connections(child, rng)
+    streams = int(current.streams)
+    if rng.random() < 0.35:
+        streams = int(rng.choice([2, 3, 4]))
+    diag_bias = float(current.diag_bias)
+    if rng.random() < 0.4:
+        diag_bias = float(rng.choice([0.0, 2.0, 4.0, 6.0, 8.0]))
+    noise_std = float(current.noise_std)
+    if rng.random() < 0.4:
+        noise_std = float(rng.choice([0.0, 1e-5, 1e-4, 1e-3, 1e-2]))
+    update_scale = float(current.update_scale)
+    if rng.random() < 0.5:
+        update_scale = float(rng.choice([0.25, 0.5, 1.0, 2.0, float(streams)]))
+    child.model.hyper = HyperConnectionsConfig(
+        streams=streams,
+        diag_bias=diag_bias,
+        noise_std=noise_std,
+        update_scale=update_scale,
+    )
+    return child
+
+
 def tune_kv_policy(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     """Jitter KV policy knobs (window size, quant type, latent dim)."""
 
@@ -942,9 +1007,12 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
         "shuffle_block_span",
         "add_recurrence",
         "add_additional_recurrence",
+        "toggle_hyper_connections",
+        "tune_hyper_connections",
         "toggle_ssm",
         "insert_retro_module",
         "insert_custom_module",
+        "insert_graph_module",
         "insert_assoc_memory",
         "tune_assoc_memory",
         "insert_memory_tokens",
@@ -974,7 +1042,11 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
     for name in rng.sample(jitter_ops, k=min(steps, len(jitter_ops))):
         fn = REGISTRY.get(name)
         if fn:
-            current = fn(current, rng)
+            result = fn(current, rng)
+            if isinstance(result, tuple):
+                current = result[1]
+            else:
+                current = result
     return current
 
 
@@ -992,6 +1064,7 @@ REGISTRY: dict[str, MutationFn] = {
     "toggle_precision": toggle_precision,
     "insert_retro_module": insert_retro_module,
     "insert_custom_module": insert_custom_module,
+    "insert_graph_module": insert_graph_module,
     "insert_assoc_memory": insert_assoc_memory,
     "tune_assoc_memory": tune_assoc_memory,
     "insert_memory_tokens": insert_memory_tokens,
@@ -1010,6 +1083,8 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_kv": tune_kv,
     "toggle_kv_policy": toggle_kv_policy,
     "tune_kv_policy": tune_kv_policy,
+    "toggle_hyper_connections": toggle_hyper_connections,
+    "tune_hyper_connections": tune_hyper_connections,
     "toggle_selector": toggle_selector,
     "tune_rope": tune_rope,
     "tune_attn_shape": tune_attn_shape,
@@ -1022,7 +1097,7 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_recurrence": tune_recurrence,
     "graph_jitter": graph_jitter,
     "tune_experts": tune_experts,
-    "template_mutation": lambda spec, rng: apply_template_mutation(spec, rng),
+    "template_mutation": template_mutation,
 }
 
 
@@ -1049,7 +1124,12 @@ def mutate(
     current = spec
     for _ in range(max(1, steps)):
         name = _pick()
-        current = REGISTRY[name](current, rng)
-        applied.append(name)
+        result = REGISTRY[name](current, rng)
+        if isinstance(result, tuple) and len(result) == 2:
+            label, current = result
+            applied.append(str(label))
+        else:
+            current = result
+            applied.append(name)
     label = "+".join(applied) if len(applied) > 1 else applied[0]
     return label, current
