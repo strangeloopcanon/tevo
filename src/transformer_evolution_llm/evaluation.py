@@ -17,6 +17,7 @@ from .dsl import (
     HyperConnectionsConfig,
     KVPolicyConfig,
     LayerScaleConfig,
+    LookupMemoryConfig,
     MemoryTokensConfig,
     MoEFFNConfig,
     RetroConfig,
@@ -103,6 +104,15 @@ def estimate_params(spec: ArchitectureSpec) -> float:
             elif isinstance(extra, ChunkMemoryConfig):
                 inner = int(extra.heads) * int(extra.head_dim)
                 params += float(4 * d_model * inner)  # q,k,v,o projections
+            elif isinstance(extra, LookupMemoryConfig):
+                entries = int(extra.entries)
+                key_dim = int(getattr(extra, "key_dim", None) or d_model)
+                value_dim = int(getattr(extra, "value_dim", None) or d_model)
+                params += float(d_model * key_dim)  # q_proj (no bias)
+                params += float(entries * key_dim)  # keys
+                params += float(entries * value_dim)  # values
+                if value_dim != d_model:
+                    params += float(value_dim * d_model)  # out_proj (no bias)
             elif isinstance(extra, BranchRouterConfig):
                 n_targets = max(1, len(extra.targets))
                 router_hidden = getattr(extra, "hidden", None)
@@ -298,6 +308,21 @@ class StaticChecker:
                         reasons.append("chunk_memory.chunk_size exceeds seq_len")
                     if extra.stride is not None and extra.stride > spec.data.seq_len:
                         reasons.append("chunk_memory.stride exceeds seq_len")
+                elif isinstance(extra, LookupMemoryConfig):
+                    if extra.entries <= 0:
+                        reasons.append("lookup_memory.entries must be > 0")
+                    if extra.topk <= 0:
+                        reasons.append("lookup_memory.topk must be > 0")
+                    if extra.topk > extra.entries:
+                        reasons.append("lookup_memory.topk cannot exceed entries")
+                    if extra.key_dim is not None and extra.key_dim <= 0:
+                        reasons.append("lookup_memory.key_dim must be > 0 when set")
+                    if extra.value_dim is not None and extra.value_dim <= 0:
+                        reasons.append("lookup_memory.value_dim must be > 0 when set")
+                    if extra.temperature <= 0.0:
+                        reasons.append("lookup_memory.temperature must be > 0")
+                    if extra.chunk_size <= 0:
+                        reasons.append("lookup_memory.chunk_size must be > 0")
                 elif isinstance(extra, BranchRouterConfig):
                     if not extra.targets:
                         reasons.append("branch_router requires non-empty targets")

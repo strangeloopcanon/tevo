@@ -18,6 +18,7 @@ from .dsl import (
     HyperConnectionsConfig,
     KVPolicyConfig,
     LayerScaleConfig,
+    LookupMemoryConfig,
     MemoryTokensConfig,
     MoEFFNConfig,
     RecurrenceConfig,
@@ -333,6 +334,60 @@ def tune_chunk_memory(spec: ArchitectureSpec, rng: random.Random) -> Architectur
         mem.head_dim = int(rng.choice([16, 32, 64]))
     if rng.random() < 0.3:
         mem.heads = int(rng.choice([1, 2, 4, 8]))
+    return child
+
+
+def insert_lookup_memory(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    block = rng.choice(child.model.blocks)
+    if any(isinstance(extra, LookupMemoryConfig) for extra in block.extras):
+        return tune_lookup_memory(child, rng)
+    dim = int(child.model.emb.dim)
+    entries = int(rng.choice([64, 128, 256, 512, 1024]))
+    topk = int(rng.choice([2, 4, 8]))
+    key_dim = int(rng.choice([max(16, dim // 4), max(16, dim // 2), dim]))
+    value_dim = int(rng.choice([max(16, dim // 2), dim]))
+    block.extras.append(
+        LookupMemoryConfig(
+            entries=entries,
+            topk=min(topk, entries),
+            key_dim=key_dim,
+            value_dim=value_dim,
+            temperature=rng.uniform(0.7, 1.5),
+            dropout=rng.choice([0.0, 0.0, 0.1]),
+            chunk_size=int(rng.choice([256, 512, 1024, 2048])),
+            lookup_device=rng.choice(["model", "model", "cpu"]),
+            gating_weight=rng.uniform(0.05, 0.3),
+        )
+    )
+    return child
+
+
+def tune_lookup_memory(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    candidates: list[LookupMemoryConfig] = []
+    for block in child.model.blocks:
+        for extra in block.extras:
+            if isinstance(extra, LookupMemoryConfig):
+                candidates.append(extra)
+    if not candidates:
+        return insert_lookup_memory(child, rng)
+    mem = rng.choice(candidates)
+    mem.gating_weight = max(0.0, min(1.0, float(mem.gating_weight + rng.uniform(-0.1, 0.1))))
+    mem.dropout = max(0.0, min(0.5, float(getattr(mem, "dropout", 0.0) + rng.uniform(-0.1, 0.1))))
+    if rng.random() < 0.5:
+        mem.temperature = max(0.1, float(getattr(mem, "temperature", 1.0) + rng.uniform(-0.3, 0.3)))
+    if rng.random() < 0.4:
+        mem.topk = int(rng.choice([1, 2, 4, 8, 16]))
+        mem.topk = max(1, min(mem.topk, int(mem.entries)))
+    if rng.random() < 0.3:
+        mem.entries = int(rng.choice([64, 128, 256, 512, 1024, 2048]))
+        mem.entries = max(1, mem.entries)
+        mem.topk = max(1, min(int(mem.topk), int(mem.entries)))
+    if rng.random() < 0.3:
+        mem.chunk_size = int(rng.choice([128, 256, 512, 1024, 2048]))
+    if rng.random() < 0.1:
+        mem.lookup_device = rng.choice(["model", "cpu"])
     return child
 
 
@@ -1019,6 +1074,8 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
         "tune_memory_tokens",
         "insert_chunk_memory",
         "tune_chunk_memory",
+        "insert_lookup_memory",
+        "tune_lookup_memory",
         "toggle_branch_router",
         "tune_branch_router",
         "insert_layer_scale",
@@ -1071,6 +1128,8 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_memory_tokens": tune_memory_tokens,
     "insert_chunk_memory": insert_chunk_memory,
     "tune_chunk_memory": tune_chunk_memory,
+    "insert_lookup_memory": insert_lookup_memory,
+    "tune_lookup_memory": tune_lookup_memory,
     "toggle_branch_router": toggle_branch_router,
     "tune_branch_router": tune_branch_router,
     "insert_layer_scale": insert_layer_scale,

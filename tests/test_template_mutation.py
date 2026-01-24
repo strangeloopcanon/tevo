@@ -3,7 +3,7 @@ import random
 import yaml
 
 from transformer_evolution_llm import template_mutation as tm
-from transformer_evolution_llm.dsl import ArchitectureSpec
+from transformer_evolution_llm.dsl import ArchitectureSpec, LookupMemoryConfig
 from transformer_evolution_llm.template_mutation import (
     MutationTemplate,
     _generate_random_template,
@@ -60,6 +60,54 @@ def test_template_mutation_changes_blocks(monkeypatch):
     rng = random.Random(0)  # noqa: S311 - deterministic test RNG
     mutated = apply_template_mutation(spec, rng)
     assert mutated.model.blocks[0].extras, "expected template mutation to add an extra module"
+
+
+def test_template_mutation_can_add_lookup_memory(monkeypatch):
+    spec = ArchitectureSpec(
+        model={
+            "name": "template-test-lookup",
+            "emb": {"dim": 128, "vocab": 100},
+            "blocks": [
+                {
+                    "attn": {"kind": "GQA", "heads": 4, "head_dim": 32},
+                    "ffn": {"type": "dense", "hidden": 512},
+                }
+            ],
+            "head": {"vocab": 100, "tie_embeddings": True},
+        },
+        train={"lr": 1e-3, "warmup": 1, "clip": 1.0},
+        data={
+            "tokenizer": "gpt2",
+            "seq_len": 64,
+            "batch_size": 1,
+            "workers": 0,
+            "shards": [{"name": "ag_news", "split": "train", "weight": 1.0}],
+        },
+    )
+
+    def fake_templates():
+        return [
+            MutationTemplate(
+                name="test-add-lookup",
+                weight=1.0,
+                conditions={},
+                actions=[
+                    {
+                        "add_extra": {
+                            "selector": "random",
+                            "extra_type": "lookup_memory",
+                            "params": {"entries": 64, "topk": 4, "key_dim": 32, "value_dim": 64},
+                        }
+                    }
+                ],
+            )
+        ]
+
+    monkeypatch.setattr(tm, "load_templates", fake_templates)
+
+    rng = random.Random(0)  # noqa: S311 - deterministic test RNG
+    mutated = apply_template_mutation(spec, rng)
+    assert any(isinstance(extra, LookupMemoryConfig) for extra in mutated.model.blocks[0].extras)
 
 
 def test_generate_random_template_produces_actions():

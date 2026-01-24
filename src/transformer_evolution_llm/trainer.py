@@ -790,7 +790,7 @@ def _estimate_long_recall(spec: ArchitectureSpec) -> float:
         for block in spec.model.blocks
         for extra in block.extras
         if getattr(extra, "type", None)
-        in {"retro", "assoc_memory", "memory_tokens", "chunk_memory"}
+        in {"retro", "assoc_memory", "memory_tokens", "chunk_memory", "lookup_memory"}
     )
     ssm_blocks = sum(1 for block in spec.model.blocks if block.ssm is not None)
     rec_spans = len(spec.model.recurrences)

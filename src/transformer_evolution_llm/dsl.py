@@ -585,6 +585,21 @@ class ChunkMemoryConfig(BaseModel):
     gating_weight: float = Field(default=0.1, ge=0.0, le=1.0)
 
 
+class LookupMemoryConfig(BaseModel):
+    """Conditional lookup from a learned key/value table."""
+
+    type: Literal["lookup_memory"] = "lookup_memory"
+    entries: int = Field(gt=0)
+    topk: int = Field(default=4, gt=0)
+    key_dim: int | None = Field(default=None, gt=0)
+    value_dim: int | None = Field(default=None, gt=0)
+    temperature: float = Field(default=1.0, gt=0.0)
+    dropout: float = Field(default=0.0, ge=0.0, le=1.0)
+    chunk_size: int = Field(default=1024, gt=0)
+    lookup_device: Literal["model", "cpu"] = "model"
+    gating_weight: float = Field(default=0.1, ge=0.0, le=1.0)
+
+
 class BranchRouterConfig(BaseModel):
     """Learned router that mixes branch outputs inside a block."""
 
@@ -612,6 +627,7 @@ ExtraModuleConfig = Annotated[
     | AssociativeMemoryConfig
     | MemoryTokensConfig
     | ChunkMemoryConfig
+    | LookupMemoryConfig
     | BranchRouterConfig
     | LayerScaleConfig,
     Field(discriminator="type"),

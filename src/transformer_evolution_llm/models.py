@@ -21,6 +21,7 @@ from .dsl import (
     GatedModuleConfig,
     HyperConnectionsConfig,
     LayerScaleConfig,
+    LookupMemoryConfig,
     MemoryTokensConfig,
     ModelConfig,
     MoECustomExpertConfig,
@@ -783,6 +784,103 @@ class ChunkMemoryModule(nn.Module):
         return cast(Tensor, out * float(getattr(self.cfg, "gating_weight", 0.0) or 0.0))
 
 
+class LookupMemoryModule(nn.Module):
+    """Conditional lookup from a learned key/value table."""
+
+    def __init__(self, cfg: LookupMemoryConfig, dim: int):
+        super().__init__()
+        self.cfg = cfg
+        self.entries = int(cfg.entries)
+        self.topk = max(1, min(int(getattr(cfg, "topk", 4) or 4), self.entries))
+        self.key_dim = int(getattr(cfg, "key_dim", None) or dim)
+        self.value_dim = int(getattr(cfg, "value_dim", None) or dim)
+        self.temperature = float(getattr(cfg, "temperature", 1.0) or 1.0)
+        self.dropout_p = float(getattr(cfg, "dropout", 0.0) or 0.0)
+        self.chunk_size = max(1, int(getattr(cfg, "chunk_size", 1024) or 1024))
+        self.lookup_device = str(getattr(cfg, "lookup_device", "model") or "model").lower()
+
+        init_std = 0.02
+        self.q_proj = nn.Linear(dim, self.key_dim, bias=False)
+        self.keys = nn.Parameter(torch.randn(self.entries, self.key_dim) * init_std)
+        self.values = nn.Parameter(torch.randn(self.entries, self.value_dim) * init_std)
+        self.out_proj: nn.Module
+        if self.value_dim == dim:
+            self.out_proj = nn.Identity()
+        else:
+            self.out_proj = nn.Linear(self.value_dim, dim, bias=False)
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        # Optional offload: keep the lookup table on CPU even when the rest of
+        # the model moves devices. This makes placement a searchable knob.
+        if self.lookup_device == "cpu":
+            with torch.no_grad():
+                self.keys.data = self.keys.data.cpu()
+                self.values.data = self.values.data.cpu()
+                if self.keys.grad is not None:
+                    self.keys.grad.data = self.keys.grad.data.cpu()
+                if self.values.grad is not None:
+                    self.values.grad.data = self.values.grad.data.cpu()
+        return self
+
+    def _topk_chunked(self, q: Tensor, keys: Tensor) -> tuple[Tensor, Tensor]:
+        """Chunked top-k retrieval over a key table.
+
+        Args:
+            q: (B, T, Dk)
+            keys: (N, Dk)
+        Returns:
+            (scores, idx): both (B, T, K)
+        """
+        b, t, d = q.shape
+        n = int(keys.shape[0])
+        k = max(1, min(self.topk, n))
+        chunk = max(1, min(self.chunk_size, n))
+        q2 = q.reshape(-1, d)
+        best_scores: Tensor | None = None
+        best_idx: Tensor | None = None
+        for start in range(0, n, chunk):
+            end = min(n, start + chunk)
+            keys_chunk = keys[start:end]
+            scores = (q2 @ keys_chunk.t()).view(b, t, end - start)
+            top_scores, top_idx = torch.topk(scores, k=min(k, end - start), dim=-1)
+            top_idx = top_idx + start
+            if best_scores is None or best_idx is None:
+                best_scores = top_scores
+                best_idx = top_idx
+                continue
+            cand_scores = torch.cat([best_scores, top_scores], dim=-1)
+            cand_idx = torch.cat([best_idx, top_idx], dim=-1)
+            best_scores, chosen = torch.topk(cand_scores, k=k, dim=-1)
+            best_idx = cand_idx.gather(-1, chosen)
+        if best_scores is None or best_idx is None:
+            return q.new_zeros(b, t, 1), q.new_zeros(b, t, 1, dtype=torch.int64)
+        return best_scores, best_idx
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, t, dim = x.shape
+        if self.entries <= 0:
+            return x.new_zeros(b, t, dim)
+
+        q = self.q_proj(x)
+        table_device = torch.device("cpu") if self.lookup_device == "cpu" else x.device
+
+        q_f = q.to(device=table_device, dtype=torch.float32)
+        keys_f = self.keys.to(device=table_device, dtype=torch.float32)
+        values_f = self.values.to(device=table_device, dtype=torch.float32)
+
+        scores, idx = self._topk_chunked(q_f, keys_f)
+        temp = self.temperature if self.temperature > 0.0 else 1.0
+        weights = torch.softmax(scores / temp, dim=-1)
+        selected = values_f[idx]  # (B, T, K, value_dim)
+        out = (weights.unsqueeze(-1) * selected).sum(dim=-2)
+        out = out.to(device=x.device, dtype=x.dtype)
+        out = cast(Tensor, self.out_proj(out))
+        if self.dropout_p > 0.0:
+            out = cast(Tensor, F.dropout(out, p=self.dropout_p, training=self.training))
+        return cast(Tensor, out * float(getattr(self.cfg, "gating_weight", 0.0) or 0.0))
+
+
 class BranchRouter(nn.Module):
     def __init__(self, cfg: BranchRouterConfig, dim: int):
         super().__init__()
@@ -931,6 +1029,8 @@ class EvolutionBlock(nn.Module):
                 self.memory_extras.append(MemoryTokensModule(extra, dim))
             elif isinstance(extra, ChunkMemoryConfig):
                 self.memory_extras.append(ChunkMemoryModule(extra, dim))
+            elif isinstance(extra, LookupMemoryConfig):
+                self.memory_extras.append(LookupMemoryModule(extra, dim))
             elif isinstance(extra, BranchRouterConfig):
                 router_cfgs.append(extra)
             elif isinstance(extra, LayerScaleConfig):

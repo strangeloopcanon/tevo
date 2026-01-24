@@ -3,17 +3,20 @@ import random
 from transformer_evolution_llm.dsl import (
     ArchitectureSpec,
     CustomModuleConfig,
+    LookupMemoryConfig,
     MoEFFNConfig,
     RetroConfig,
 )
 from transformer_evolution_llm.mutations import (
     dense_to_moe,
     insert_custom_module,
+    insert_lookup_memory,
     insert_retro_module,
     make_gqa,
     mutate_topk,
     toggle_gated_mix,
     toggle_hyper_connections,
+    tune_lookup_memory,
 )
 
 
@@ -63,3 +66,20 @@ def test_toggle_hyper_connections_toggles_streams(tiny_spec: ArchitectureSpec) -
     assert enabled.model.hyper.streams > 1
     disabled = toggle_hyper_connections(enabled, rng=rng)
     assert disabled.model.hyper is None
+
+
+def test_insert_lookup_memory_adds_extra(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(7)  # noqa: S311 - deterministic unit tests
+    child = insert_lookup_memory(tiny_spec, rng=rng)
+    assert any(isinstance(extra, LookupMemoryConfig) for extra in child.model.blocks[0].extras)
+
+
+def test_tune_lookup_memory_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(8)  # noqa: S311 - deterministic unit tests
+    with_mem = insert_lookup_memory(tiny_spec, rng=rng)
+    tuned = tune_lookup_memory(with_mem, rng=rng)
+    mem = next(
+        extra for extra in tuned.model.blocks[0].extras if isinstance(extra, LookupMemoryConfig)
+    )
+    assert mem.entries > 0
+    assert 0 < mem.topk <= mem.entries

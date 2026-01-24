@@ -21,6 +21,7 @@ from .dsl import (
     DenseFFNConfig,
     GatedModuleConfig,
     LayerScaleConfig,
+    LookupMemoryConfig,
     MemoryTokensConfig,
     MoEFFNConfig,
     RetroConfig,
@@ -367,6 +368,20 @@ def _add_extra(spec: ArchitectureSpec, params: TemplateAction, rng: random.Rando
                 heads=int(extra_params.get("heads", 2)),
                 head_dim=int(extra_params.get("head_dim", 32)),
                 dropout=float(extra_params.get("dropout", 0.0)),
+                gating_weight=float(extra_params.get("gating_weight", 0.1)),
+            )
+        )
+    elif extra_type == "lookup_memory":
+        block.extras.append(
+            LookupMemoryConfig(
+                entries=int(extra_params.get("entries", 256)),
+                topk=int(extra_params.get("topk", 4)),
+                key_dim=extra_params.get("key_dim"),
+                value_dim=extra_params.get("value_dim"),
+                temperature=float(extra_params.get("temperature", 1.0)),
+                dropout=float(extra_params.get("dropout", 0.0)),
+                chunk_size=int(extra_params.get("chunk_size", 1024)),
+                lookup_device=str(extra_params.get("lookup_device", "model") or "model"),
                 gating_weight=float(extra_params.get("gating_weight", 0.1)),
             )
         )
