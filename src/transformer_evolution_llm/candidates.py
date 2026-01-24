@@ -30,7 +30,21 @@ class Candidate:
         self.metrics[name] = value
 
     def score(self, weights: dict[str, float]) -> float:
-        return sum(self.metrics.get(k, 0.0) * w for k, w in weights.items())
+        if self.status != "completed":
+            return -math.inf
+        total = 0.0
+        for metric, weight in weights.items():
+            value = self.metrics.get(metric)
+            if value is None:
+                return -math.inf
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError):
+                return -math.inf
+            if not math.isfinite(value_f):
+                return -math.inf
+            total += value_f * float(weight)
+        return total
 
     def serialize(self) -> dict[str, Any]:
         return {
