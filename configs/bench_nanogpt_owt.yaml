@@ -1,0 +1,56 @@
+model:
+  name: bench-nanogpt-owt
+  emb:
+    dim: 512
+    vocab: 50257
+    dropout: 0.0
+  blocks:
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+  head:
+    tie_embeddings: true
+    vocab: 50257
+  norm: rmsnorm
+train:
+  lr: 0.0008
+  warmup: 200
+  clip: 1.0
+  bf16: false
+  grad_ckpt: true
+  max_tokens: 200000
+  weight_decay: 0.02
+  seed: 4242
+  passkey_eval_steps: 0
+  speedrun_eval_interval: 20
+  speedrun_eval_batches: 4
+  speedrun_target_ppl: 6000.0
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 500.0
+  no_improve_patience: 40
+  improvement_tolerance: 0.001
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  packed: true
+  packed_train_path: runs/packed/openwebtext/train.bin
+  packed_val_path: runs/packed/openwebtext/val.bin
+  packed_dtype: uint16
+  seq_len: 256
+  batch_size: 8
+  workers: 0
+  shards: []
+  eval_tokens: 16384
+  healing_shards: []
+  healing_tokens: null

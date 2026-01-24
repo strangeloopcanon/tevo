@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from typing import Any
 
+import numpy as np
 import torch
 
 from transformer_evolution_llm import dsl
@@ -82,3 +83,34 @@ def test_data_module_accepts_config_in_split(monkeypatch):
     retry_args, retry_kwargs = calls[1]
     assert retry_args == ("wikitext", "wikitext-2-raw-v1")
     assert retry_kwargs["split"] == "train"
+
+
+def test_data_module_packed_batches(monkeypatch, tmp_path):
+    from transformer_evolution_llm import data as data_module
+
+    class Loader:
+        @staticmethod
+        def from_pretrained(_name: str, **_kwargs: Any) -> DummyTokenizer:
+            return DummyTokenizer()
+
+    monkeypatch.setattr(data_module, "AutoTokenizer", Loader)
+
+    train_path = tmp_path / "train.bin"
+    val_path = tmp_path / "val.bin"
+    np.arange(0, 256, dtype=np.uint16).tofile(train_path)
+    np.arange(0, 128, dtype=np.uint16).tofile(val_path)
+
+    cfg = dsl.DataConfig(
+        tokenizer="hf-internal-testing/tiny-random-gpt2",
+        seq_len=8,
+        batch_size=2,
+        workers=0,
+        shards=[],
+        packed=True,
+        packed_train_path=str(train_path),
+        packed_val_path=str(val_path),
+        packed_split="train",
+    )
+    module = DataModule(cfg)
+    batch = next(module.batches(max_tokens=16))
+    assert batch.input_ids.shape == (2, 8)

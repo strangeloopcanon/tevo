@@ -8,6 +8,7 @@ __pycache__/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+.codex/
 .benchmarks/
 .venv/
 *.egg-info/

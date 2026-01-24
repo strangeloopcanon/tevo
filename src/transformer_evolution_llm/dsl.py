@@ -752,6 +752,22 @@ class DataConfig(BaseModel):
         default=True,
         description="Use streaming datasets (avoids full downloads; requires network).",
     )
+    packed: bool = Field(
+        default=False,
+        description="Use packed-token stream files instead of per-shard text datasets.",
+    )
+    packed_train_path: str | None = Field(
+        default=None, description="Path to packed-token train file (e.g., train.bin)."
+    )
+    packed_val_path: str | None = Field(
+        default=None, description="Path to packed-token val file (e.g., val.bin)."
+    )
+    packed_split: Literal["train", "val"] | None = Field(
+        default=None, description="Override split when reading packed tokens."
+    )
+    packed_dtype: Literal["uint16", "int32"] = Field(
+        default="uint16", description="Packed-token dtype on disk."
+    )
     seq_len: int = Field(default=2048, gt=0)
     batch_size: int = Field(default=1, gt=0)
     workers: int = Field(default=2, ge=0)
@@ -763,10 +779,18 @@ class DataConfig(BaseModel):
 
     @field_validator("shards")
     @classmethod
-    def non_empty(cls, value: list[DatasetShard]) -> list[DatasetShard]:
+    def non_empty(cls, value: list[DatasetShard], info: ValidationInfo) -> list[DatasetShard]:
+        if info.data.get("packed"):
+            return value
         if not value:
             raise ValueError("Provide at least one dataset shard.")
         return value
+
+    @model_validator(mode="after")
+    def validate_packed_paths(self) -> DataConfig:
+        if self.packed and not self.packed_train_path:
+            raise ValueError("packed_train_path is required when packed=true.")
+        return self
 
     @property
     def total_weight(self) -> float:
@@ -828,6 +852,8 @@ class EvolutionConfig(BaseModel):
     promotion_min_recurrence_gain: float = Field(default=0.0)
     promotion_max_instability: float | None = Field(default=None, ge=0.0)
     archive_max_elites: int = Field(default=0, ge=0)
+    structural_elite_k: int = Field(default=2, ge=0)
+    structural_elite_weights: dict[str, float] | None = None
     adaptive_mutation: bool = False
     adaptive_mutation_eta: float = Field(default=0.1, gt=0.0, le=1.0)
     adaptive_mutation_min_weight: float = Field(default=0.05, gt=0.0)

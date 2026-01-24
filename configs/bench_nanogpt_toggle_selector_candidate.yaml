@@ -1,0 +1,80 @@
+model:
+  name: bench-nanogpt-toggle-selector-candidate
+  emb:
+    dim: 768
+    vocab: 50257
+    dropout: 0.0
+  blocks:
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+    - attn:
+        kind: MHA
+        heads: 12
+        head_dim: 64
+        rope: standard
+        kv_groups: 1
+        dropout: 0.0
+        selector: dsa
+        selector_topk: 192
+        selector_heads: 1
+        selector_dim: 64
+        selector_rope: full
+        selector_detach: true
+      ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
+  head:
+    tie_embeddings: true
+    vocab: 50257
+  norm: layernorm
+train:
+  lr: 6.0e-4
+  warmup: 20
+  clip: 1.0
+  bf16: false
+  grad_ckpt: true
+  max_tokens: 600000
+  weight_decay: 0.1
+  seed: 4242
+  passkey_eval_steps: 0
+  speedrun_eval_interval: 10
+  speedrun_eval_batches: 4
+  speedrun_target_ppl: 3300.0
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 500.0
+  no_improve_patience: 60
+  improvement_tolerance: 0.001
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  packed: true
+  packed_train_path: runs/packed/openwebtext/train.bin
+  packed_val_path: runs/packed/openwebtext/val.bin
+  packed_dtype: uint16
+  seq_len: 1024
+  batch_size: 2
+  workers: 0
+  shards: []
+  eval_tokens: 65536
+  healing_shards: []
+  healing_tokens: null

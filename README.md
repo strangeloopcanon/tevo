@@ -464,6 +464,8 @@ Additional documentation in the `docs/` folder:
 |----------|-------------|
 | [evolution_takeaways.md](docs/evolution_takeaways.md) | Detailed lessons learned from multiple evolutionary sweeps—how to set up evolution to discover specific architecture families. |
 | [gpu_run_plan.md](docs/gpu_run_plan.md) | Playbook for running evolution on GPU-rich machines (A100, 4090) with larger models (350M–1B params). |
+| [modal_run.md](docs/modal_run.md) | How to run evolution and benchmarks on Modal GPUs with volume setup. |
+| [nanogpt_benchmark.md](docs/nanogpt_benchmark.md) | NanoGPT-style benchmark contract (packed OpenWebText + HF mix) and speedrun metrics. |
 | [scale_policy.md](docs/scale_policy.md) | Soft priors and scaling policies for moving from laptop surrogates to production scale. |
 
 </details>
@@ -477,11 +479,11 @@ The current phase runs on single-machine surrogates (~100 M parameters). To scal
 2. Keep `grad_ckpt` on.
 3. Re-tune `--score-weight-*` for production priorities.
 
-### Speedrun-style relevance (directional)
+### NanoGPT-style benchmark (implemented)
 
-The NanoGPT speedrun record for training a 124M model to a target validation loss on FineWeb—typically on an 8×H100 pod—has improved rapidly (community reports went from ~45 minutes to under 3 minutes, with recent figures around ~2.3–2.9 minutes).
+So what: we now have a fixed, repeatable benchmark path (packed OpenWebText + HF mix) that logs *time/tokens to target* alongside `val_ppl`, so architectures can be compared on training efficiency, not just short-run perplexity.
 
-So what: once we're happy with local motif discovery, we can add an optional "speedrun-style" eval path that measures *time-to-target*/*tokens-to-target* under a fixed NanoGPT-like recipe, so architectures are judged on training efficiency (not just short-run perplexity).
+Use `docs/nanogpt_benchmark.md` for the contract and commands.
 
 ### Sparse attention patterns
 The DSL supports `sparsity: none|sliding|block|local_global|dilated|local_block`.
@@ -515,6 +517,13 @@ python scripts/fit_scaling.py runs/<run_1>/frontier.json runs/<run_2>/frontier.j
 | `frontier_phi_seeded128` | `seed_xover-48-9237.yaml` (128 gens) | 25 | Shallow retro-heavy stacks; `ppl_code≈1.0` |
 | `frontier_phi_gated128` | `live_phi_tiny.yaml` (128 gens) | 1 | Deep (12 layers) but unstable |
 | `frontier_phi_entropy_v2` | `seed_xover-48-9237.yaml` (160 gens) | 99 | Balanced mix of shallow retro and deep MoE/SSM hybrids (up to 30 layers) |
+
+### Modal Runs (NanoGPT objective)
+
+| Run | Config | Frontier Size | Notable Findings |
+|-----|--------|---------------|------------------|
+| `modal_nanogpt_speedrun_long1` | `exp_nanogpt_speedrun_owt.yaml` (24 gens, 120 steps) | 7 | Dense MHA stacks (9–12 layers); no MoE/SSM/retro; KV window + Alibi variants |
+| `modal_nanogpt_speedrun_long3` | `exp_nanogpt_speedrun_owt.yaml` (48 gens, 180 steps) | 8 | Dense MHA stacks with layer-count shifts; no MoE/SSM/retro in frontier; small toggles (Alibi/precision/graph) |
 
 ### Architecture Highlights (Historical)
 

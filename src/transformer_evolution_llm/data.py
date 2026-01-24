@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import random
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -28,6 +31,8 @@ class DataModule:
         self._seed = int(seed)
         self._rng = random.Random(self._seed)  # noqa: S311  # nosec B311 - deterministic batches
         self._dataset_cache: dict[tuple[str, str, str, bool, str | None], object] = {}
+        self._packed = bool(getattr(cfg, "packed", False))
+        self._packed_cache: dict[str, np.memmap] = {}
         self.tokenizer = AutoTokenizer.from_pretrained(
             cfg.tokenizer,
             revision=cfg.hf_revision,
@@ -131,6 +136,9 @@ class DataModule:
         return DataModule._BatchIterable(self, max_tokens)
 
     def _batch_generator(self, max_tokens: int | None) -> Iterator[TokenBatch]:
+        if self._packed:
+            yield from self._packed_batch_generator(max_tokens)
+            return
         budget = max_tokens
         healing_remaining = self.cfg.healing_tokens if self.cfg.healing_shards else None
 
@@ -173,6 +181,57 @@ class DataModule:
                 budget -= tokens
                 if budget <= 0:
                     return
+
+    def _packed_batch_generator(self, max_tokens: int | None) -> Iterator[TokenBatch]:
+        split = getattr(self.cfg, "packed_split", None) or "train"
+        tokens = self._packed_tokens(split)
+        seq_len = int(self.cfg.seq_len)
+        batch_size = max(1, int(self.cfg.batch_size))
+        max_start = int(tokens.shape[0]) - seq_len - 1
+        if max_start <= 0:
+            raise ValueError("Packed token stream is too short for seq_len.")
+        budget = max_tokens
+        while True:
+            starts = [self._rng.randrange(0, max_start) for _ in range(batch_size)]
+            rows = [np.array(tokens[s : s + seq_len], dtype=np.int64) for s in starts]
+            batch = np.stack(rows, axis=0)
+            input_ids = torch.from_numpy(batch)
+            attention_mask = torch.ones_like(input_ids)
+            uids = [f"packed-{split}-{s}" for s in starts]
+            yield TokenBatch(input_ids=input_ids, attention_mask=attention_mask, uids=uids)
+            if budget is not None:
+                budget -= seq_len * batch_size
+                if budget <= 0:
+                    return
+
+    def _packed_tokens(self, split: str) -> np.memmap:
+        split_key = "val" if split == "val" else "train"
+        cached = self._packed_cache.get(split_key)
+        if cached is not None:
+            return cached
+        train_path = getattr(self.cfg, "packed_train_path", None)
+        val_path = getattr(self.cfg, "packed_val_path", None)
+        path = train_path if split_key == "train" else (val_path or train_path)
+        if not path:
+            raise ValueError("Packed token path is missing in DataConfig.")
+        dtype_name = getattr(self.cfg, "packed_dtype", "uint16")
+        dtype = np.uint16 if dtype_name == "uint16" else np.int32
+        token_path = Path(path).expanduser()
+        if not token_path.is_absolute():
+            packed_root = os.environ.get("TEVO_PACKED_ROOT")
+            if packed_root:
+                parts = token_path.parts
+                if parts and parts[0] == "runs":
+                    token_path = Path(packed_root, *parts[1:])
+                else:
+                    token_path = Path(packed_root) / token_path
+            else:
+                token_path = Path.cwd() / token_path
+        if not token_path.exists():
+            raise FileNotFoundError(f"Packed token file not found: {token_path}")
+        tokens = np.memmap(token_path, dtype=dtype, mode="r")
+        self._packed_cache[split_key] = tokens
+        return tokens
 
     def _shard_iter(self, shard: DatasetShard) -> Iterable[TokenBatch]:
         dataset = self._load_dataset(shard)

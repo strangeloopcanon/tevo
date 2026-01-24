@@ -1,0 +1,67 @@
+model:
+  name: bench-nanogpt-hfmix
+  emb:
+    dim: 512
+    vocab: 50257
+    dropout: 0.0
+  blocks:
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+    - attn: { kind: GQA, heads: 8, head_dim: 64, rope: yarn, kv_groups: 4, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: swiglu, dropout: 0.0 }
+  head:
+    tie_embeddings: true
+    vocab: 50257
+  norm: rmsnorm
+train:
+  lr: 0.0008
+  warmup: 200
+  clip: 1.0
+  bf16: false
+  grad_ckpt: true
+  max_tokens: 200000
+  weight_decay: 0.02
+  seed: 4242
+  passkey_eval_steps: 0
+  speedrun_eval_interval: 20
+  speedrun_eval_batches: 4
+  speedrun_target_ppl: 2600.0
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 500.0
+  no_improve_patience: 40
+  improvement_tolerance: 0.001
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  seq_len: 256
+  batch_size: 4
+  workers: 0
+  shards:
+    - name: ag_news
+      split: train
+      weight: 0.25
+    - name: wikitext
+      split: wikitext-2-raw-v1
+      weight: 0.35
+    - name: mbpp
+      split: train
+      weight: 0.4
+  eval_shards:
+    - name: ag_news
+      split: test
+      weight: 1.0
+    - name: wikitext
+      split: wikitext-2-raw-v1:test
+      weight: 1.0
+    - name: mbpp
+      split: test
+      weight: 1.0
+  eval_tokens: 16384
+  healing_shards: []
+  healing_tokens: null

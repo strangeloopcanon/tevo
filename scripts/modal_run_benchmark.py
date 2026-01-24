@@ -1,10 +1,4 @@
-"""Run scripts/run_live.py on Modal GPUs.
-
-This is intentionally minimal: it runs one full evolutionary sweep inside a
-single Modal container (so weight inheritance stays local), writes run artifacts
-to a persisted Modal Volume, and optionally downloads the frontier/state JSONs
-back into the local repo.
-"""
+"""Run scripts/run_benchmark.py on Modal GPUs."""
 
 from __future__ import annotations
 
@@ -18,7 +12,7 @@ import modal
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 GPU = os.environ.get("TEVO_MODAL_GPU", "A10G")
-TIMEOUT_S = int(os.environ.get("TEVO_MODAL_TIMEOUT_S", str(60 * 60 * 12)))
+TIMEOUT_S = int(os.environ.get("TEVO_MODAL_TIMEOUT_S", str(60 * 60 * 6)))
 PYTORCH_INDEX_URL = os.environ.get("TEVO_TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu124")
 TORCH_VERSION = os.environ.get("TEVO_TORCH_VERSION", "2.6.0+cu124")
 
@@ -30,7 +24,6 @@ HF_VOL = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
 
 
 def _ignore_repo_path(path: Path) -> bool:
-    # Keep the image small and avoid bundling local artifacts.
     if path.name.startswith(".env"):
         return True
     if path.name in {".coverage", "htmlcov"}:
@@ -85,7 +78,7 @@ IMAGE = (
     .add_local_dir(str(REPO_ROOT), remote_path="/repo", ignore=_ignore_repo_path)
 )
 
-app = modal.App("transformer-evolution-llm-live")
+app = modal.App("transformer-evolution-llm-benchmark")
 
 
 @app.function(
@@ -96,26 +89,22 @@ app = modal.App("transformer-evolution-llm-live")
     timeout=TIMEOUT_S,
     volumes={"/runs": RUNS_VOL, "/hf": HF_VOL},
 )
-def run_live(
+def run_benchmark(
     *,
     config_path: str,
-    generations: int,
     steps: int,
     eval_batches: int,
     seed: int,
     run_id: str | None,
-    cleanup_old_checkpoints: bool,
-    prune_checkpoints_to_frontier: bool,
-    lineage: bool,
+    max_tokens: int | None,
 ) -> dict[str, str]:
-    run_name = run_id or f"modal_{int(time.time())}"
-    runs_root = Path("/runs")
+    run_name = run_id or f"bench_{int(time.time())}"
+    runs_root = Path("/runs/benchmarks")
     run_root = runs_root / run_name
     run_root.mkdir(parents=True, exist_ok=True)
 
-    out_path = run_root / "frontier.json"
-    lineage_path = run_root / "lineage.json"
-    checkpoint_dir = run_root / "checkpoints"
+    out_path = run_root / "summary.json"
+    history_path = run_root / "history.json"
 
     cfg_path = Path(config_path)
     if not cfg_path.is_absolute():
@@ -123,12 +112,10 @@ def run_live(
 
     cmd = [
         "python",
-        "/repo/scripts/run_live.py",
+        "/repo/scripts/run_benchmark.py",
         str(cfg_path),
         "--device",
         "cuda",
-        "--generations",
-        str(int(generations)),
         "--steps",
         str(int(steps)),
         "--eval-batches",
@@ -137,54 +124,40 @@ def run_live(
         str(int(seed)),
         "--out",
         str(out_path),
-        "--checkpoint-dir",
-        str(checkpoint_dir),
+        "--history-out",
+        str(history_path),
     ]
-    if cleanup_old_checkpoints:
-        cmd.append("--cleanup-old-checkpoints")
-    else:
-        cmd.append("--no-cleanup-old-checkpoints")
-    if prune_checkpoints_to_frontier:
-        cmd.append("--prune-checkpoints-to-frontier")
-    if lineage:
-        cmd.extend(["--lineage-out", str(lineage_path)])
+    if max_tokens is not None:
+        cmd.extend(["--max-tokens", str(int(max_tokens))])
 
     subprocess.run(cmd, check=True)
     RUNS_VOL.commit()
     HF_VOL.commit()
     return {
         "run_id": run_name,
-        "frontier": f"{run_name}/frontier.json",
-        "state": f"{run_name}/frontier.state.json",
-        "lineage": f"{run_name}/lineage.json",
-        "manifest": f"{run_name}/frontier.manifest.json",
+        "summary": f"benchmarks/{run_name}/summary.json",
+        "history": f"benchmarks/{run_name}/history.json",
     }
 
 
 @app.local_entrypoint()
 def main(
     config_path: str,
-    generations: int = 48,
-    steps: int = 360,
+    steps: int = 240,
     eval_batches: int = 4,
     seed: int = 0,
     run_id: str | None = None,
+    max_tokens: int | None = None,
     download: bool = False,
     local_out_dir: str = "runs/modal",
-    cleanup_old_checkpoints: bool = True,
-    prune_checkpoints_to_frontier: bool = False,
-    lineage: bool = False,
 ) -> None:
-    result = run_live.remote(
+    result = run_benchmark.remote(
         config_path=config_path,
-        generations=generations,
         steps=steps,
         eval_batches=eval_batches,
         seed=seed,
         run_id=run_id,
-        cleanup_old_checkpoints=cleanup_old_checkpoints,
-        prune_checkpoints_to_frontier=prune_checkpoints_to_frontier,
-        lineage=lineage,
+        max_tokens=max_tokens,
     )
     print(result)
 
@@ -193,7 +166,7 @@ def main(
     out_root = Path(local_out_dir) / str(result["run_id"])
     out_root.mkdir(parents=True, exist_ok=True)
 
-    for key in ("frontier", "state", "lineage", "manifest"):
+    for key in ("summary", "history"):
         remote_path = result.get(key) or ""
         if not remote_path:
             continue

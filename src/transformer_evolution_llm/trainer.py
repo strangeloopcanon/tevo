@@ -6,7 +6,7 @@ import gc
 import json as std_json
 import math
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,7 @@ class FullWeightTrainer:
         instability_threshold: float = 5.0,
         no_improve_patience: int = 20,
         improvement_tolerance: float = 1e-3,
+        speedrun_callback: Callable[[int, float, int], None] | None = None,
     ) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -58,6 +59,7 @@ class FullWeightTrainer:
         self.no_improve_patience = no_improve_patience
         self.improvement_tolerance = improvement_tolerance
         self._eval_module_cache: dict[str, DataModule] = {}
+        self.speedrun_callback = speedrun_callback
 
     def _get_eval_module(
         self, spec: ArchitectureSpec, *, eval_batches: int | None = None
@@ -74,6 +76,8 @@ class FullWeightTrainer:
         eval_cfg = spec.data.model_copy(deep=True)
         if eval_shards:
             eval_cfg.shards = list(eval_shards)
+        if getattr(eval_cfg, "packed", False):
+            eval_cfg.packed_split = "val"
         eval_cfg.healing_shards = []
         eval_cfg.healing_tokens = None
 
@@ -336,6 +340,8 @@ class FullWeightTrainer:
                     loss_val = 1e9
                 if loss_val < speedrun_best_loss:
                     speedrun_best_loss = loss_val
+                if self.speedrun_callback is not None and math.isfinite(float(loss_val)):
+                    self.speedrun_callback(int(step_idx + 1), float(loss_val), int(tokens_seen))
                 if speedrun_target_loss is not None and loss_val <= speedrun_target_loss:
                     speedrun_reached = True
                     speedrun_steps_to_target = float(step_idx + 1)
