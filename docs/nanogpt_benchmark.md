@@ -76,8 +76,14 @@ Build the cache:
 PYTHONPATH=src python scripts/prepare_packed_data.py \
   --dataset openwebtext \
   --out-dir runs/packed/openwebtext \
-  --streaming
+  --streaming \
+  --max-train-tokens 10000000 \
+  --max-val-tokens 1000000
 ```
+
+Notes:
+- The packed files are just token ids, so sizes are predictable (`uint16` ≈ 2 bytes/token). The example above is ~22MB on disk.
+- For a quick smoke cache, drop those caps down (for example `--max-train-tokens 200000 --max-val-tokens 50000`).
 
 On Modal, point `packed_train_path` / `packed_val_path` at a mounted volume (for example `/runs/packed/openwebtext/train.bin`).
 If you keep relative paths like `runs/packed/...`, set `TEVO_PACKED_ROOT=/runs` inside the container.

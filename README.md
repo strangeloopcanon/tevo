@@ -1,38 +1,66 @@
 # Transformer Evolution LLM
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/strangeloopcanon/transformer-evolution-llm)
 
-An autonomous evolution loop that invents new LLM blueprints. This system uses a typed DSL, mutation templates, and checkpoint-aware crossover to evolve Transformer architectures that are optimized for specific constraints (perplexity, throughput, memory).
+An evolutionary architecture-search loop for Transformer-like language models.
 
-Instead of just tuning hyperparameters, this project evolves the *topology* of the model itself—inserting memory blocks, switching attention types (dense/sparse/linear), toggling MoE/SSM layers, and wiring complex residual paths—while reusing weights to avoid training from scratch.
+Architectures are defined in typed YAML (Pydantic). The loop mutates/crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. To keep the search practical, children can inherit weights from parents and crossover merges checkpoints when possible.
 
 ## Why This Exists
 
-**Manual architecture design is slow and biased by what we already know.** Every major LLM architecture—from vanilla Transformers to modern innovations like [DeepSeek's MoE routing](https://arxiv.org/abs/2401.06066), [Google's Titans](https://arxiv.org/abs/2501.00663) with neural long-term memory, or hybrid SSM-attention models—was discovered through expensive human intuition and trial-and-error.
+This repo is a sandbox for answering questions like: “under a fixed training recipe and constraints, what kinds of architectural motifs survive?”
 
-This project asks: *what if we let evolution discover these building blocks automatically?*
+It’s meant to be:
+- A way to explore trade-offs (quality vs speed vs memory) without hand-writing dozens of model variants.
+- A way to make results inspectable: every run emits a frontier plus lineage describing how candidates were produced.
 
-- **Architecture search, not hyperparameter tuning**: We mutate the actual structure—adding memory modules, swapping attention types, inserting routing layers—not just learning rates or widths.
-- **Lamarckian speedup**: Children inherit trained weights from parents, so evolution doesn't restart training from scratch each generation.
-- **Multi-objective exploration**: The Pareto frontier tracks trade-offs across perplexity, throughput, memory, and structural complexity—no single "best" model, but a menu of options.
-
-The goal is to use laptop-scale surrogates (~65–100M params) as a fast "architecture microscope" to discover promising motifs that can then be scaled up.
+The goal is to use laptop-scale surrogates (~65–100M params) as a fast feedback loop to discover motifs that can then be scaled up.
 
 ## Key Features
 
 - **Typed DSL**: Architectures are defined in YAML/JSON using a strict Pydantic-based schema (`src/transformer_evolution_llm/dsl.py`), ensuring all generated candidates are valid by construction.
-- **Weight Inheritance**: "Lamarckian" evolution where child models inherit trained weights from parents, significantly reducing the compute needed to validate new designs.
-- **Multi-Objective Optimization**: Uses Pareto frontiers to trade off conflicting goals like Perplexity vs. Throughput vs. Parameter Count.
+- **Weight Inheritance + Checkpoint-Aware Crossover**: Children can inherit parent weights; crossover attempts to merge state dicts so you don’t always restart from scratch.
+- **Multi-Objective Optimization**: Maintains a Pareto frontier over metrics like perplexity, throughput, RAM proxy, and structural complexity.
 - **Rich Mutation Primitives**: Includes structural mutations (add/remove blocks, split layers), component swaps (Attention ↔ MoE ↔ SSM), and hyperparameter tuning.
 - **Template Learning (experimental)**: Optionally adjusts and persists mutation templates based on which template mutations improve objectives (`evolution.template_learning`, `evolution.template_learning_save_path`).
 - **Graph Module Primitive (experimental)**: A built-in `graph_module` component that can be inserted as a custom extra so search can explore small operator graphs, not just fixed blocks.
 - **Audit Lineage**: Every discovery comes with a full JSON lineage and visualization tools, explaining exactly *how* a specific architecture was derived.
+- **NanoGPT-style benchmark path (implemented)**: A repeatable speedrun-style metric (`tokens/time to target`) for comparing training efficiency inside this repo (see `docs/nanogpt_benchmark.md`).
+
+## What You Get From A Run
+
+A run writes a small set of artifacts under `runs/<run_id>/`:
+- `frontier.json`: the non-dominated candidates (each has a full `spec` + `metrics` + `id`).
+- `lineage.json` / `frontier_lineage.json`: parent links and mutation/crossover history.
+- `frontier.manifest.json`: the run recipe + environment snapshot.
+- `checkpoints/` (optional): model checkpoints (often pruned to frontier-only).
+
+See “Run Folder: What’s What” below for the full list.
+
+## Scope (What This Is / Is Not)
+
+- **Bounded search space:** evolution can only produce what the DSL + mutation set can express. To explore a new primitive (e.g. a new memory operator), you have to add it to the codebase first.
+- **Short-budget proxies:** most metrics come from short surrogate training. Expect the frontier to move when you increase data, steps, or change objectives.
+- **Not a leaderboard:** the NanoGPT-style benchmark is for repeatable *within-repo* comparisons. The micro-benchmark numbers in this README used a tiny packed OpenWebText subset; regenerate a larger cache before drawing conclusions.
+- **Not interpretability tooling:** this repo can discover motifs; it does not (yet) provide mechanistic explanations for why a motif works.
+
+<details>
+<summary>Extending the search space (adding a new primitive)</summary>
+
+At a high level:
+
+1) Add a typed config to the DSL (`src/transformer_evolution_llm/dsl.py`).
+2) Implement the module in the model code (`src/transformer_evolution_llm/models.py`).
+3) Add any static checks / cost estimates (`src/transformer_evolution_llm/evaluation.py`).
+4) Add a mutation operator so evolution can discover it (`src/transformer_evolution_llm/mutations.py` or `src/transformer_evolution_llm/template_mutation.py`).
+
+</details>
 
 ## Installation
 
 ### Prerequisites
 - Python 3.11+
 - A compatible accelerator (CUDA, MPS, or CPU)
-- `uv` (used by `make setup`)
+- `uv` (used by `make setup`; install via `brew install uv` or see [astral.sh/uv](https://astral.sh/uv/))
 - [Optional] A Hugging Face token (for dataset access): `HF_TOKEN`
 
 ### Setup
@@ -54,8 +82,11 @@ Optional environment:
 
 ## Quick Start
 
-### 1. Run a Smoke Test
-Verify the installation by running a tiny evolution loop on CPU:
+### 10-minute tour (end-to-end)
+
+So what: run a tiny search, inspect what survived, then rerun/benchmark one candidate.
+
+1) Run a smoke evolution loop (CPU):
 
 ```bash
 export TOKENIZERS_PARALLELISM=false
@@ -74,8 +105,39 @@ python scripts/run_live.py configs/live_smoke.yaml \
 python scripts/report_motifs.py "$RUN/frontier.json" --lineage "$RUN/frontier_lineage.json" --top 10
 ```
 
-### 2. Run a Long-Context Sweep (Mac M4 / MPS)
-This matches the "newest long‑context frontier" section below and is designed to stay disk-safe by pruning checkpoints to just the frontier.
+2) Export one candidate as a new seed and rerun it:
+
+```bash
+REPLAY="runs/replay_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$REPLAY"
+# Pick an id printed by report_motifs.py above.
+CANDIDATE_ID="<paste_id_here>"
+python scripts/export_seed.py "$RUN/frontier.json" --id "$CANDIDATE_ID" --out-config "$REPLAY/seed.yaml"
+python scripts/run_live.py "$REPLAY/seed.yaml" \
+  --device cpu --generations 1 --steps 40 --eval-batches 2 --seed 0 \
+  --out "$REPLAY/frontier.json" \
+  --checkpoint-dir "$REPLAY/checkpoints" \
+  2>&1 | tee "$REPLAY/live.log"
+```
+
+3) (Optional) Run the NanoGPT-style benchmark recipe for a single config:
+
+```bash
+BENCH="runs/bench_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BENCH"
+PYTHONPATH=src python scripts/run_benchmark.py \
+  configs/bench_nanogpt_owt_baseline.yaml \
+  --device cpu \
+  --steps 40 \
+  --eval-batches 2 \
+  --out "$BENCH/summary.json" \
+  --history-out "$BENCH/history.json"
+```
+
+See `docs/nanogpt_benchmark.md` for the packed-token data contract and the actual benchmark configs/budgets.
+
+### Run a Long-Context Sweep (Mac M4 / MPS)
+This matches the example long‑context frontier section below and is designed to stay disk-safe by pruning checkpoints to just the frontier.
 
 ```bash
 export TOKENIZERS_PARALLELISM=false
@@ -94,6 +156,8 @@ HF_TOKEN="$HF_TOKEN" python scripts/run_live.py configs/exp_longctx_overnight_m4
 
 python scripts/report_motifs.py "$RUN/frontier.json" --lineage "$RUN/frontier_lineage.json" --top 15
 ```
+
+Note: replace `--device mps` with `--device cuda` on NVIDIA GPUs.
 
 Monitor the run:
 ```bash
@@ -187,7 +251,7 @@ evolution:
 
 See [`src/transformer_evolution_llm/dsl.py`](src/transformer_evolution_llm/dsl.py) for the full schema definition.
 
-## Newest Long-Context Frontier (Illustrative Survivors)
+## Example Long-Context Frontier (Illustrative Survivors)
 
 These are illustrative survivors from the newest long‑context sweep (11‑entry Pareto frontier at ~65–85M params), archived as YAML for inspection/reseeding.
 
@@ -331,12 +395,12 @@ evo-loop convert-checkpoints runs/<run_dir>/checkpoints --dtype fp16 --apply
 ### Scale-Hop Plans
 The current phase runs on laptop-scale surrogates (~65–100M parameters). The next steps:
 1. **350M–1B sanity runs** on GPU (see [docs/gpu_run_plan.md](docs/gpu_run_plan.md))—validate that motifs discovered at small scale transfer.
-2. **Speedrun-style eval**: Measure time-to-target under a NanoGPT-like recipe, so architectures are judged on training efficiency.
+2. **Speedrun-style eval (implemented)**: Measure time/tokens-to-target under a NanoGPT-like recipe, so architectures are judged on training efficiency. Next: scale the packed-token cache and calibrate targets so this metric has useful dynamic range (see `docs/nanogpt_benchmark.md`).
 3. **Multi-GPU evolution** with ZeRO-1 or FSDP for larger populations.
 
 ### Architectures of Interest
 
-This project can help explore ideas from recent architecture innovations:
+The DSL includes knobs inspired by recent architecture work:
 
 | Architecture | Key Ideas | DSL Components |
 |--------------|-----------|----------------|
@@ -345,7 +409,7 @@ This project can help explore ideas from recent architecture innovations:
 | [**Mamba/SSM hybrids**](https://arxiv.org/abs/2312.00752) | State-space models mixed with attention | `ssm` blocks, `toggle_ssm` mutations |
 | [**MLA (Multi-head Latent Attention)**](https://arxiv.org/abs/2405.04434) | Latent KV compression | `MLA` attention kind, `kv_policy` |
 
-The evolution loop can rediscover these patterns—or find novel combinations.
+Evolution can recombine these ingredients under different constraints/objectives.
 
 ## Contributing
 

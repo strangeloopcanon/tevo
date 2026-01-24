@@ -12,6 +12,8 @@ TEVO_MODAL_GPU=A10G modal run scripts/modal_run_live.py \
 
 This writes `frontier.json` (+ `frontier.state.json`, and optional `lineage.json`) into a persisted volume, and (with `--download`) downloads them into `runs/modal/<run_id>/` locally.
 
+`runs/modal/` is treated as a local artifact directory (large JSON/checkpoints); keep it out of git.
+
 ## Benchmark run
 ```bash
 TEVO_MODAL_GPU=A10G modal run scripts/modal_run_benchmark.py \
