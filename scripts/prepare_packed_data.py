@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Iterable
@@ -77,6 +79,10 @@ def main(
     max_samples: int | None = typer.Option(None, help="Limit number of docs per split."),
     max_train_tokens: int | None = typer.Option(None, help="Cap train tokens for smoke runs."),
     max_val_tokens: int | None = typer.Option(None, help="Cap val tokens for smoke runs."),
+    hard_exit: bool = typer.Option(
+        False,
+        help="Call os._exit(0) after writing outputs (avoids shutdown crashes in some runtimes).",
+    ),
 ) -> None:
     out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -89,6 +95,7 @@ def main(
     np_dtype = dtype_map[dtype]
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, revision=hf_revision)
+    tokenizer.model_max_length = int(1e30)
     if tokenizer.eos_token_id is None:
         typer.echo("Tokenizer missing eos_token_id; append_eos will be ignored.")
 
@@ -141,6 +148,25 @@ def main(
         typer.echo("No val split provided; creating holdout with val_fraction.")
         with train_path.open("wb") as train_fh, val_path.open("wb") as val_fh:
             for idx, text in enumerate(_iter_texts(train_dataset), start=1):
+                if (
+                    max_train_tokens is not None
+                    and max_val_tokens is not None
+                    and train_tokens >= max_train_tokens
+                    and val_tokens >= max_val_tokens
+                ):
+                    break
+                if (
+                    max_train_tokens is not None
+                    and max_val_tokens is None
+                    and train_tokens >= max_train_tokens
+                ):
+                    break
+                if (
+                    max_val_tokens is not None
+                    and max_train_tokens is None
+                    and val_tokens >= max_val_tokens
+                ):
+                    break
                 ids = tokenizer.encode(text, add_special_tokens=False)
                 eos_id = tokenizer.eos_token_id
                 if append_eos and eos_id is not None:
@@ -148,16 +174,18 @@ def main(
                 if not ids:
                     continue
                 arr = np.asarray(ids, dtype=np_dtype)
-                if rng.random() < val_fraction:
+                if max_train_tokens is not None and train_tokens >= max_train_tokens:
+                    write_val = True
+                elif max_val_tokens is not None and val_tokens >= max_val_tokens:
+                    write_val = False
+                else:
+                    write_val = rng.random() < val_fraction
+                if write_val:
                     arr.tofile(val_fh)
                     val_tokens += int(arr.size)
-                    if max_val_tokens is not None and val_tokens >= max_val_tokens:
-                        break
                 else:
                     arr.tofile(train_fh)
                     train_tokens += int(arr.size)
-                    if max_train_tokens is not None and train_tokens >= max_train_tokens:
-                        break
                 if idx % 1000 == 0:
                     typer.echo(
                         f"[split] docs={idx} train_tokens={train_tokens} val_tokens={val_tokens}"
@@ -183,6 +211,10 @@ def main(
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     typer.echo(f"Wrote {train_path} and {val_path} (train_tokens={train_tokens})")
+    if hard_exit:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,11 @@
 
 So what: you can run evolution or benchmarks on a single Modal GPU and keep artifacts in Modal Volumes.
 
+## Packed data prep (CPU)
+```bash
+modal run scripts/modal_prepare_packed_data.py --out-dir openwebtext_10m --max-train-tokens 10000000 --max-val-tokens 1000000 --val-fraction 0.1 --download-metadata
+```
+
 ## Evolution run
 ```bash
 TEVO_MODAL_GPU=A10G modal run scripts/modal_run_live.py \
