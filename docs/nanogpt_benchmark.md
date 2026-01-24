@@ -16,6 +16,7 @@ Larger packed stream (recommended for non-toy runs):
 - Packed data: `runs/packed/openwebtext_10m/` (see “Data prep” below).
 - Baseline config: `configs/bench_nanogpt_owt_baseline_10m.yaml`.
 - Evolution config: `configs/exp_nanogpt_speedrun_owt_10m.yaml`.
+- V3 evolution configs (compute-to-target): `configs/exp_nanogpt_speedrun_owt_10m_v3.yaml` and `configs/exp_selector_style_owt_10m_v3.yaml`.
 - `speedrun_target_ppl` is calibrated so the baseline does not hit it on the first eval interval.
 
 ### B) HF mix (existing shards)
@@ -55,19 +56,24 @@ TEVO_MODAL_GPU=A10G modal run scripts/modal_run_benchmark.py \
 
 - Record config path, git commit, device, steps, token budget.
 - Report `val_loss`, `val_ppl`, `throughput_tok_s` (from summary JSON).
-- Report `speedrun_*` metrics. If the target is not reached, those fields stay at the sentinel `1e9`.
+- Report `speedrun_*` metrics (including `speedrun_flops_to_target` and `flops_per_token_est`). If the target is not reached, the `*_to_target` fields stay at large sentinels.
 
 ## Evolution objective
 
 Use `configs/exp_nanogpt_speedrun_owt.yaml` for evolution runs that include `speedrun_tokens_to_target` and `speedrun_time_to_target` in the objective set. Keep `ppl_stop_threshold: null` so the speedrun probes run.
 
+V3 (recommended): use `configs/exp_nanogpt_speedrun_owt_10m_v3.yaml` to minimize estimated compute-to-threshold via `speedrun_flops_to_target` (and still track `ppl_code`). The FLOPs estimate is a crude trunk-only proxy intended for relative comparisons.
+
 ## Recent Modal runs (A10G)
 
-So what: speedrun-to-target can find real early-learning wins, but it’s bucketed by the eval interval (so you often get a small set of token counts like 40,960 / 49,152 / 57,344).
+So what: speedrun-to-target can find early-learning wins. Historically, `speedrun_tokens_to_target` was bucketed by the eval interval; we now interpolate between eval points so the metric is less discretized.
 
 - NanoGPT objective on `openwebtext_10m` (`configs/exp_nanogpt_speedrun_owt_10m.yaml`): `runs/modal/modal_nanogpt_speedrun_owt10m_dyn1/` (96 generations, 360 steps). Frontier collapsed to 1 dominant model (`tune_kv-72-a316`), which hit the target at 40,960 tokens vs 57,344 for the seed and improved short-budget `ppl_code` (~769 vs ~1616). Trade-off: much lower measured throughput (~7.9k vs ~17.8k tok/s).
 - DeepSeek-style objective on `openwebtext_10m` (`configs/exp_deepseek_style_owt_10m.yaml`): `runs/modal/modal_deepseek_style_owt10m_dyn1/` (96 generations, 360 steps). Frontier size 11; the best KV-efficient points used 1× MLA and reached `kv_bytes_per_token` as low as 31,232 (vs 36,864 for the seed) while keeping throughput ~17k tok/s, with `ppl_code` in the ~1.3k–1.8k range.
 - Historical tiny packed OWT: `runs/modal/modal_nanogpt_speedrun_long3/` (48 generations, 180 steps): frontier size 8; mostly dense attention stacks with small toggles (Alibi/precision/graph), no MoE/SSM/retro/recurrence blocks in the frontier.
+- V3 smoke validation (FLOPs-to-target objective, 10M packed OWT):
+  - `configs/exp_nanogpt_speedrun_owt_10m_v3.yaml`: `runs/modal/modal_speedrun_owt10m_v3_seed1/` (1 generation, 360 steps). Seed hits the target with interpolated `speedrun_tokens_to_target` (~46.9k) and reports `speedrun_flops_to_target`.
+  - `configs/exp_selector_style_owt_10m_v3.yaml`: `runs/modal/modal_selector_owt10m_v3_seed1/` (1 generation, 360 steps). Same target, plus selector/KV objectives are active.
 
 <details>
 <summary>Data prep, cache layout, and knobs</summary>

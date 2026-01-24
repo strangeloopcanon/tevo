@@ -549,7 +549,9 @@ So what: we now have a fixed, repeatable benchmark path (packed OpenWebText + HF
 
 Use `docs/nanogpt_benchmark.md` for the contract and commands.
 
-*Update (Jan 2026):* On Modal (A10G) using the non-toy packed OpenWebText stream (`openwebtext_10m`, 10M train / 1M val tokens), a speedrun-style objective can find large early-learning wins under short budgets. Example: with a calibrated target (`speedrun_target_ppl=2500`, eval interval 4), the best NanoGPT-objective run hit the target at **40,960 tokens vs 57,344** for the seed and also improved short-budget `ppl_code` (~769 vs ~1616). This is still an early-convergence proxy, not a claim about scaled training.
+*Update (Jan 2026):* We now log a compute proxy (`speedrun_flops_to_target`) in addition to `speedrun_tokens_to_target`, and `tokens_to_target` is interpolated between eval points (less discretization than the old “bucketed” counts).
+
+On Modal (A10G) using the non-toy packed OpenWebText stream (`openwebtext_10m`, 10M train / 1M val tokens), a speedrun-style objective can find large early-learning wins under short budgets. Example: with a calibrated target (`speedrun_target_ppl=2500`, eval interval 4), the best NanoGPT-objective run hit the target at **40,960 tokens vs 57,344** for the seed and also improved short-budget `ppl_code` (~769 vs ~1616). This is still an early-convergence proxy, not a claim about scaled training.
 
 ### Sparse attention patterns
 The DSL supports `sparsity: none|sliding|block|local_global|dilated|local_block`.

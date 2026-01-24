@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +20,10 @@ from .dsl import (
     LayerScaleConfig,
     LookupMemoryConfig,
     MemoryTokensConfig,
+    MoECustomExpertConfig,
+    MoEDenseExpertConfig,
     MoEFFNConfig,
+    MoESSMExpertConfig,
     RetroConfig,
 )
 
@@ -179,6 +183,248 @@ def throughput_proxy(spec: ArchitectureSpec, seq_len: int) -> float:
     hidden = sum(_attn_hidden(block) for block in spec.model.blocks)
     denom = max(1, hidden * spec.model.n_layers * seq_len)
     return 1e9 / denom
+
+
+def _dense_ffn_flops_per_token(d_model: int, hidden: int, activation: str) -> float:
+    act = str(activation or "swiglu").lower()
+    if act == "swiglu":
+        # two projections up + one down
+        return float(6 * d_model * hidden)
+    return float(4 * d_model * hidden)
+
+
+def _ssm_flops_per_token(d_model: int, *, d_state: int, d_conv: int) -> float:
+    inner = max(1, int(d_state))
+    k = max(1, int(d_conv))
+    # Roughly: in_proj + conv1d + out_proj
+    return float(2 * d_model * inner + 2 * inner * inner * k + 2 * inner * d_model)
+
+
+def _average_keys_per_query(attn: Any, *, seq_len: int) -> float:
+    if attn is None:
+        return 0.0
+    kind = str(getattr(attn, "kind", "MHA") or "MHA").upper()
+    if kind == "LINEAR":
+        return 0.0
+
+    causal = bool(getattr(attn, "causal", True))
+    t = max(1, int(seq_len))
+
+    selector = str(getattr(attn, "selector", "none") or "none")
+    if selector != "none":
+        topk = int(getattr(attn, "selector_topk", 0) or 0)
+        topk = max(1, min(topk if topk > 0 else 64, t))
+        if causal:
+            return float(min(topk, (t + 1) / 2.0))
+        return float(topk)
+
+    sparsity = str(getattr(attn, "sparsity", "none") or "none")
+    sw = getattr(attn, "sw", None)
+    if sparsity == "none" and sw:
+        sparsity = "sliding"
+
+    if sparsity == "sliding":
+        w = int(sw or 0)
+        if w <= 0:
+            return float((t + 1) / 2.0 if causal else t)
+        return float(min(w, (t + 1) / 2.0) if causal and w >= t else min(w, t))
+
+    if sparsity == "block":
+        bsz = int(getattr(attn, "block_size", 0) or 0)
+        if bsz <= 0:
+            return float((t + 1) / 2.0 if causal else t)
+        bsz = min(bsz, t)
+        return float((bsz + 1) / 2.0 if causal else bsz)
+
+    if sparsity == "dilated":
+        dilation = int(getattr(attn, "dilation", 0) or 0)
+        dilation = max(1, dilation)
+        eff = int(math.ceil(t / float(dilation)))
+        return float((eff + 1) / 2.0 if causal else eff)
+
+    if sparsity == "local_global":
+        w = int(getattr(attn, "sw", 0) or 0)
+        w = max(1, min(w, t))
+        gstride = int(getattr(attn, "global_stride", 0) or 0)
+        gstride = max(1, min(gstride, t))
+        # Approximate average number of "global" keys available in the past.
+        avg_globals = 0.5 * float(int(math.ceil(t / float(gstride))))
+        base = float(w) + avg_globals + 1.0  # + token 0
+        if causal:
+            return float(min(base, (t + 1) / 2.0))
+        return float(min(base, t))
+
+    if sparsity == "local_block":
+        w = int(getattr(attn, "sw", 0) or 0)
+        w = max(1, min(w, t))
+        bsz = int(getattr(attn, "block_size", 0) or 0)
+        bsz = max(1, min(bsz, t))
+        base = float(w + bsz)
+        if causal:
+            return float(min(base, (t + 1) / 2.0))
+        return float(min(base, t))
+
+    # Full attention
+    return float((t + 1) / 2.0 if causal else t)
+
+
+def estimate_flops_per_token(
+    spec: ArchitectureSpec, *, recurrence_steps: dict[int, int] | None = None
+) -> float:
+    """Crude FLOPs/token estimator (forward-pass, trunk only).
+
+    Intended for *relative* comparisons (e.g., "compute-to-threshold" speedrun
+    objectives), not as an exact accounting.
+    """
+    d_model = int(spec.model.emb.dim)
+    seq_len = int(spec.data.seq_len)
+
+    # Baseline: each block executes once; recurrences override block multipliers.
+    block_mult = [1.0 for _ in spec.model.blocks]
+    recurrence_cost = 0.0
+    if spec.model.recurrences:
+        steps_map = recurrence_steps or {}
+        for idx, rec in enumerate(spec.model.recurrences):
+            current_steps = max(1, int(steps_map.get(idx, rec.train_recurrence)))
+            start = max(0, int(rec.start))
+            end = min(int(rec.end), len(spec.model.blocks))
+            for block_idx in range(start, end):
+                block_mult[block_idx] = float(current_steps)
+            # Adapter runs once per loop iteration.
+            input_dim = d_model * (2 if rec.concat_prelude else 1)
+            output_dim = d_model
+            if rec.adapter == "gated":
+                recurrence_cost += float(current_steps) * float(4 * input_dim * output_dim)
+            else:
+                recurrence_cost += float(current_steps) * float(2 * input_dim * output_dim)
+
+    total = 0.0
+    for block, mult in zip(spec.model.blocks, block_mult, strict=True):
+        block_flops = 0.0
+        if block.attn:
+            heads = int(block.attn.heads)
+            head_dim = int(block.attn.head_dim)
+            kv_groups = max(1, int(block.attn.kv_groups or 1))
+            kv_heads = max(1, heads // kv_groups)
+            q_dim = heads * head_dim
+            kind = str(getattr(block.attn, "kind", "MHA") or "MHA").upper()
+
+            if kind == "MLA":
+                latent = int(getattr(block.attn, "kv_latent_dim", 0) or 0)
+                if latent <= 0:
+                    latent = kv_heads * head_dim
+                block_flops += float(2 * d_model * q_dim)  # q_proj
+                block_flops += float(2 * d_model * latent)  # kv_down
+                block_flops += float(2 * latent * (2 * kv_heads * head_dim))  # kv_up
+                block_flops += float(2 * q_dim * d_model)  # out_proj
+            elif kind == "LINEAR":
+                qkv_dim = (heads + 2 * kv_heads) * head_dim
+                block_flops += float(2 * d_model * qkv_dim)  # qkv
+                block_flops += float(2 * q_dim * d_model)  # out_proj
+                block_flops += float(4 * heads * head_dim * head_dim)  # kernelized attention ops
+            else:
+                qkv_dim = (heads + 2 * kv_heads) * head_dim
+                block_flops += float(2 * d_model * qkv_dim)  # qkv
+                block_flops += float(2 * q_dim * d_model)  # out_proj
+                k = _average_keys_per_query(block.attn, seq_len=seq_len)
+                block_flops += float(4 * heads * head_dim * k)  # QK + AV
+
+            if getattr(block.attn, "gating_pos", "none") != "none":
+                gating_op = getattr(block.attn, "gating_op", "dense")
+                if gating_op == "dense":
+                    block_flops += float(2 * heads * head_dim * head_dim)
+                else:
+                    block_flops += float(heads * head_dim)
+
+        if isinstance(block.ffn, DenseFFNConfig):
+            block_flops += _dense_ffn_flops_per_token(
+                d_model, int(block.ffn.hidden), str(getattr(block.ffn, "activation", "swiglu"))
+            )
+        elif isinstance(block.ffn, MoEFFNConfig):
+            block_flops += float(2 * d_model * int(block.ffn.n_experts))  # router
+
+            # Approximate expert compute by averaging declared expert configs (or default dense).
+            expert_flops: list[float] = []
+            if block.ffn.experts:
+                for expert in block.ffn.experts:
+                    if isinstance(expert, MoEDenseExpertConfig):
+                        hidden = int(expert.hidden or block.ffn.hidden)
+                        hops = max(1, int(expert.hops))
+                        per_hop = _dense_ffn_flops_per_token(
+                            d_model, hidden, str(getattr(expert, "activation", "swiglu"))
+                        )
+                        expert_flops.append(float(hops) * per_hop)
+                    elif isinstance(expert, MoESSMExpertConfig):
+                        hops = max(1, int(expert.hops))
+                        per_hop = _ssm_flops_per_token(
+                            d_model,
+                            d_state=int(expert.ssm.d_state),
+                            d_conv=int(expert.ssm.d_conv),
+                        )
+                        expert_flops.append(float(hops) * per_hop)
+                    elif isinstance(expert, MoECustomExpertConfig):
+                        inner = int(expert.params.get("dim", d_model))
+                        expert_flops.append(float(4 * d_model * inner))
+            if not expert_flops:
+                expert_flops = [
+                    _dense_ffn_flops_per_token(d_model, int(block.ffn.hidden), "swiglu")
+                ]
+            avg_expert = float(sum(expert_flops) / max(1, len(expert_flops)))
+            block_flops += float(int(block.ffn.k) * avg_expert)
+            if max(int(getattr(block.ffn, "shared", 0) or 0), 1 if block.ffn.shared_expert else 0):
+                block_flops += _dense_ffn_flops_per_token(d_model, int(block.ffn.hidden), "swiglu")
+
+        if block.ssm:
+            block_flops += _ssm_flops_per_token(
+                d_model,
+                d_state=int(getattr(block.ssm, "d_state", d_model) or d_model),
+                d_conv=int(getattr(block.ssm, "d_conv", 1) or 1),
+            )
+
+        for extra in block.extras:
+            if isinstance(extra, RetroConfig):
+                continue
+            if isinstance(extra, GatedModuleConfig) or isinstance(extra, LayerScaleConfig):
+                block_flops += float(d_model)
+            elif isinstance(extra, CustomModuleConfig):
+                inner = int(extra.params.get("dim", d_model))
+                block_flops += float(4 * d_model * inner)
+            elif isinstance(extra, AssociativeMemoryConfig):
+                inner = int(extra.heads) * int(extra.head_dim)
+                block_flops += float(8 * d_model * inner)
+                block_flops += float(4 * int(extra.heads) * int(extra.head_dim) ** 2)
+            elif isinstance(extra, MemoryTokensConfig):
+                inner = int(extra.heads) * int(extra.head_dim)
+                block_flops += float(2 * d_model * inner + 2 * inner * d_model)
+                block_flops += float(4 * int(extra.heads) * int(extra.head_dim) * int(extra.tokens))
+            elif isinstance(extra, ChunkMemoryConfig):
+                inner = int(extra.heads) * int(extra.head_dim)
+                block_flops += float(8 * d_model * inner)
+                stride = int(getattr(extra, "stride", None) or int(extra.chunk_size))
+                stride = max(1, stride)
+                keys = int(math.ceil(seq_len / float(stride)))
+                block_flops += float(4 * int(extra.heads) * int(extra.head_dim) * keys)
+            elif isinstance(extra, LookupMemoryConfig):
+                entries = int(extra.entries)
+                key_dim = int(getattr(extra, "key_dim", None) or d_model)
+                value_dim = int(getattr(extra, "value_dim", None) or d_model)
+                block_flops += float(2 * d_model * key_dim)  # q_proj
+                block_flops += float(2 * entries * key_dim)  # dot-product lookup
+                if value_dim != d_model:
+                    block_flops += float(2 * value_dim * d_model)  # out_proj
+            elif isinstance(extra, BranchRouterConfig):
+                n_targets = max(1, len(extra.targets))
+                router_hidden = getattr(extra, "hidden", None)
+                if router_hidden:
+                    h = int(router_hidden)
+                    block_flops += float(2 * d_model * h + 2 * h * n_targets)
+                else:
+                    block_flops += float(2 * d_model * n_targets)
+
+        total += float(mult) * block_flops
+
+    total += recurrence_cost
+    return float(max(0.0, total))
 
 
 @dataclass
