@@ -12,6 +12,12 @@ So what: we now have a small, repeatable benchmark harness to compare architectu
 Canonical baseline (NanoGPT-like stack, 12×MHA, seq_len=1024):
 - Config: `configs/bench_nanogpt_owt_baseline.yaml`.
 
+Larger packed stream (recommended for non-toy runs):
+- Packed data: `runs/packed/openwebtext_10m/` (see “Data prep” below).
+- Baseline config: `configs/bench_nanogpt_owt_baseline_10m.yaml`.
+- Evolution config: `configs/exp_nanogpt_speedrun_owt_10m.yaml`.
+- `speedrun_target_ppl` is calibrated so the baseline does not hit it on the first eval interval.
+
 ### B) HF mix (existing shards)
 - Uses the current shard mix to keep continuity with older runs.
 - Same speedrun logging and metrics.
@@ -75,8 +81,9 @@ Build the cache:
 ```
 PYTHONPATH=src python scripts/prepare_packed_data.py \
   --dataset openwebtext \
-  --out-dir runs/packed/openwebtext \
+  --out-dir runs/packed/openwebtext_10m \
   --streaming \
+  --val-fraction 0.1 \
   --max-train-tokens 10000000 \
   --max-val-tokens 1000000
 ```
@@ -85,7 +92,17 @@ Notes:
 - The packed files are just token ids, so sizes are predictable (`uint16` ≈ 2 bytes/token). The example above is ~22MB on disk.
 - For a quick smoke cache, drop those caps down (for example `--max-train-tokens 200000 --max-val-tokens 50000`).
 
-On Modal, point `packed_train_path` / `packed_val_path` at a mounted volume (for example `/runs/packed/openwebtext/train.bin`).
+On Modal (writes into the `tevo-runs` volume under `/runs/packed/...`):
+```
+modal run scripts/modal_prepare_packed_data.py \
+  --out-dir openwebtext_10m \
+  --max-train-tokens 10000000 \
+  --max-val-tokens 1000000 \
+  --val-fraction 0.1 \
+  --download-metadata
+```
+
+On Modal, point `packed_train_path` / `packed_val_path` at a mounted volume (for example `/runs/packed/openwebtext_10m/train.bin`).
 If you keep relative paths like `runs/packed/...`, set `TEVO_PACKED_ROOT=/runs` inside the container.
 
 Speedrun targets can be expressed as `speedrun_target_ppl` or `speedrun_target_loss` (pick one). When `speedrun_target_ppl` is set, we convert via `loss = log(ppl)`.
