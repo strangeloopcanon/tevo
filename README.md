@@ -549,7 +549,7 @@ So what: we now have a fixed, repeatable benchmark path (packed OpenWebText + HF
 
 Use `docs/nanogpt_benchmark.md` for the contract and commands.
 
-*Update (Jan 2026):* On Modal (A10G) using the non-toy packed OpenWebText stream (`openwebtext_10m`, 10M train / 1M val tokens), evolution found a candidate that reached the target perplexity in **40,960 tokens vs 61,440** for the baseline (≈33% fewer tokens in this setup), and also improved short-budget `ppl_code` (~1396 vs ~1814). The winning motif was small (1× MLA attention block + one Alibi-enabled block). This is still an early-convergence proxy, not a claim about scaled training.
+*Update (Jan 2026):* On Modal (A10G) using the non-toy packed OpenWebText stream (`openwebtext_10m`, 10M train / 1M val tokens), a speedrun-style objective can find large early-learning wins under short budgets. Example: with a calibrated target (`speedrun_target_ppl=2500`, eval interval 4), the best NanoGPT-objective run hit the target at **40,960 tokens vs 57,344** for the seed and also improved short-budget `ppl_code` (~769 vs ~1616). This is still an early-convergence proxy, not a claim about scaled training.
 
 ### Sparse attention patterns
 The DSL supports `sparsity: none|sliding|block|local_global|dilated|local_block`.
@@ -592,6 +592,8 @@ python scripts/fit_scaling.py runs/<run_1>/frontier.json runs/<run_2>/frontier.j
 | `modal_nanogpt_speedrun_long3` | `exp_nanogpt_speedrun_owt.yaml` (48 gens, 180 steps) | 8 | Dense MHA stacks with layer-count shifts; no MoE/SSM/retro in frontier; small toggles (Alibi/precision/graph) |
 | `modal_nanogpt_speedrun_valfix_full1` | `exp_nanogpt_speedrun_owt.yaml` (48 gens, 1000 steps) | 1 | Mixed `kv_groups` + memory extras + `branch_router` hit target at 40,960 vs 61,440 tokens on tiny OWT subset. |
 | `modal_nanogpt_speedrun_owt10m_full1` | `exp_nanogpt_speedrun_owt_10m.yaml` (48 gens, 240 steps) | 1 | 10M/1M packed OWT: winner adds 1× MLA block + one Alibi block; hits target at 40,960 vs 61,440 tokens and improves `ppl_code` vs seed. |
+| `modal_nanogpt_speedrun_owt10m_dyn1` | `exp_nanogpt_speedrun_owt_10m.yaml` (96 gens, 360 steps) | 1 | 10M/1M packed OWT: calibrated target (2.5k) yields multiple token buckets; winner improves `ppl_code` strongly but is slower (throughput trade-off). |
+| `modal_deepseek_style_owt10m_dyn1` | `exp_deepseek_style_owt_10m.yaml` (96 gens, 360 steps) | 11 | DeepSeek-style pressure (KV bytes + throughput + selector): frontier contains MLA/GQA variants that reduce `kv_bytes_per_token` while keeping throughput high. |
 
 ### Architecture Highlights (Historical)
 

@@ -61,12 +61,13 @@ TEVO_MODAL_GPU=A10G modal run scripts/modal_run_benchmark.py \
 
 Use `configs/exp_nanogpt_speedrun_owt.yaml` for evolution runs that include `speedrun_tokens_to_target` and `speedrun_time_to_target` in the objective set. Keep `ppl_stop_threshold: null` so the speedrun probes run.
 
-## Latest NanoGPT-objective runs (Modal A10G)
+## Recent Modal runs (A10G)
 
-So what: the speedrun objective can find real early-learning wins (tokens/steps-to-target), but it can also collapse to a single dominant point when the target is easy and the eval interval is coarse.
+So what: speedrun-to-target can find real early-learning wins, but it’s bucketed by the eval interval (so you often get a small set of token counts like 40,960 / 49,152 / 57,344).
 
-- `runs/modal/modal_nanogpt_speedrun_owt10m_full1/` (48 generations, 240 steps, `openwebtext_10m`): frontier size 1; winner `toggle_alibi-14-c2e1` hits the target at 40,960 vs 61,440 tokens for the seed and improves short-budget `ppl_code` (~1396 vs ~1814). Motif: 1× MLA block (`kv_latent_dim=192`) + one Alibi-enabled block.
-- `runs/modal/modal_nanogpt_speedrun_long3/` (48 generations, 180 steps, tiny packed OWT): frontier size 8; mostly dense attention stacks with small toggles (Alibi/precision/graph), no MoE/SSM/retro/recurrence blocks in the frontier.
+- NanoGPT objective on `openwebtext_10m` (`configs/exp_nanogpt_speedrun_owt_10m.yaml`): `runs/modal/modal_nanogpt_speedrun_owt10m_dyn1/` (96 generations, 360 steps). Frontier collapsed to 1 dominant model (`tune_kv-72-a316`), which hit the target at 40,960 tokens vs 57,344 for the seed and improved short-budget `ppl_code` (~769 vs ~1616). Trade-off: much lower measured throughput (~7.9k vs ~17.8k tok/s).
+- DeepSeek-style objective on `openwebtext_10m` (`configs/exp_deepseek_style_owt_10m.yaml`): `runs/modal/modal_deepseek_style_owt10m_dyn1/` (96 generations, 360 steps). Frontier size 11; the best KV-efficient points used 1× MLA and reached `kv_bytes_per_token` as low as 31,232 (vs 36,864 for the seed) while keeping throughput ~17k tok/s, with `ppl_code` in the ~1.3k–1.8k range.
+- Historical tiny packed OWT: `runs/modal/modal_nanogpt_speedrun_long3/` (48 generations, 180 steps): frontier size 8; mostly dense attention stacks with small toggles (Alibi/precision/graph), no MoE/SSM/retro/recurrence blocks in the frontier.
 
 <details>
 <summary>Data prep, cache layout, and knobs</summary>

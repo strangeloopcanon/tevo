@@ -43,9 +43,9 @@ train:
   weight_decay: 0.1
   seed: 4242
   passkey_eval_steps: 0
-  speedrun_eval_interval: 10
+  speedrun_eval_interval: 4
   speedrun_eval_batches: 4
-  speedrun_target_ppl: 3300.0
+  speedrun_target_ppl: 2500.0
   entropy_threshold: 0.5
   entropy_patience: 3
   instability_threshold: 500.0
@@ -66,4 +66,3 @@ data:
   eval_tokens: 65536
   healing_shards: []
   healing_tokens: null
-
