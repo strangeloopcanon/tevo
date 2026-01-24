@@ -485,6 +485,8 @@ So what: we now have a fixed, repeatable benchmark path (packed OpenWebText + HF
 
 Use `docs/nanogpt_benchmark.md` for the contract and commands.
 
+*Update (Jan 2026):* Micro-benchmark on Modal (packed OpenWebText; ~118k train / ~33k val tokens) found a candidate that reached the target perplexity in **40,960 tokens vs 61,440** for the baseline (≈33% fewer tokens in this setup). This is an early-convergence proxy, not a claim about scaled training.
+
 ### Sparse attention patterns
 The DSL supports `sparsity: none|sliding|block|local_global|dilated|local_block`.
 - `local_global` combines a local window with periodic global tokens.
@@ -524,6 +526,7 @@ python scripts/fit_scaling.py runs/<run_1>/frontier.json runs/<run_2>/frontier.j
 |-----|--------|---------------|------------------|
 | `modal_nanogpt_speedrun_long1` | `exp_nanogpt_speedrun_owt.yaml` (24 gens, 120 steps) | 7 | Dense MHA stacks (9–12 layers); no MoE/SSM/retro; KV window + Alibi variants |
 | `modal_nanogpt_speedrun_long3` | `exp_nanogpt_speedrun_owt.yaml` (48 gens, 180 steps) | 8 | Dense MHA stacks with layer-count shifts; no MoE/SSM/retro in frontier; small toggles (Alibi/precision/graph) |
+| `modal_nanogpt_speedrun_valfix_full1` | `exp_nanogpt_speedrun_owt.yaml` (48 gens, 1000 steps) | 1 | Mixed `kv_groups` + memory extras + `branch_router` hit target at 40,960 vs 61,440 tokens on tiny OWT subset. |
 
 ### Architecture Highlights (Historical)
 
