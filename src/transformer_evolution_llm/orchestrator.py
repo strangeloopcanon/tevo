@@ -456,9 +456,14 @@ class EvolutionRunner:
             self.trainer.steps = max(1, int(base_steps * self._rung2_ratio))
             batches = self.data_module.batches(max_tokens=rung2_extra)
             try:
+                # Disable speedrun metrics during continuation rungs so the
+                # "tokens_to_target" objective reflects from-scratch learning
+                # (rung1) rather than warm-started refinement.
+                rung2_spec = candidate.spec.model_copy(deep=True)
+                rung2_spec.train.speedrun_eval_interval = 0
                 metrics2, checkpoint = self.trainer.train(
                     candidate=candidate,
-                    spec=candidate.spec,
+                    spec=rung2_spec,
                     batch_iter=batches,
                     seed_state_path=checkpoint,
                 )
@@ -559,9 +564,11 @@ class EvolutionRunner:
             batches = self.data_module.batches(max_tokens=promo_tokens)
             seed_state = candidate.checkpoint
             try:
+                promo_spec = candidate.spec.model_copy(deep=True)
+                promo_spec.train.speedrun_eval_interval = 0
                 metrics3, checkpoint3 = self.trainer.train(
                     candidate=candidate,
-                    spec=candidate.spec,
+                    spec=promo_spec,
                     batch_iter=batches,
                     seed_state_path=seed_state,
                 )
