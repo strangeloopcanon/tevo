@@ -61,14 +61,12 @@ TEVO_MODAL_GPU=A10G modal run scripts/modal_run_benchmark.py \
 
 Use `configs/exp_nanogpt_speedrun_owt.yaml` for evolution runs that include `speedrun_tokens_to_target` and `speedrun_time_to_target` in the objective set. Keep `ppl_stop_threshold: null` so the speedrun probes run.
 
-## Latest NanoGPT-objective frontier (A10G, longer budget)
+## Latest NanoGPT-objective runs (Modal A10G)
 
-So what: even with a lower target and longer budgets, the frontier still favors dense MHA stacks; novelty shows up mostly as layer-count changes and small toggles.
+So what: the speedrun objective can find real early-learning wins (tokens/steps-to-target), but it can also collapse to a single dominant point when the target is easy and the eval interval is coarse.
 
-- Run: `runs/modal/modal_nanogpt_speedrun_long3/` (48 generations, 180 steps, A10G).
-- Frontier size: 8; `speedrun_tokens_to_target` spans 40960–81920 (some never reach target); `ppl_code` ~2402–4989.
-- Variants that survived: Alibi/precision toggles, layer-count shifts, and a graph-module insertion; no MoE/SSM/retro/recurrence blocks in the frontier.
-- Limitation: still a proxy under short training; it does not measure long-context memory or downstream tasks.
+- `runs/modal/modal_nanogpt_speedrun_owt10m_full1/` (48 generations, 240 steps, `openwebtext_10m`): frontier size 1; winner `toggle_alibi-14-c2e1` hits the target at 40,960 vs 61,440 tokens for the seed and improves short-budget `ppl_code` (~1396 vs ~1814). Motif: 1× MLA block (`kv_latent_dim=192`) + one Alibi-enabled block.
+- `runs/modal/modal_nanogpt_speedrun_long3/` (48 generations, 180 steps, tiny packed OWT): frontier size 8; mostly dense attention stacks with small toggles (Alibi/precision/graph), no MoE/SSM/retro/recurrence blocks in the frontier.
 
 <details>
 <summary>Data prep, cache layout, and knobs</summary>
