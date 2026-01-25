@@ -201,6 +201,25 @@ def tune_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSp
     return child
 
 
+def tune_warmup(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    current = int(getattr(child.train, "warmup", 0) or 0)
+    options = [0, 5, 10, 20, 40, 80, 160, 320]
+    choices = [v for v in options if v != current]
+    child.train.warmup = int(rng.choice(choices or [current]))
+    return child
+
+
+def tune_clip(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    choices = [0.5, 0.8, 1.0, 1.5, 2.0, 4.0]
+    current = float(getattr(child.train, "clip", 1.0) or 1.0)
+    # Avoid a no-op when possible.
+    options = [v for v in choices if abs(v - current) > 1e-9]
+    child.train.clip = float(rng.choice(options or [current]))
+    return child
+
+
 def insert_retro_module(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     child = clone_spec(spec)
     block = rng.choice(child.model.blocks)
@@ -1173,6 +1192,8 @@ REGISTRY: dict[str, MutationFn] = {
     "toggle_precision": toggle_precision,
     "toggle_optimizer": toggle_optimizer,
     "tune_optimizer": tune_optimizer,
+    "tune_warmup": tune_warmup,
+    "tune_clip": tune_clip,
     "insert_retro_module": insert_retro_module,
     "insert_custom_module": insert_custom_module,
     "insert_graph_module": insert_graph_module,

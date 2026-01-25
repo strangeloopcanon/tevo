@@ -17,8 +17,10 @@ from transformer_evolution_llm.mutations import (
     toggle_gated_mix,
     toggle_hyper_connections,
     toggle_optimizer,
+    tune_clip,
     tune_lookup_memory,
     tune_optimizer,
+    tune_warmup,
 )
 
 
@@ -111,3 +113,16 @@ def test_tune_optimizer_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
         beta1, beta2 = child.train.optimizer.betas
         assert 0.0 <= beta1 < 1.0
         assert 0.0 <= beta2 < 1.0
+
+
+def test_tune_warmup_changes_value(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(11)  # noqa: S311 - deterministic unit tests
+    child = tune_warmup(tiny_spec, rng=rng)
+    assert child.train.warmup >= 0
+    assert child.train.warmup != tiny_spec.train.warmup
+
+
+def test_tune_clip_keeps_positive(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(12)  # noqa: S311 - deterministic unit tests
+    child = tune_clip(tiny_spec, rng=rng)
+    assert child.train.clip > 0.0
