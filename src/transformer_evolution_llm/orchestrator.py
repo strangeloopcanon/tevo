@@ -400,7 +400,12 @@ class EvolutionRunner:
             if not isinstance(base_steps, int):
                 base_steps = 100
             # Rung 1
-            self.trainer.steps = max(1, int(base_steps * self._rung1_ratio))
+            rung1_ratio = self._rung1_ratio
+            if rung2_extra <= 0:
+                # If we're not running a continuation rung, use the full configured step
+                # budget in rung1 (otherwise we'd only train for ~20% of `--steps`).
+                rung1_ratio = 1.0
+            self.trainer.steps = max(1, int(base_steps * rung1_ratio))
             if rung1_tokens <= 0:
                 candidate.status = "failed"
                 return

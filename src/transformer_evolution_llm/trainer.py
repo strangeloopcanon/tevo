@@ -535,6 +535,24 @@ class FullWeightTrainer:
         if speedrun_enabled:
             missing_penalty = 1e9
             missing_penalty_flops = missing_penalty * max(float(flops_per_token_est), 1.0)
+            best_eval_loss = (
+                float(speedrun_best_loss) if math.isfinite(speedrun_best_loss) else missing_penalty
+            )
+            target_loss = float(speedrun_target_loss) if speedrun_target_loss is not None else None
+            if target_loss is not None and math.isfinite(best_eval_loss):
+                loss_gap = max(0.0, best_eval_loss - target_loss)
+            else:
+                loss_gap = missing_penalty
+            gap_cap = 2.0
+            gap_beta = 4.0
+            flops_budget = max(float(flops_seen), 0.0)
+            if speedrun_reached:
+                speedrun_score = float(speedrun_flops_to_target)
+            elif math.isfinite(float(speedrun_best_loss)):
+                penalty = math.exp(gap_beta * min(float(loss_gap), gap_cap))
+                speedrun_score = max(flops_budget, 1.0) * penalty
+            else:
+                speedrun_score = missing_penalty_flops
             metrics.update(
                 {
                     "speedrun_reached": 1.0 if speedrun_reached else 0.0,
@@ -550,9 +568,9 @@ class FullWeightTrainer:
                     "speedrun_flops_to_target": (
                         speedrun_flops_to_target if speedrun_reached else missing_penalty_flops
                     ),
-                    "speedrun_best_eval_loss": (
-                        speedrun_best_loss if math.isfinite(speedrun_best_loss) else missing_penalty
-                    ),
+                    "speedrun_best_eval_loss": best_eval_loss,
+                    "speedrun_loss_gap": float(loss_gap),
+                    "speedrun_score": float(speedrun_score),
                     "speedrun_error": speedrun_error,
                 }
             )
