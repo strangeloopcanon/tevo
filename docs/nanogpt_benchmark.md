@@ -74,6 +74,9 @@ So what: speedrun-to-target can find early-learning wins. Historically, `speedru
 - V3 smoke validation (FLOPs-to-target objective, 10M packed OWT):
   - `configs/exp_nanogpt_speedrun_owt_10m_v3.yaml`: `runs/modal/modal_speedrun_owt10m_v3_seed1/` (1 generation, 360 steps). Seed hits the target with interpolated `speedrun_tokens_to_target` (~46.9k) and reports `speedrun_flops_to_target`.
   - `configs/exp_selector_style_owt_10m_v3.yaml`: `runs/modal/modal_selector_owt10m_v3_seed1/` (1 generation, 360 steps). Same target, plus selector/KV objectives are active.
+- V3 full sweeps (FLOPs-to-target objective, 10M packed OWT):
+  - Compute-to-target (`configs/exp_nanogpt_speedrun_owt_10m_v3.yaml`): `runs/modal/modal_speedrun_owt10m_v3_full1/` (96 generations, 360 steps). Frontier size 3; best compute point hits the target at ~45.9k tokens (interpolated), `speedrun_flops_to_target≈8.67e12`. Frontier stayed mostly dense MHA; `memory_tokens` is the only non-baseline module that persisted.
+  - Selector-style (`configs/exp_selector_style_owt_10m_v3.yaml`): `runs/modal/modal_selector_owt10m_v3_full1/` (96 generations, 360 steps). Frontier size 17 with 100% selector coverage, plus 5× MLA entries and 6× memory entries. Best KV point reaches `kv_bytes_per_token=8,704` via `kv_policy.quant=nf4` + one GQA block (inference-side KV cache setting; training unaffected).
 
 <details>
 <summary>Data prep, cache layout, and knobs</summary>

@@ -596,6 +596,8 @@ python scripts/fit_scaling.py runs/<run_1>/frontier.json runs/<run_2>/frontier.j
 | `modal_nanogpt_speedrun_owt10m_full1` | `exp_nanogpt_speedrun_owt_10m.yaml` (48 gens, 240 steps) | 1 | 10M/1M packed OWT: winner adds 1× MLA block + one Alibi block; hits target at 40,960 vs 61,440 tokens and improves `ppl_code` vs seed. |
 | `modal_nanogpt_speedrun_owt10m_dyn1` | `exp_nanogpt_speedrun_owt_10m.yaml` (96 gens, 360 steps) | 1 | 10M/1M packed OWT: calibrated target (2.5k) yields multiple token buckets; winner improves `ppl_code` strongly but is slower (throughput trade-off). |
 | `modal_deepseek_style_owt10m_dyn1` | `exp_deepseek_style_owt_10m.yaml` (96 gens, 360 steps) | 11 | DeepSeek-style pressure (KV bytes + throughput + selector): frontier contains MLA/GQA variants that reduce `kv_bytes_per_token` while keeping throughput high. |
+| `modal_speedrun_owt10m_v3_full1` | `exp_nanogpt_speedrun_owt_10m_v3.yaml` (96 gens, 360 steps) | 3 | V3 compute-to-target (`speedrun_flops_to_target`): frontier stayed mostly dense MHA; `memory_tokens` shows up as a recurring “speed” assist. |
+| `modal_selector_owt10m_v3_full1` | `exp_selector_style_owt_10m_v3.yaml` (96 gens, 360 steps) | 17 | V3 selector-style pressure: larger frontier with MLA + KV-policy quant points (e.g., `kv_policy.quant=nf4` + 1× GQA) plus some memory modules. |
 
 ### Architecture Highlights (Historical)
 
