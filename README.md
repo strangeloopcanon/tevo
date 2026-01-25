@@ -566,6 +566,7 @@ optimizer:
   lr: 3.0e-4
   betas: [0.9, 0.99]
 ```
+Evolution can also mutate optimizer choice/hparams via `toggle_optimizer` and `tune_optimizer`.
 
 ### Scaling tools
 Fit scaling-law priors from existing runs:

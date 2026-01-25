@@ -740,7 +740,10 @@ class TrainSchedule(BaseModel):
 
 
 class OptimizerConfig(BaseModel):
-    """Optimizer selection and hyperparameters (non-evolvable by default)."""
+    """Optimizer selection and hyperparameters.
+
+    These fields can be mutated by evolution if the optimizer mutations are enabled.
+    """
 
     name: Literal["adamw", "lion"] = "adamw"
     lr: float | None = Field(default=None, gt=0.0)

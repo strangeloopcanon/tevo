@@ -149,6 +149,58 @@ def toggle_precision(spec: ArchitectureSpec, rng: random.Random) -> Architecture
     return child
 
 
+def toggle_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    name = str(getattr(child.train.optimizer, "name", "adamw") or "adamw").lower()
+    child.train.optimizer.name = "lion" if name == "adamw" else "adamw"
+    # Reset optimizer-specific moment knobs; keep lr/wd overrides if already set.
+    child.train.optimizer.betas = None
+    child.train.optimizer.eps = None
+    return child
+
+
+def tune_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Jitter optimizer hyperparameters to explore training dynamics."""
+    child = clone_spec(spec)
+    opt = child.train.optimizer
+    name = str(getattr(opt, "name", "adamw") or "adamw").lower()
+
+    base_lr = float(opt.lr if opt.lr is not None else child.train.lr)
+    if rng.random() < 0.2:
+        opt.lr = None
+    else:
+        factor = float(rng.choice([0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0]))
+        opt.lr = float(max(1e-6, min(base_lr * factor, 5e-3)))
+
+    base_wd = float(opt.weight_decay if opt.weight_decay is not None else child.train.weight_decay)
+    if rng.random() < 0.2:
+        opt.weight_decay = None
+    else:
+        if rng.random() < 0.1:
+            opt.weight_decay = 0.0
+        else:
+            factor = float(rng.choice([0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]))
+            opt.weight_decay = float(max(0.0, min(base_wd * factor, 0.2)))
+
+    if name == "adamw":
+        opt.betas = rng.choice(
+            [
+                None,
+                (0.9, 0.95),
+                (0.9, 0.98),
+                (0.9, 0.99),
+                (0.9, 0.999),
+                (0.95, 0.999),
+            ]
+        )
+        opt.eps = rng.choice([None, 1e-8, 1e-6, 1e-5])
+    else:
+        opt.betas = rng.choice([None, (0.9, 0.99), (0.9, 0.98), (0.95, 0.98)])
+        opt.eps = None
+
+    return child
+
+
 def insert_retro_module(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     child = clone_spec(spec)
     block = rng.choice(child.model.blocks)
@@ -1119,6 +1171,8 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_router": tune_router,
     "make_gqa": make_gqa,
     "toggle_precision": toggle_precision,
+    "toggle_optimizer": toggle_optimizer,
+    "tune_optimizer": tune_optimizer,
     "insert_retro_module": insert_retro_module,
     "insert_custom_module": insert_custom_module,
     "insert_graph_module": insert_graph_module,
