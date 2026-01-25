@@ -18,6 +18,7 @@ from torch.nn.utils import clip_grad_norm_
 from .candidates import Candidate
 from .data import DataModule, TokenBatch
 from .dsl import ArchitectureSpec
+from .evaluation import estimate_flops_per_token
 from .models import BranchRouter, EvolutionModel, MoELayer, count_parameters
 from .morphology import match_experts_to_parent, sort_moe_experts
 from .optimizers import build_optimizer
@@ -226,9 +227,22 @@ class FullWeightTrainer:
         speedrun_steps_to_target = 0.0
         speedrun_tokens_to_target = 0.0
         speedrun_time_to_target = 0.0
+        speedrun_flops_to_target = 0.0
+        speedrun_prev_eval_loss: float | None = None
+        speedrun_prev_eval_step = 0
+        speedrun_prev_eval_tokens = 0.0
+        speedrun_prev_eval_time = 0.0
+        speedrun_prev_eval_flops = 0.0
+        flops_seen = 0.0
+        flops_per_token_est = estimate_flops_per_token(
+            spec,
+            recurrence_steps=self._recurrence_schedule(spec, self.steps, total_steps),
+        )
         for step_idx in range(self.steps):
+            recurrence_steps: dict[int, int] = {}
             if spec.model.recurrences:
-                model.set_recurrence_steps(self._recurrence_schedule(spec, step_idx, total_steps))
+                recurrence_steps = self._recurrence_schedule(spec, step_idx, total_steps)
+                model.set_recurrence_steps(recurrence_steps)
             try:
                 batch = next(iterator)
             except StopIteration:
@@ -306,9 +320,14 @@ class FullWeightTrainer:
             optimizer.step()
             optimizer.zero_grad()
             try:
-                tokens_seen += int(attn_mask.sum().item())
+                step_tokens = int(attn_mask.sum().item())
             except Exception:
-                tokens_seen += input_ids.numel()
+                step_tokens = int(input_ids.numel())
+            tokens_seen += step_tokens
+            if step_tokens > 0:
+                flops_seen += float(step_tokens) * estimate_flops_per_token(
+                    spec, recurrence_steps=recurrence_steps
+                )
             if (
                 speedrun_enabled
                 and not speedrun_reached
@@ -343,10 +362,41 @@ class FullWeightTrainer:
                 if self.speedrun_callback is not None and math.isfinite(float(loss_val)):
                     self.speedrun_callback(int(step_idx + 1), float(loss_val), int(tokens_seen))
                 if speedrun_target_loss is not None and loss_val <= speedrun_target_loss:
+                    elapsed = max(time.perf_counter() - start_time, 1e-6)
+                    eval_step = int(step_idx + 1)
+                    eval_tokens = float(tokens_seen)
+                    eval_flops = float(flops_seen)
+                    eval_time = float(elapsed)
+                    frac = 1.0
+                    if (
+                        speedrun_prev_eval_loss is not None
+                        and math.isfinite(speedrun_prev_eval_loss)
+                        and speedrun_prev_eval_loss > speedrun_target_loss
+                        and math.isfinite(loss_val)
+                    ):
+                        denom = speedrun_prev_eval_loss - float(loss_val)
+                        if denom > 0.0:
+                            frac = (speedrun_prev_eval_loss - speedrun_target_loss) / denom
+                            frac = max(0.0, min(1.0, frac))
                     speedrun_reached = True
-                    speedrun_steps_to_target = float(step_idx + 1)
-                    speedrun_tokens_to_target = float(tokens_seen)
-                    speedrun_time_to_target = max(time.perf_counter() - start_time, 1e-6)
+                    speedrun_steps_to_target = float(speedrun_prev_eval_step) + frac * float(
+                        eval_step - speedrun_prev_eval_step
+                    )
+                    speedrun_tokens_to_target = speedrun_prev_eval_tokens + frac * (
+                        eval_tokens - speedrun_prev_eval_tokens
+                    )
+                    speedrun_flops_to_target = speedrun_prev_eval_flops + frac * (
+                        eval_flops - speedrun_prev_eval_flops
+                    )
+                    speedrun_time_to_target = speedrun_prev_eval_time + frac * (
+                        eval_time - speedrun_prev_eval_time
+                    )
+                if math.isfinite(float(loss_val)):
+                    speedrun_prev_eval_loss = float(loss_val)
+                    speedrun_prev_eval_step = int(step_idx + 1)
+                    speedrun_prev_eval_tokens = float(tokens_seen)
+                    speedrun_prev_eval_time = max(time.perf_counter() - start_time, 1e-6)
+                    speedrun_prev_eval_flops = float(flops_seen)
             # Router entropy guard
             step_entropy = _average_router_entropy(model)
             if step_entropy is not None and step_entropy < self.entropy_threshold:
@@ -467,6 +517,7 @@ class FullWeightTrainer:
             "throughput": throughput,
             "params": float(count_parameters(model)),
             "ram": float(count_parameters(model) * 2 / (1024**3)),
+            "flops_per_token_est": float(flops_per_token_est),
             "long_recall": long_recall,
             "long_recall_proxy": long_recall_proxy,
             "router_entropy": router_entropy,
@@ -483,6 +534,7 @@ class FullWeightTrainer:
         }
         if speedrun_enabled:
             missing_penalty = 1e9
+            missing_penalty_flops = missing_penalty * max(float(flops_per_token_est), 1.0)
             metrics.update(
                 {
                     "speedrun_reached": 1.0 if speedrun_reached else 0.0,
@@ -494,6 +546,9 @@ class FullWeightTrainer:
                     ),
                     "speedrun_time_to_target": (
                         speedrun_time_to_target if speedrun_reached else missing_penalty
+                    ),
+                    "speedrun_flops_to_target": (
+                        speedrun_flops_to_target if speedrun_reached else missing_penalty_flops
                     ),
                     "speedrun_best_eval_loss": (
                         speedrun_best_loss if math.isfinite(speedrun_best_loss) else missing_penalty

@@ -1,11 +1,11 @@
 model:
-  name: exp-nanogpt-speedrun-owt-10m
+  name: exp-selector-style-owt-10m-v3
   emb:
     dim: 768
     vocab: 50257
     dropout: 0.0
   blocks:
-    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0, selector: dsa, selector_topk: 64, selector_heads: 1, selector_dim: 32, selector_rope: partial }
       ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
     - attn: { kind: MHA, heads: 12, head_dim: 64, rope: standard, kv_groups: 1, dropout: 0.0 }
       ffn: { type: dense, hidden: 3072, activation: gelu, dropout: 0.0 }
@@ -73,6 +73,7 @@ evolution:
     max_kv_bytes_per_token: 45000
     min_throughput_proxy: 1.0
     min_layers: 12
+    min_selector_blocks: 1
   rung1_tokens: 300000
   rung2_tokens: 900000
   population: 24
@@ -83,5 +84,7 @@ evolution:
   structural_elite_k: 4
   weight_inheritance: scratch
   objectives:
-    speedrun_tokens_to_target: min
     ppl_code: min
+    speedrun_flops_to_target: min
+    kv_bytes_per_token: min
+    throughput: max

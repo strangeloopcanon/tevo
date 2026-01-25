@@ -1,5 +1,5 @@
 model:
-  name: exp-nanogpt-speedrun-owt-10m
+  name: exp-nanogpt-speedrun-owt-10m-v3
   emb:
     dim: 768
     vocab: 50257
@@ -83,5 +83,5 @@ evolution:
   structural_elite_k: 4
   weight_inheritance: scratch
   objectives:
-    speedrun_tokens_to_target: min
+    speedrun_flops_to_target: min
     ppl_code: min
