@@ -708,7 +708,7 @@ class TrainSchedule(BaseModel):
     passkey_eval_vocab_limit: int | None = Field(
         default=None, gt=0, description="Optional cap on synthetic passkey token range."
     )
-    # Optional speedrun-style probe: measure time/tokens to hit a target eval loss/ppl.
+    # Optional speedrun-style probe: periodic eval checks for learning-curve + time-to-target.
     speedrun_eval_interval: int = Field(
         default=0,
         ge=0,
@@ -730,10 +730,6 @@ class TrainSchedule(BaseModel):
     @model_validator(mode="after")
     def _validate_speedrun(self) -> TrainSchedule:
         if self.speedrun_eval_interval > 0:
-            if self.speedrun_target_loss is None and self.speedrun_target_ppl is None:
-                raise ValueError(
-                    "speedrun_eval_interval requires speedrun_target_loss or speedrun_target_ppl"
-                )
             if self.speedrun_target_loss is not None and self.speedrun_target_ppl is not None:
                 raise ValueError("Provide only one of speedrun_target_loss or speedrun_target_ppl")
         return self
