@@ -27,6 +27,8 @@ import typer
 
 app = typer.Typer(help="Run multi-seed speedrun benchmarks and summarize results.")
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 @dataclass(frozen=True)
 class BenchResult:
@@ -67,6 +69,18 @@ def _median(values: list[float]) -> float:
     return float(statistics.median(values))
 
 
+def _repo_relative(path: Path) -> str:
+    """Return a path relative to the repo root when possible.
+
+    Modal workers mount the repo under /repo, so passing absolute local paths
+    (e.g., /Users/...) will fail inside the container.
+    """
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except Exception:
+        return str(path)
+
+
 def _run_modal_benchmark(
     *,
     config_path: Path,
@@ -83,7 +97,7 @@ def _run_modal_benchmark(
         "run",
         "scripts/modal_run_benchmark.py",
         "--config-path",
-        str(config_path),
+        _repo_relative(config_path),
         "--steps",
         str(int(steps)),
         "--eval-batches",
