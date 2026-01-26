@@ -535,6 +535,7 @@ class FullWeightTrainer:
         if speedrun_enabled:
             missing_penalty = 1e9
             missing_penalty_flops = missing_penalty * max(float(flops_per_token_est), 1.0)
+            missing_penalty_time = missing_penalty
             best_eval_loss = (
                 float(speedrun_best_loss) if math.isfinite(speedrun_best_loss) else missing_penalty
             )
@@ -545,14 +546,27 @@ class FullWeightTrainer:
                 loss_gap = missing_penalty
             gap_cap = 2.0
             gap_beta = 4.0
-            flops_budget = max(float(flops_seen), 0.0)
+            tokens_budget = getattr(batch_iter, "max_tokens", None)
+            if tokens_budget is None:
+                tokens_budget = getattr(spec.train, "max_tokens", None)
+            if tokens_budget is None:
+                tokens_budget = tokens_seen
+            tokens_budget = max(float(tokens_budget), float(tokens_seen), 1.0)
+            flops_per_token_run = float(flops_seen) / max(float(tokens_seen), 1.0)
+            if not math.isfinite(flops_per_token_run) or flops_per_token_run <= 0.0:
+                flops_per_token_run = float(flops_per_token_est)
+            flops_budget = tokens_budget * max(float(flops_per_token_run), 1.0)
+            time_budget = tokens_budget / max(float(throughput), 1e-6)
             if speedrun_reached:
                 speedrun_score = float(speedrun_flops_to_target)
+                speedrun_time_score = float(speedrun_time_to_target)
             elif math.isfinite(float(speedrun_best_loss)):
                 penalty = math.exp(gap_beta * min(float(loss_gap), gap_cap))
                 speedrun_score = max(flops_budget, 1.0) * penalty
+                speedrun_time_score = max(time_budget, 1.0) * penalty
             else:
                 speedrun_score = missing_penalty_flops
+                speedrun_time_score = missing_penalty_time
             metrics.update(
                 {
                     "speedrun_reached": 1.0 if speedrun_reached else 0.0,
@@ -571,6 +585,7 @@ class FullWeightTrainer:
                     "speedrun_best_eval_loss": best_eval_loss,
                     "speedrun_loss_gap": float(loss_gap),
                     "speedrun_score": float(speedrun_score),
+                    "speedrun_time_score": float(speedrun_time_score),
                     "speedrun_error": speedrun_error,
                 }
             )

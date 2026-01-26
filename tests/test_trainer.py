@@ -87,6 +87,7 @@ def test_full_weight_trainer_speedrun_metrics(tmp_path: Path, tiny_spec) -> None
         "speedrun_best_eval_loss",
         "speedrun_loss_gap",
         "speedrun_score",
+        "speedrun_time_score",
         "speedrun_error",
     ):
         assert key in metrics
