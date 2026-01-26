@@ -217,7 +217,7 @@ class FullWeightTrainer:
                 speedrun_target_ppl = None
         if speedrun_target_loss is None and speedrun_target_ppl is not None:
             speedrun_target_loss = math.log(speedrun_target_ppl)
-        speedrun_enabled = speedrun_interval > 0 and speedrun_target_loss is not None
+        speedrun_enabled = speedrun_interval > 0
         speedrun_eval_failed = False
         speedrun_eval_module: DataModule | None = None
         speedrun_eval_tokens = 0
@@ -447,6 +447,7 @@ class FullWeightTrainer:
             ppl_eval = ppl_train
             ppl_eval_error = 1.0
         perplexity = ppl_eval
+        speedrun_end_eval_loss = math.log(max(float(perplexity), 1e-12))
         long_recall_proxy = _estimate_long_recall(spec)
         passkey_metrics = self._passkey_probe(model, spec)
         long_recall = float(passkey_metrics.get("passkey_acc", long_recall_proxy))
@@ -619,6 +620,7 @@ class FullWeightTrainer:
                         speedrun_flops_to_target if speedrun_reached else missing_penalty_flops
                     ),
                     "speedrun_best_eval_loss": best_eval_loss,
+                    "speedrun_end_eval_loss": float(speedrun_end_eval_loss),
                     "speedrun_loss_auc": float(speedrun_loss_auc),
                     "speedrun_loss_gap": float(loss_gap),
                     "speedrun_score": float(speedrun_score),
