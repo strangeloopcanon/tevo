@@ -224,6 +224,7 @@ class FullWeightTrainer:
         speedrun_error = 0.0
         speedrun_reached = False
         speedrun_best_loss = float("inf")
+        speedrun_eval_points: list[tuple[float, float]] = []
         speedrun_steps_to_target = 0.0
         speedrun_tokens_to_target = 0.0
         speedrun_time_to_target = 0.0
@@ -330,7 +331,6 @@ class FullWeightTrainer:
                 )
             if (
                 speedrun_enabled
-                and not speedrun_reached
                 and not speedrun_eval_failed
                 and (step_idx + 1) % speedrun_interval == 0
             ):
@@ -359,9 +359,16 @@ class FullWeightTrainer:
                     loss_val = 1e9
                 if loss_val < speedrun_best_loss:
                     speedrun_best_loss = loss_val
+                if math.isfinite(float(loss_val)):
+                    speedrun_eval_points.append((float(tokens_seen), float(loss_val)))
                 if self.speedrun_callback is not None and math.isfinite(float(loss_val)):
                     self.speedrun_callback(int(step_idx + 1), float(loss_val), int(tokens_seen))
-                if speedrun_target_loss is not None and loss_val <= speedrun_target_loss:
+                if (
+                    not speedrun_reached
+                    and speedrun_target_loss is not None
+                    and math.isfinite(float(loss_val))
+                    and loss_val <= speedrun_target_loss
+                ):
                     elapsed = max(time.perf_counter() - start_time, 1e-6)
                     eval_step = int(step_idx + 1)
                     eval_tokens = float(tokens_seen)
@@ -557,6 +564,35 @@ class FullWeightTrainer:
                 flops_per_token_run = float(flops_per_token_est)
             flops_budget = tokens_budget * max(float(flops_per_token_run), 1.0)
             time_budget = tokens_budget / max(float(throughput), 1e-6)
+            speedrun_loss_auc = missing_penalty
+            if speedrun_eval_points and math.isfinite(tokens_budget) and tokens_budget > 0.0:
+                token_cap = float(tokens_budget)
+                cleaned = [
+                    (max(0.0, min(float(t), token_cap)), float(loss))
+                    for t, loss in speedrun_eval_points
+                    if math.isfinite(float(loss))
+                ]
+                cleaned.sort(key=lambda pair: pair[0])
+                points: list[tuple[float, float]] = []
+                for t, loss in cleaned:
+                    if points and abs(t - points[-1][0]) < 1e-9:
+                        points[-1] = (t, loss)
+                    else:
+                        points.append((t, loss))
+                if points:
+                    if points[0][0] > 0.0:
+                        points = [(0.0, points[0][1]), *points]
+                    if points[-1][0] < token_cap:
+                        points.append((token_cap, points[-1][1]))
+                    auc = 0.0
+                    prev_t, prev_l = points[0]
+                    for t, loss in points[1:]:
+                        dt = max(0.0, float(t) - float(prev_t))
+                        auc += 0.5 * (float(prev_l) + float(loss)) * dt
+                        prev_t, prev_l = t, loss
+                        if prev_t >= token_cap:
+                            break
+                    speedrun_loss_auc = float(auc) / max(token_cap, 1.0)
             if speedrun_reached:
                 speedrun_score = float(speedrun_flops_to_target)
                 speedrun_time_score = float(speedrun_time_to_target)
@@ -583,6 +619,7 @@ class FullWeightTrainer:
                         speedrun_flops_to_target if speedrun_reached else missing_penalty_flops
                     ),
                     "speedrun_best_eval_loss": best_eval_loss,
+                    "speedrun_loss_auc": float(speedrun_loss_auc),
                     "speedrun_loss_gap": float(loss_gap),
                     "speedrun_score": float(speedrun_score),
                     "speedrun_time_score": float(speedrun_time_score),

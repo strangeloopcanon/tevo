@@ -85,6 +85,7 @@ def test_full_weight_trainer_speedrun_metrics(tmp_path: Path, tiny_spec) -> None
         "speedrun_tokens_to_target",
         "speedrun_time_to_target",
         "speedrun_best_eval_loss",
+        "speedrun_loss_auc",
         "speedrun_loss_gap",
         "speedrun_score",
         "speedrun_time_score",

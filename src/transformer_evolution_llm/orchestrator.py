@@ -388,10 +388,11 @@ class EvolutionRunner:
             base_rung2 = max(int(self.cfg.rung2_tokens), int(candidate.spec.train.max_tokens or 0))
             base_rung1 = int(self.cfg.rung1_tokens)
             mult = 1.0
-            if candidate.spec.model.n_layers >= 4:
-                mult += 0.2
-            if candidate.spec.model.moe_block_count() >= 1:
-                mult += 0.1
+            if not bool(getattr(self.cfg, "fixed_token_budget", False)):
+                if candidate.spec.model.n_layers >= 4:
+                    mult += 0.2
+                if candidate.spec.model.moe_block_count() >= 1:
+                    mult += 0.1
             rung2_tokens = int(min(base_rung2 * mult, tokens_budget)) if tokens_budget > 0 else 0
             rung1_tokens = int(min(base_rung1 * mult, rung2_tokens)) if rung2_tokens > 0 else 0
             rung2_extra = max(0, rung2_tokens - rung1_tokens)

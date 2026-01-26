@@ -852,6 +852,13 @@ class EvolutionConfig(BaseModel):
     )
     rung1_tokens: int = 200_000
     rung2_tokens: int = 1_000_000
+    fixed_token_budget: bool = Field(
+        default=False,
+        description=(
+            "If true, do not scale rung token budgets by model complexity in live mode; "
+            "use rung{1,2}_tokens as-is (still capped by priors.tokens_per_param)."
+        ),
+    )
     population: int = 12
     topk_keep: float = Field(default=0.33, gt=0.0, le=1.0)
     crossover_prob: float = Field(default=0.2, ge=0.0, le=1.0)
