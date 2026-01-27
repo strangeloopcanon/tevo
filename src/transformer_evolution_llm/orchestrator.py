@@ -1011,36 +1011,64 @@ class EvolutionRunner:
             and len(self.pool) >= 2
             and self.rng.random() < self.cfg.crossover_prob
         ):
-            parent_a, parent_b = self.rng.sample(self.pool, 2)
-            blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
-            spec_data = parent_a.spec.model_dump(mode="python")
-            spec_data["model"]["blocks"] = [block.model_dump(mode="python") for block in blocks]
-            spec = ArchitectureSpec(**spec_data)
-            child_id = self._new_id("xover")
-            seed_path: Path | None = None
-            if self.weight_inheritance == "parent":
-                seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
-                merge_checkpoints(
-                    child_spec=spec,
-                    cut_a=cut_a,
-                    cut_b=cut_b,
-                    parent_a_blocks=len(parent_a.spec.model.blocks),
-                    parent_b_blocks=len(parent_b.spec.model.blocks),
-                    parent_a_ckpt=parent_a.checkpoint,
-                    parent_b_ckpt=parent_b.checkpoint,
-                    out_path=seed_path,
-                )
-            self._parents[child_id] = [parent_a.ident, parent_b.ident]
-            return Candidate(
-                ident=child_id,
-                spec=spec,
-                parent=None,
-                seed_state_path=seed_path,
-            )
+            # Crossover can fail if checkpoint shapes are incompatible or if the splice
+            # produces an invalid spec. Treat that as a retryable event rather than
+            # crashing the entire run.
+            for _ in range(3):
+                parent_a, parent_b = self.rng.sample(self.pool, 2)
+                child_id = self._new_id("xover")
+                seed_path: Path | None = None
+                try:
+                    blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
+                    spec_data = parent_a.spec.model_dump(mode="python")
+                    spec_data["model"]["blocks"] = [
+                        block.model_dump(mode="python") for block in blocks
+                    ]
+                    spec = ArchitectureSpec(**spec_data)
+                    if self.weight_inheritance == "parent":
+                        seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
+                        merge_checkpoints(
+                            child_spec=spec,
+                            cut_a=cut_a,
+                            cut_b=cut_b,
+                            parent_a_blocks=len(parent_a.spec.model.blocks),
+                            parent_b_blocks=len(parent_b.spec.model.blocks),
+                            parent_a_ckpt=parent_a.checkpoint,
+                            parent_b_ckpt=parent_b.checkpoint,
+                            out_path=seed_path,
+                        )
+                    self._parents[child_id] = [parent_a.ident, parent_b.ident]
+                    return Candidate(
+                        ident=child_id,
+                        spec=spec,
+                        parent=None,
+                        seed_state_path=seed_path,
+                    )
+                except Exception as exc:
+                    console.print(f"[yellow]Crossover failed:[/] {exc}")
+                    if seed_path is not None:
+                        try:
+                            seed_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    continue
         parent = self._select_parent()
-        name, spec = mutate(
-            parent.spec, self.rng, self.mutation_weights, steps=getattr(self, "mutation_steps", 1)
-        )
+        # Mutations must never crash a long sweep; some operators have narrow
+        # preconditions and may throw. Retry a few times, then fall back to a noop.
+        name = "noop"
+        spec = parent.spec.model_copy(deep=True)
+        for _ in range(8):
+            try:
+                name, spec = mutate(
+                    parent.spec,
+                    self.rng,
+                    self.mutation_weights,
+                    steps=getattr(self, "mutation_steps", 1),
+                )
+                break
+            except Exception as exc:
+                console.print(f"[yellow]Mutation failed:[/] {exc}")
+                continue
         child = Candidate(
             ident=self._new_id(name),
             spec=spec,
