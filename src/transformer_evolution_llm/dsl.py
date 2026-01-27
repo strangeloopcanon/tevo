@@ -118,6 +118,45 @@ class AttentionConfig(BaseModel):
             self.selector_dim = max(1, min(int(self.selector_dim), int(self.head_dim)))
         return self
 
+    @model_validator(mode="after")
+    def validate_sparsity_config(self) -> AttentionConfig:
+        """Validate sparsity pattern configuration with helpful error messages."""
+        sparsity = self.sparsity or "none"
+
+        if sparsity == "sliding" and self.sw is not None and self.sw <= 0:
+            raise ValueError(
+                f"Sliding window attention requires sw > 0, got sw={self.sw}. "
+                "Set sw to a positive integer (e.g., sw=128)."
+            )
+
+        if sparsity == "local_global":
+            if self.sw is None or self.sw <= 0:
+                raise ValueError(
+                    f"local_global sparsity requires a positive sliding window (sw > 0). "
+                    f"Got sw={self.sw}. Set sw to a positive integer (e.g., sw=128)."
+                )
+            if self.global_stride is None or self.global_stride <= 0:
+                raise ValueError(
+                    f"local_global sparsity requires global_stride > 0. "
+                    f"Got global_stride={self.global_stride}. Set to a positive integer (e.g., 64)."
+                )
+
+        if sparsity == "block":
+            if self.block_size is None or self.block_size <= 0:
+                raise ValueError(
+                    f"block sparsity requires block_size > 0. "
+                    f"Got block_size={self.block_size}. Set to a positive integer (e.g., 64)."
+                )
+
+        if sparsity == "dilated":
+            if self.dilation is None or self.dilation <= 0:
+                raise ValueError(
+                    f"dilated sparsity requires dilation > 0. "
+                    f"Got dilation={self.dilation}. Set to a positive integer (e.g., 2)."
+                )
+
+        return self
+
 
 class KVPolicyConfig(BaseModel):
     """Inference KV-cache policy (for memory/latency-aware evolution).
@@ -461,6 +500,16 @@ class MoEFFNConfig(BaseModel):
     drop_policy: Literal["none", "greedy"] = "none"
     experts: list[MoEExpertConfig] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_moe_topk(self) -> MoEFFNConfig:
+        """Ensure k does not exceed n_experts."""
+        if self.k > self.n_experts:
+            raise ValueError(
+                f"MoE top-k ({self.k}) cannot exceed n_experts ({self.n_experts}). "
+                f"Set k <= {self.n_experts} or increase n_experts to at least {self.k}."
+            )
+        return self
+
 
 class MoEDenseExpertConfig(BaseModel):
     """Dense expert configuration for MoE blocks."""
@@ -599,6 +648,16 @@ class LookupMemoryConfig(BaseModel):
     lookup_device: Literal["model", "cpu"] = "model"
     gating_weight: float = Field(default=0.1, ge=0.0, le=1.0)
 
+    @model_validator(mode="after")
+    def validate_lookup_topk(self) -> LookupMemoryConfig:
+        """Ensure topk does not exceed entries."""
+        if self.topk > self.entries:
+            raise ValueError(
+                f"LookupMemory top-k ({self.topk}) cannot exceed entries ({self.entries}). "
+                f"Set topk <= {self.entries} or increase entries to at least {self.topk}."
+            )
+        return self
+
 
 class BranchRouterConfig(BaseModel):
     """Learned router that mixes branch outputs inside a block."""
@@ -672,9 +731,22 @@ class RecurrenceConfig(BaseModel):
     def valid_range(cls, value: int, info: ValidationInfo) -> int:
         start = info.data.get("start", 0)
         if value <= start:
-            msg = "recurrence end must be greater than start"
-            raise ValueError(msg)
+            raise ValueError(
+                f"Recurrence end ({value}) must be greater than start ({start}). "
+                f"Set end > {start} to define a valid block range for recurrence."
+            )
         return value
+
+    @model_validator(mode="after")
+    def validate_recurrence_params(self) -> RecurrenceConfig:
+        """Validate recurrence configuration with helpful error messages."""
+        if self.train_recurrence > self.max_train_recurrence:
+            raise ValueError(
+                f"train_recurrence ({self.train_recurrence}) cannot exceed "
+                f"max_train_recurrence ({self.max_train_recurrence}). "
+                f"Set train_recurrence <= {self.max_train_recurrence}."
+            )
+        return self
 
 
 class TrainSchedule(BaseModel):
@@ -708,7 +780,17 @@ class TrainSchedule(BaseModel):
     passkey_eval_vocab_limit: int | None = Field(
         default=None, gt=0, description="Optional cap on synthetic passkey token range."
     )
-    # Optional speedrun-style probe: periodic eval checks for learning-curve + time-to-target.
+    # Downstream probes: quick capability checks beyond perplexity
+    downstream_probes: bool = Field(
+        default=False,
+        description="If True, run simple code/math/recall probes as part of evaluation.",
+    )
+    downstream_probe_examples: int = Field(
+        default=5,
+        ge=1,
+        description="Number of examples per downstream probe.",
+    )
+    # Optional speedrun-style probe: measure time/tokens to hit a target eval loss/ppl.
     speedrun_eval_interval: int = Field(
         default=0,
         ge=0,
@@ -723,6 +805,14 @@ class TrainSchedule(BaseModel):
     speedrun_target_ppl: float | None = Field(
         default=None, gt=0.0, description="Target eval perplexity threshold for the speedrun probe."
     )
+    # Multi-threshold speedrun: track progress toward multiple thresholds and compute AUC
+    speedrun_multi_thresholds: list[float] | None = Field(
+        default=None,
+        description=(
+            "List of perplexity thresholds to track (e.g., [2500, 2000, 1500, 1000]). "
+            "If provided, computes AUC of tokens-to-threshold curve."
+        ),
+    )
 
     model_config = {"populate_by_name": True}
     optimizer: OptimizerConfig = Field(default_factory=lambda: OptimizerConfig())
@@ -730,16 +820,17 @@ class TrainSchedule(BaseModel):
     @model_validator(mode="after")
     def _validate_speedrun(self) -> TrainSchedule:
         if self.speedrun_eval_interval > 0:
+            if self.speedrun_target_loss is None and self.speedrun_target_ppl is None:
+                raise ValueError(
+                    "speedrun_eval_interval requires speedrun_target_loss or speedrun_target_ppl"
+                )
             if self.speedrun_target_loss is not None and self.speedrun_target_ppl is not None:
                 raise ValueError("Provide only one of speedrun_target_loss or speedrun_target_ppl")
         return self
 
 
 class OptimizerConfig(BaseModel):
-    """Optimizer selection and hyperparameters.
-
-    These fields can be mutated by evolution if the optimizer mutations are enabled.
-    """
+    """Optimizer selection and hyperparameters (non-evolvable by default)."""
 
     name: Literal["adamw", "lion"] = "adamw"
     lr: float | None = Field(default=None, gt=0.0)
@@ -848,17 +939,19 @@ class EvolutionConfig(BaseModel):
     )
     rung1_tokens: int = 200_000
     rung2_tokens: int = 1_000_000
-    fixed_token_budget: bool = Field(
-        default=False,
-        description=(
-            "If true, do not scale rung token budgets by model complexity in live mode; "
-            "use rung{1,2}_tokens as-is (still capped by priors.tokens_per_param)."
-        ),
-    )
     population: int = 12
     topk_keep: float = Field(default=0.33, gt=0.0, le=1.0)
     crossover_prob: float = Field(default=0.2, ge=0.0, le=1.0)
-    parent_selection: Literal["weighted", "pareto_uniform", "lexicase", "map_elites"] = "weighted"
+    parent_selection: Literal[
+        "weighted", "pareto_uniform", "lexicase", "epsilon_lexicase", "map_elites"
+    ] = "weighted"
+    # Epsilon-lexicase: tolerance band for near-ties (as fraction of objective range)
+    epsilon_lexicase_epsilon: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Tolerance band for epsilon-lexicase selection (fraction of objective range).",
+    )
     pareto_objectives: list[str] = Field(
         default_factory=lambda: ["ppl_code", "ppl_math", "long_recall", "throughput", "ram"]
     )
@@ -877,10 +970,30 @@ class EvolutionConfig(BaseModel):
     structural_elite_k: int = Field(default=2, ge=0)
     structural_elite_weights: dict[str, float] | None = None
     adaptive_mutation: bool = False
+    # Context-aware mutation: prioritize mutations based on candidate architecture state
+    context_aware_mutation: bool = Field(
+        default=False,
+        description="If True, prioritize mutations based on candidate architecture state.",
+    )
     adaptive_mutation_eta: float = Field(default=0.1, gt=0.0, le=1.0)
     adaptive_mutation_min_weight: float = Field(default=0.05, gt=0.0)
     adaptive_mutation_max_weight: float = Field(default=5.0, gt=0.0)
     weight_inheritance: Literal["parent", "init", "scratch"] = "parent"
+    # Adaptive rung budgets: promote/demote candidates based on improvement rate
+    adaptive_rung_budget: bool = Field(
+        default=False,
+        description="If True, adjust rung budgets based on improvement rate during training.",
+    )
+    adaptive_rung_fast_promote_threshold: float = Field(
+        default=0.15,
+        ge=0.0,
+        description="Improvement rate threshold for early promotion to rung2.",
+    )
+    adaptive_rung_slow_stop_threshold: float = Field(
+        default=0.02,
+        ge=0.0,
+        description="Improvement rate threshold for early stopping (plateau).",
+    )
     # Operator invention v1: learn weights for mutation templates and optionally persist/promote
     template_learning: bool = False
     template_learning_eta: float = Field(default=0.2, gt=0.0, le=1.0)

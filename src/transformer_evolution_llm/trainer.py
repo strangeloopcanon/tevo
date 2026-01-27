@@ -24,6 +24,144 @@ from .morphology import match_experts_to_parent, sort_moe_experts
 from .optimizers import build_optimizer
 
 
+def compute_speedrun_auc(
+    thresholds: list[float], tokens_to_threshold: list[float | None]
+) -> float:
+    """Compute area under the tokens-to-threshold curve.
+
+    Uses trapezoidal integration over thresholds where we reached the target.
+    Lower AUC means faster training (reached thresholds with fewer tokens).
+
+    Args:
+        thresholds: Perplexity thresholds (should be sorted descending).
+        tokens_to_threshold: Tokens to reach each threshold (None if not reached).
+
+    Returns:
+        AUC value. If fewer than 2 thresholds were reached, returns infinity.
+    """
+    # Filter to thresholds we actually reached
+    valid_pairs = [
+        (t, tok)
+        for t, tok in zip(thresholds, tokens_to_threshold)
+        if tok is not None and math.isfinite(tok)
+    ]
+
+    if len(valid_pairs) < 2:
+        return float("inf")
+
+    # Sort by threshold (descending) for proper integration
+    valid_pairs.sort(key=lambda x: x[0], reverse=True)
+
+    # Trapezoidal integration
+    auc = 0.0
+    for i in range(1, len(valid_pairs)):
+        t_prev, tok_prev = valid_pairs[i - 1]
+        t_curr, tok_curr = valid_pairs[i]
+        dt = abs(t_prev - t_curr)
+        avg_tok = (tok_prev + tok_curr) / 2
+        auc += dt * avg_tok
+
+    return auc
+
+
+def fit_learning_curve(
+    steps: list[int], losses: list[float], target_steps: int | None = None
+) -> dict[str, float]:
+    """Fit a power-law learning curve to predict long-term performance.
+
+    Uses the form: loss(t) = a * t^(-b) + c
+    where a, b, c are fitted parameters.
+
+    Args:
+        steps: Training step indices.
+        losses: Corresponding loss values.
+        target_steps: Optional target step count for extrapolation.
+
+    Returns:
+        Dictionary with:
+        - a, b, c: Fitted parameters
+        - r_squared: Fit quality (0-1)
+        - extrapolated_loss: Predicted loss at target_steps (if provided)
+        - extrapolated_ppl: Predicted perplexity at target_steps (if provided)
+        - fit_error: 1.0 if fitting failed, 0.0 otherwise
+    """
+    result: dict[str, float] = {
+        "learning_curve_a": 0.0,
+        "learning_curve_b": 0.0,
+        "learning_curve_c": 0.0,
+        "learning_curve_r_squared": 0.0,
+        "fit_error": 0.0,
+    }
+
+    if len(steps) < 3 or len(losses) < 3:
+        result["fit_error"] = 1.0
+        return result
+
+    # Filter out invalid values
+    valid_pairs = [
+        (s, l) for s, l in zip(steps, losses) if s > 0 and math.isfinite(l) and l > 0
+    ]
+    if len(valid_pairs) < 3:
+        result["fit_error"] = 1.0
+        return result
+
+    steps_arr = [p[0] for p in valid_pairs]
+    losses_arr = [p[1] for p in valid_pairs]
+
+    try:
+        # Simple power-law fit using log-linear regression
+        # log(loss - c) = log(a) - b * log(t)
+        # We estimate c as the minimum observed loss (floor estimate)
+        c_est = min(losses_arr) * 0.9  # Slightly below minimum
+
+        # Shift losses
+        shifted = [max(l - c_est, 1e-9) for l in losses_arr]
+
+        # Log-transform
+        log_t = [math.log(s) for s in steps_arr]
+        log_l = [math.log(l) for l in shifted]
+
+        # Linear regression: log_l = log_a - b * log_t
+        n = len(log_t)
+        sum_x = sum(log_t)
+        sum_y = sum(log_l)
+        sum_xy = sum(x * y for x, y in zip(log_t, log_l))
+        sum_x2 = sum(x * x for x in log_t)
+
+        denom = n * sum_x2 - sum_x * sum_x
+        if abs(denom) < 1e-12:
+            result["fit_error"] = 1.0
+            return result
+
+        b = -(n * sum_xy - sum_x * sum_y) / denom
+        log_a = (sum_y + b * sum_x) / n
+        a = math.exp(log_a)
+        c = c_est
+
+        # Compute R-squared
+        mean_y = sum_y / n
+        ss_tot = sum((y - mean_y) ** 2 for y in log_l)
+        predicted = [log_a - b * x for x in log_t]
+        ss_res = sum((y - p) ** 2 for y, p in zip(log_l, predicted))
+        r_squared = 1.0 - (ss_res / max(ss_tot, 1e-12)) if ss_tot > 0 else 0.0
+
+        result["learning_curve_a"] = float(a)
+        result["learning_curve_b"] = float(b)
+        result["learning_curve_c"] = float(c)
+        result["learning_curve_r_squared"] = max(0.0, min(1.0, float(r_squared)))
+
+        # Extrapolate to target if provided
+        if target_steps is not None and target_steps > 0 and b > 0:
+            extrapolated = a * (target_steps ** (-b)) + c
+            result["extrapolated_loss"] = float(extrapolated)
+            result["extrapolated_ppl"] = float(math.exp(extrapolated))
+
+    except (ValueError, OverflowError, ZeroDivisionError):
+        result["fit_error"] = 1.0
+
+    return result
+
+
 class FullWeightTrainer:
     """Runs a short, full-weight finetune for each candidate."""
 
@@ -193,6 +331,16 @@ class FullWeightTrainer:
         max_loss_jump = 0.0
         optimizer.zero_grad()
         total_steps = max(1, self.steps)
+        # Track losses for learning curve fitting
+        loss_history_steps: list[int] = []
+        loss_history_values: list[float] = []
+        # Track stability metrics
+        recent_losses: list[float] = []  # Last N losses for variance calculation
+        grad_norms: list[float] = []  # Gradient norms for spike detection
+        grad_norm_spikes = 0  # Count of gradient norm spikes
+        # Track improvement rate for adaptive rung budgets
+        early_loss: float | None = None
+        mid_loss: float | None = None
         autocast_ctx: Any = nullcontext()
         if self.device.type in {"cuda", "mps"}:
             dtype = torch.bfloat16 if bool(getattr(spec.train, "bf16", True)) else torch.float16
@@ -217,14 +365,13 @@ class FullWeightTrainer:
                 speedrun_target_ppl = None
         if speedrun_target_loss is None and speedrun_target_ppl is not None:
             speedrun_target_loss = math.log(speedrun_target_ppl)
-        speedrun_enabled = speedrun_interval > 0
+        speedrun_enabled = speedrun_interval > 0 and speedrun_target_loss is not None
         speedrun_eval_failed = False
         speedrun_eval_module: DataModule | None = None
         speedrun_eval_tokens = 0
         speedrun_error = 0.0
         speedrun_reached = False
         speedrun_best_loss = float("inf")
-        speedrun_eval_points: list[tuple[float, float]] = []
         speedrun_steps_to_target = 0.0
         speedrun_tokens_to_target = 0.0
         speedrun_time_to_target = 0.0
@@ -235,6 +382,21 @@ class FullWeightTrainer:
         speedrun_prev_eval_time = 0.0
         speedrun_prev_eval_flops = 0.0
         flops_seen = 0.0
+
+        # Multi-threshold speedrun tracking
+        multi_thresholds_raw = getattr(spec.train, "speedrun_multi_thresholds", None)
+        multi_thresholds: list[float] = []
+        if multi_thresholds_raw:
+            multi_thresholds = sorted(
+                [float(t) for t in multi_thresholds_raw if t > 0], reverse=True
+            )
+        multi_threshold_reached: dict[float, bool] = {t: False for t in multi_thresholds}
+        multi_threshold_tokens: dict[float, float | None] = {t: None for t in multi_thresholds}
+        multi_threshold_flops: dict[float, float | None] = {t: None for t in multi_thresholds}
+        # Track eval history for interpolation
+        eval_history: list[tuple[float, float, float, float]] = (
+            []
+        )  # (tokens, flops, time, ppl)
         flops_per_token_est = estimate_flops_per_token(
             spec,
             recurrence_steps=self._recurrence_schedule(spec, self.steps, total_steps),
@@ -303,6 +465,23 @@ class FullWeightTrainer:
                 stop_reason = "nan_or_inf_loss"
                 optimizer.zero_grad()
                 break
+
+            # Track loss for learning curve fitting (every 5 steps to avoid overhead)
+            if (step_idx + 1) % 5 == 0 or step_idx == 0:
+                loss_history_steps.append(step_idx + 1)
+                loss_history_values.append(current_loss)
+
+            # Track recent losses for stability (keep last 20)
+            recent_losses.append(current_loss)
+            if len(recent_losses) > 20:
+                recent_losses.pop(0)
+
+            # Track early and mid losses for improvement rate
+            if step_idx == min(5, total_steps // 4):
+                early_loss = current_loss
+            if step_idx == total_steps // 2:
+                mid_loss = current_loss
+
             loss.backward()
             grad_total = clip_grad_norm_(model.parameters(), spec.train.clip)
             if hasattr(grad_total, "item"):
@@ -314,6 +493,15 @@ class FullWeightTrainer:
                 stop_reason = "nan_or_inf_grad"
                 optimizer.zero_grad()
                 break
+
+            # Track gradient norms for stability analysis
+            grad_norms.append(grad_norm)
+            # Detect spikes: grad_norm > 3x running average
+            if len(grad_norms) >= 5:
+                avg_norm = sum(grad_norms[-5:]) / 5
+                if grad_norm > 3.0 * avg_norm and avg_norm > 0.1:
+                    grad_norm_spikes += 1
+
             if grad_norm > self.instability_threshold:
                 stop_reason = f"high_grad({grad_norm:.2f})"
                 optimizer.zero_grad()
@@ -331,6 +519,7 @@ class FullWeightTrainer:
                 )
             if (
                 speedrun_enabled
+                and not speedrun_reached
                 and not speedrun_eval_failed
                 and (step_idx + 1) % speedrun_interval == 0
             ):
@@ -359,16 +548,9 @@ class FullWeightTrainer:
                     loss_val = 1e9
                 if loss_val < speedrun_best_loss:
                     speedrun_best_loss = loss_val
-                if math.isfinite(float(loss_val)):
-                    speedrun_eval_points.append((float(tokens_seen), float(loss_val)))
                 if self.speedrun_callback is not None and math.isfinite(float(loss_val)):
                     self.speedrun_callback(int(step_idx + 1), float(loss_val), int(tokens_seen))
-                if (
-                    not speedrun_reached
-                    and speedrun_target_loss is not None
-                    and math.isfinite(float(loss_val))
-                    and loss_val <= speedrun_target_loss
-                ):
+                if speedrun_target_loss is not None and loss_val <= speedrun_target_loss:
                     elapsed = max(time.perf_counter() - start_time, 1e-6)
                     eval_step = int(step_idx + 1)
                     eval_tokens = float(tokens_seen)
@@ -404,6 +586,41 @@ class FullWeightTrainer:
                     speedrun_prev_eval_tokens = float(tokens_seen)
                     speedrun_prev_eval_time = max(time.perf_counter() - start_time, 1e-6)
                     speedrun_prev_eval_flops = float(flops_seen)
+
+                    # Track eval history for multi-threshold interpolation
+                    current_ppl = math.exp(loss_val) if loss_val < 20 else float("inf")
+                    eval_history.append(
+                        (
+                            float(tokens_seen),
+                            float(flops_seen),
+                            speedrun_prev_eval_time,
+                            current_ppl,
+                        )
+                    )
+
+                    # Check multi-thresholds
+                    for thresh in multi_thresholds:
+                        if multi_threshold_reached[thresh]:
+                            continue
+                        if current_ppl <= thresh:
+                            # Interpolate to find exact crossing point
+                            if len(eval_history) >= 2:
+                                prev_tokens, prev_flops, prev_time, prev_ppl = eval_history[-2]
+                                curr_tokens, curr_flops, curr_time, curr_ppl = eval_history[-1]
+                                if prev_ppl > thresh >= curr_ppl and prev_ppl != curr_ppl:
+                                    frac = (prev_ppl - thresh) / (prev_ppl - curr_ppl)
+                                    interp_tokens = prev_tokens + frac * (curr_tokens - prev_tokens)
+                                    interp_flops = prev_flops + frac * (curr_flops - prev_flops)
+                                else:
+                                    interp_tokens = float(tokens_seen)
+                                    interp_flops = float(flops_seen)
+                            else:
+                                interp_tokens = float(tokens_seen)
+                                interp_flops = float(flops_seen)
+
+                            multi_threshold_reached[thresh] = True
+                            multi_threshold_tokens[thresh] = interp_tokens
+                            multi_threshold_flops[thresh] = interp_flops
             # Router entropy guard
             step_entropy = _average_router_entropy(model)
             if step_entropy is not None and step_entropy < self.entropy_threshold:
@@ -447,7 +664,6 @@ class FullWeightTrainer:
             ppl_eval = ppl_train
             ppl_eval_error = 1.0
         perplexity = ppl_eval
-        speedrun_end_eval_loss = math.log(max(float(perplexity), 1e-12))
         long_recall_proxy = _estimate_long_recall(spec)
         passkey_metrics = self._passkey_probe(model, spec)
         long_recall = float(passkey_metrics.get("passkey_acc", long_recall_proxy))
@@ -514,6 +730,12 @@ class FullWeightTrainer:
         elif stop_reason == "data_exhausted":
             reason_code = 5.0
         moe_penalty = 1.0 + 0.01 * spec.model.moe_block_count()
+        # Fit learning curve to predict long-term performance
+        learning_curve_metrics = fit_learning_curve(
+            loss_history_steps,
+            loss_history_values,
+            target_steps=self.steps * 10,  # Extrapolate to 10x current training
+        )
         metrics = {
             "ppl_code": perplexity,
             "ppl_train": ppl_train,
@@ -540,70 +762,52 @@ class FullWeightTrainer:
             "nan_seen": 1.0 if nan_or_inf else 0.0,
             "loss_spike": max(0.0, max_loss_jump),
         }
+        # Add learning curve metrics
+        metrics.update(learning_curve_metrics)
+
+        # Compute stability metrics
+        loss_variance = 0.0
+        if len(recent_losses) >= 3:
+            mean_loss = sum(recent_losses) / len(recent_losses)
+            loss_variance = sum((l - mean_loss) ** 2 for l in recent_losses) / len(recent_losses)
+
+        grad_norm_mean = sum(grad_norms) / len(grad_norms) if grad_norms else 0.0
+        grad_norm_std = 0.0
+        if len(grad_norms) >= 3:
+            grad_norm_std = (
+                sum((g - grad_norm_mean) ** 2 for g in grad_norms) / len(grad_norms)
+            ) ** 0.5
+
+        # Compute instability score: composite of loss variance, grad spikes, and max grad
+        instability_score = (
+            0.3 * min(loss_variance, 10.0) / 10.0  # Normalized loss variance
+            + 0.3 * min(grad_norm_spikes, 10) / 10.0  # Normalized spike count
+            + 0.4 * min(max_grad_norm, self.instability_threshold) / self.instability_threshold
+        )
+
+        # Compute improvement rate for adaptive rung budgets
+        improvement_rate = 0.0
+        if early_loss is not None and mid_loss is not None and early_loss > 0:
+            # Relative improvement from early to mid training
+            improvement_rate = max(0.0, (early_loss - mid_loss) / early_loss)
+        elif len(loss_history_values) >= 5:
+            # Fallback: compute from first and last few losses
+            first_avg = sum(loss_history_values[:3]) / 3
+            last_avg = sum(loss_history_values[-3:]) / 3
+            if first_avg > 0:
+                improvement_rate = max(0.0, (first_avg - last_avg) / first_avg)
+
+        metrics.update({
+            "loss_variance": float(loss_variance),
+            "grad_norm_mean": float(grad_norm_mean),
+            "grad_norm_std": float(grad_norm_std),
+            "grad_norm_spikes": float(grad_norm_spikes),
+            "instability_score": float(instability_score),
+            "improvement_rate": float(improvement_rate),
+        })
         if speedrun_enabled:
             missing_penalty = 1e9
             missing_penalty_flops = missing_penalty * max(float(flops_per_token_est), 1.0)
-            missing_penalty_time = missing_penalty
-            best_eval_loss = (
-                float(speedrun_best_loss) if math.isfinite(speedrun_best_loss) else missing_penalty
-            )
-            target_loss = float(speedrun_target_loss) if speedrun_target_loss is not None else None
-            if target_loss is not None and math.isfinite(best_eval_loss):
-                loss_gap = max(0.0, best_eval_loss - target_loss)
-            else:
-                loss_gap = missing_penalty
-            gap_cap = 2.0
-            gap_beta = 4.0
-            tokens_budget = getattr(batch_iter, "max_tokens", None)
-            if tokens_budget is None:
-                tokens_budget = getattr(spec.train, "max_tokens", None)
-            if tokens_budget is None:
-                tokens_budget = tokens_seen
-            tokens_budget = max(float(tokens_budget), float(tokens_seen), 1.0)
-            flops_per_token_run = float(flops_seen) / max(float(tokens_seen), 1.0)
-            if not math.isfinite(flops_per_token_run) or flops_per_token_run <= 0.0:
-                flops_per_token_run = float(flops_per_token_est)
-            flops_budget = tokens_budget * max(float(flops_per_token_run), 1.0)
-            time_budget = tokens_budget / max(float(throughput), 1e-6)
-            speedrun_loss_auc = missing_penalty
-            if speedrun_eval_points and math.isfinite(tokens_budget) and tokens_budget > 0.0:
-                token_cap = float(tokens_budget)
-                cleaned = [
-                    (max(0.0, min(float(t), token_cap)), float(loss))
-                    for t, loss in speedrun_eval_points
-                    if math.isfinite(float(loss))
-                ]
-                cleaned.sort(key=lambda pair: pair[0])
-                points: list[tuple[float, float]] = []
-                for t, loss in cleaned:
-                    if points and abs(t - points[-1][0]) < 1e-9:
-                        points[-1] = (t, loss)
-                    else:
-                        points.append((t, loss))
-                if points:
-                    if points[0][0] > 0.0:
-                        points = [(0.0, points[0][1]), *points]
-                    if points[-1][0] < token_cap:
-                        points.append((token_cap, points[-1][1]))
-                    auc = 0.0
-                    prev_t, prev_l = points[0]
-                    for t, loss in points[1:]:
-                        dt = max(0.0, float(t) - float(prev_t))
-                        auc += 0.5 * (float(prev_l) + float(loss)) * dt
-                        prev_t, prev_l = t, loss
-                        if prev_t >= token_cap:
-                            break
-                    speedrun_loss_auc = float(auc) / max(token_cap, 1.0)
-            if speedrun_reached:
-                speedrun_score = float(speedrun_flops_to_target)
-                speedrun_time_score = float(speedrun_time_to_target)
-            elif math.isfinite(float(speedrun_best_loss)):
-                penalty = math.exp(gap_beta * min(float(loss_gap), gap_cap))
-                speedrun_score = max(flops_budget, 1.0) * penalty
-                speedrun_time_score = max(time_budget, 1.0) * penalty
-            else:
-                speedrun_score = missing_penalty_flops
-                speedrun_time_score = missing_penalty_time
             metrics.update(
                 {
                     "speedrun_reached": 1.0 if speedrun_reached else 0.0,
@@ -619,16 +823,65 @@ class FullWeightTrainer:
                     "speedrun_flops_to_target": (
                         speedrun_flops_to_target if speedrun_reached else missing_penalty_flops
                     ),
-                    "speedrun_best_eval_loss": best_eval_loss,
-                    "speedrun_end_eval_loss": float(speedrun_end_eval_loss),
-                    "speedrun_loss_auc": float(speedrun_loss_auc),
-                    "speedrun_loss_gap": float(loss_gap),
-                    "speedrun_score": float(speedrun_score),
-                    "speedrun_time_score": float(speedrun_time_score),
+                    "speedrun_best_eval_loss": (
+                        speedrun_best_loss if math.isfinite(speedrun_best_loss) else missing_penalty
+                    ),
                     "speedrun_error": speedrun_error,
                 }
             )
+
+            # Add multi-threshold metrics if configured
+            if multi_thresholds:
+                tokens_list = [
+                    multi_threshold_tokens.get(t) for t in sorted(multi_thresholds, reverse=True)
+                ]
+                auc = compute_speedrun_auc(
+                    sorted(multi_thresholds, reverse=True), tokens_list
+                )
+                metrics["speedrun_auc"] = auc if math.isfinite(auc) else missing_penalty
+
+                # Add per-threshold metrics
+                for thresh in multi_thresholds:
+                    thresh_key = str(int(thresh))
+                    reached = multi_threshold_reached.get(thresh, False)
+                    metrics[f"speedrun_reached_{thresh_key}"] = 1.0 if reached else 0.0
+                    tokens_val = multi_threshold_tokens.get(thresh)
+                    metrics[f"speedrun_tokens_{thresh_key}"] = (
+                        tokens_val if tokens_val is not None else missing_penalty
+                    )
+                    flops_val = multi_threshold_flops.get(thresh)
+                    metrics[f"speedrun_flops_{thresh_key}"] = (
+                        flops_val if flops_val is not None else missing_penalty_flops
+                    )
+
+                # Count how many thresholds were reached
+                metrics["speedrun_thresholds_reached"] = float(
+                    sum(1 for t in multi_thresholds if multi_threshold_reached.get(t, False))
+                )
         metrics.update(passkey_metrics)
+
+        # Run downstream probes if enabled
+        if bool(getattr(spec.train, "downstream_probes", False)):
+            n_examples = int(getattr(spec.train, "downstream_probe_examples", 5) or 5)
+            try:
+                # Need to reload model for probes (it was deleted for memory)
+                probe_model = EvolutionModel(spec.model).to(self.device)
+                probe_model.eval()
+                state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+                probe_model.load_state_dict(state, strict=False)
+                downstream_metrics = run_downstream_probes(
+                    probe_model, spec, self.device, n_examples=n_examples
+                )
+                metrics.update(downstream_metrics)
+                del probe_model
+            except Exception:
+                metrics.update({
+                    "code_probe_acc": 0.0,
+                    "math_probe_acc": 0.0,
+                    "recall_probe_acc": 0.0,
+                    "downstream_avg_acc": 0.0,
+                    "downstream_error": 1.0,
+                })
         if spec.model.recurrences:
             metrics.update(self._recurrence_evaluations(model, spec, batch_iter, criterion))
         result = (metrics, checkpoint_path)
@@ -877,10 +1130,18 @@ class FullWeightTrainer:
                     total += int(targets.numel())
             acc = float(correct) / float(max(1, total))
             loss_val = eval_loss / float(max(1, eval_batches))
-            return {
+
+            # Run multi-needle probes on the trained probe model
+            multi_needle_results = run_multi_needle_probes(
+                probe_model, spec, self.device, probe_types=["first", "middle", "last", "pattern"]
+            )
+
+            results = {
                 "passkey_acc": acc,
                 "passkey_loss": loss_val,
             }
+            results.update(multi_needle_results)
+            return results
         except Exception:
             if (
                 self.device.type == "cuda"
@@ -908,6 +1169,255 @@ def _average_router_entropy(model: nn.Module) -> float | None:
     if not entropies:
         return None
     return sum(entropies) / len(entropies)
+
+
+def run_multi_needle_probes(
+    model: nn.Module,
+    spec: ArchitectureSpec,
+    device: torch.device,
+    probe_types: list[str] | None = None,
+) -> dict[str, float]:
+    """Run multiple needle-in-haystack probe variants.
+
+    Probe types:
+    - "first": Retrieve value placed at the first position
+    - "middle": Retrieve value placed in the middle
+    - "last": Retrieve value placed near the end (but before query)
+    - "pattern": Find a repeated pattern in the context
+
+    Returns:
+        Dictionary of probe_type -> accuracy for each probe.
+    """
+    if probe_types is None:
+        probe_types = ["first", "middle", "last", "pattern"]
+
+    results: dict[str, float] = {}
+    vocab = int(spec.model.head.vocab)
+    seq_len = int(spec.data.seq_len)
+    batch_size = max(1, int(spec.data.batch_size))
+
+    if vocab < 10 or seq_len < 16:
+        return {f"needle_{pt}_acc": 0.0 for pt in probe_types}
+
+    seed_val = int(getattr(spec.train, "seed", 0) or 0)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed_val + 42)
+
+    query_marker = vocab - 2
+    noise_vocab = max(1, vocab - 3)
+    eval_batches = 4
+
+    was_training = bool(getattr(model, "training", False))
+
+    try:
+        model.eval()
+        with torch.no_grad():
+            for probe_type in probe_types:
+                correct = 0
+                total = 0
+
+                for _ in range(eval_batches):
+                    ids = torch.randint(
+                        0, noise_vocab, (batch_size, seq_len),
+                        generator=generator, dtype=torch.long
+                    )
+                    target = torch.randint(
+                        0, noise_vocab, (batch_size,),
+                        generator=generator, dtype=torch.long
+                    )
+
+                    if probe_type == "first":
+                        # Place target at position 0
+                        ids[:, 0] = target
+                    elif probe_type == "middle":
+                        # Place target in the middle
+                        mid_pos = seq_len // 2
+                        ids[:, mid_pos] = target
+                    elif probe_type == "last":
+                        # Place target near the end (3 positions before query)
+                        ids[:, -4] = target
+                    elif probe_type == "pattern":
+                        # Repeat target 3 times in early context
+                        pattern_positions = [1, 3, 5]
+                        for pos in pattern_positions:
+                            if pos < seq_len - 2:
+                                ids[:, pos] = target
+                    else:
+                        continue
+
+                    # Add query marker and target at end
+                    ids[:, -2] = int(query_marker)
+                    ids[:, -1] = target
+
+                    input_ids = ids.to(device)
+                    logits = model(input_ids)
+
+                    if logits.size(1) < 2:
+                        continue
+
+                    # Predict from position -2 (after query marker)
+                    pred = logits[:, -2, :noise_vocab].argmax(dim=-1)
+                    correct += int((pred == target.to(device)).sum().item())
+                    total += int(target.numel())
+
+                acc = float(correct) / float(max(1, total))
+                results[f"needle_{probe_type}_acc"] = acc
+
+    finally:
+        if was_training:
+            model.train()
+
+    # Compute aggregate needle score
+    accs = [v for k, v in results.items() if k.endswith("_acc")]
+    results["needle_avg_acc"] = sum(accs) / len(accs) if accs else 0.0
+
+    return results
+
+
+def run_downstream_probes(
+    model: nn.Module,
+    spec: ArchitectureSpec,
+    device: torch.device,
+    n_examples: int = 5,
+) -> dict[str, float]:
+    """Run simple downstream probes to assess capability beyond perplexity.
+
+    Probes:
+    - code_probe: Simple code completion (predict closing bracket/token)
+    - math_probe: Basic arithmetic pattern completion
+    - recall_probe: Factual pattern recall (given context, predict answer)
+
+    These are synthetic tasks designed to run quickly and provide a rough
+    signal about model capability without requiring external datasets.
+
+    Returns:
+        Dictionary with probe accuracies.
+    """
+    results: dict[str, float] = {}
+    vocab = int(spec.model.head.vocab)
+    seq_len = min(256, int(spec.data.seq_len))
+    batch_size = 1
+
+    if vocab < 50:
+        return {"code_probe_acc": 0.0, "math_probe_acc": 0.0, "recall_probe_acc": 0.0}
+
+    seed_val = int(getattr(spec.train, "seed", 0) or 0)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed_val + 123)
+
+    was_training = bool(getattr(model, "training", False))
+
+    try:
+        model.eval()
+
+        # Probe 1: Code completion (bracket matching)
+        # Pattern: context tokens + open bracket -> predict close bracket
+        code_correct = 0
+        code_total = 0
+        # Use simple token patterns for synthetic code
+        open_token = min(40, vocab - 1)  # Represents '('
+        close_token = min(41, vocab - 1)  # Represents ')'
+
+        with torch.no_grad():
+            for _ in range(n_examples):
+                # Create pattern: [noise] [open] [noise] -> predict [close]
+                ids = torch.randint(0, min(100, vocab), (batch_size, seq_len), dtype=torch.long)
+                ids[:, seq_len // 2] = open_token
+                ids[:, -1] = close_token
+
+                input_ids = ids[:, :-1].to(device)
+                target = close_token
+
+                logits = model(input_ids)
+                if logits.size(1) > 0:
+                    pred = logits[:, -1, :].argmax(dim=-1).item()
+                    if pred == target:
+                        code_correct += 1
+                    code_total += 1
+
+        results["code_probe_acc"] = float(code_correct) / max(1, code_total)
+
+        # Probe 2: Math pattern (arithmetic sequence)
+        # Pattern: A + B = [answer] where answer = A + B (mod vocab)
+        math_correct = 0
+        math_total = 0
+        plus_token = min(43, vocab - 1)  # '+'
+        eq_token = min(61, vocab - 1)  # '='
+
+        with torch.no_grad():
+            for _ in range(n_examples):
+                a = torch.randint(1, min(50, vocab // 4), (1,), generator=generator).item()
+                b = torch.randint(1, min(50, vocab // 4), (1,), generator=generator).item()
+                answer = (a + b) % max(1, vocab // 2)
+
+                # Create: [noise] A + B = [answer]
+                ids = torch.randint(0, min(100, vocab), (batch_size, seq_len), dtype=torch.long)
+                ids[:, -5] = a
+                ids[:, -4] = plus_token
+                ids[:, -3] = b
+                ids[:, -2] = eq_token
+                ids[:, -1] = answer
+
+                input_ids = ids[:, :-1].to(device)
+                target = answer
+
+                logits = model(input_ids)
+                if logits.size(1) > 0:
+                    pred = logits[:, -1, :].argmax(dim=-1).item()
+                    if pred == target:
+                        math_correct += 1
+                    math_total += 1
+
+        results["math_probe_acc"] = float(math_correct) / max(1, math_total)
+
+        # Probe 3: Recall (repeat a value from earlier in context)
+        # Pattern: [marker] [value] ... [query_marker] -> [value]
+        recall_correct = 0
+        recall_total = 0
+        marker_token = min(vocab - 3, max(0, vocab - 3))
+        query_token = min(vocab - 2, max(0, vocab - 2))
+
+        with torch.no_grad():
+            for _ in range(n_examples):
+                value = torch.randint(0, min(100, vocab), (1,), generator=generator).item()
+
+                # Create: [marker] [value] [noise] [query] -> [value]
+                ids = torch.randint(0, min(100, vocab), (batch_size, seq_len), dtype=torch.long)
+                ids[:, 0] = marker_token
+                ids[:, 1] = value
+                ids[:, -2] = query_token
+                ids[:, -1] = value
+
+                input_ids = ids[:, :-1].to(device)
+                target = value
+
+                logits = model(input_ids)
+                if logits.size(1) > 0:
+                    pred = logits[:, -1, :].argmax(dim=-1).item()
+                    if pred == target:
+                        recall_correct += 1
+                    recall_total += 1
+
+        results["recall_probe_acc"] = float(recall_correct) / max(1, recall_total)
+
+        # Compute aggregate
+        accs = [results.get("code_probe_acc", 0), results.get("math_probe_acc", 0),
+                results.get("recall_probe_acc", 0)]
+        results["downstream_avg_acc"] = sum(accs) / len(accs)
+
+    except Exception:
+        results = {
+            "code_probe_acc": 0.0,
+            "math_probe_acc": 0.0,
+            "recall_probe_acc": 0.0,
+            "downstream_avg_acc": 0.0,
+            "downstream_error": 1.0,
+        }
+    finally:
+        if was_training:
+            model.train()
+
+    return results
 
 
 def _estimate_long_recall(spec: ArchitectureSpec) -> float:
