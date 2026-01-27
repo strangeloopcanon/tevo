@@ -115,6 +115,7 @@ def run_live(
 
     out_path = run_root / "frontier.json"
     lineage_path = run_root / "lineage.json"
+    default_lineage_path = run_root / "frontier_lineage.json"
     checkpoint_dir = run_root / "checkpoints"
 
     cfg_path = Path(config_path)
@@ -152,11 +153,12 @@ def run_live(
     subprocess.run(cmd, check=True)
     RUNS_VOL.commit()
     HF_VOL.commit()
+    resolved_lineage = lineage_path if lineage else default_lineage_path
     return {
         "run_id": run_name,
         "frontier": f"{run_name}/frontier.json",
         "state": f"{run_name}/frontier.state.json",
-        "lineage": f"{run_name}/lineage.json",
+        "lineage": f"{run_name}/{resolved_lineage.name}",
         "manifest": f"{run_name}/frontier.manifest.json",
     }
 
@@ -198,6 +200,11 @@ def main(
         if not remote_path:
             continue
         local_path = out_root / Path(remote_path).name
-        with local_path.open("wb") as handle:
-            RUNS_VOL.read_file_into_fileobj(remote_path, handle)
+        try:
+            with local_path.open("wb") as handle:
+                RUNS_VOL.read_file_into_fileobj(remote_path, handle)
+        except FileNotFoundError:
+            local_path.unlink(missing_ok=True)
+            print(f"missing {remote_path}; skipping download")
+            continue
         print(f"downloaded {remote_path} -> {local_path}")

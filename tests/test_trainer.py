@@ -69,7 +69,6 @@ def test_full_weight_trainer_speedrun_metrics(tmp_path: Path, tiny_spec) -> None
     spec = tiny_spec.model_copy(deep=True)
     spec.train.speedrun_eval_interval = 10_000
     spec.train.speedrun_eval_batches = 1
-    spec.train.speedrun_target_loss = 1e-3
 
     trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=2, eval_batches=1, device="cpu")
     candidate = Candidate(ident="cand-speedrun", spec=spec)
@@ -85,6 +84,11 @@ def test_full_weight_trainer_speedrun_metrics(tmp_path: Path, tiny_spec) -> None
         "speedrun_tokens_to_target",
         "speedrun_time_to_target",
         "speedrun_best_eval_loss",
+        "speedrun_end_eval_loss",
+        "speedrun_loss_auc",
+        "speedrun_loss_gap",
+        "speedrun_score",
+        "speedrun_time_score",
         "speedrun_error",
     ):
         assert key in metrics

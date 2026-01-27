@@ -16,7 +16,11 @@ from transformer_evolution_llm.mutations import (
     mutate_topk,
     toggle_gated_mix,
     toggle_hyper_connections,
+    toggle_optimizer,
+    tune_clip,
     tune_lookup_memory,
+    tune_optimizer,
+    tune_warmup,
 )
 
 
@@ -83,3 +87,42 @@ def test_tune_lookup_memory_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> N
     )
     assert mem.entries > 0
     assert 0 < mem.topk <= mem.entries
+
+
+def test_toggle_optimizer_flips_name(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(9)  # noqa: S311 - deterministic unit tests
+    first = toggle_optimizer(tiny_spec, rng=rng)
+    assert first.train.optimizer.name == "lion"
+    second = toggle_optimizer(first, rng=rng)
+    assert second.train.optimizer.name == "adamw"
+
+
+def test_tune_optimizer_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(10)  # noqa: S311 - deterministic unit tests
+    child = tune_optimizer(tiny_spec, rng=rng)
+    assert child.train.optimizer.name in {"adamw", "lion"}
+    if child.train.optimizer.lr is not None:
+        assert child.train.optimizer.lr > 0.0
+        assert child.train.optimizer.lr <= 5e-3
+    if child.train.optimizer.weight_decay is not None:
+        assert child.train.optimizer.weight_decay >= 0.0
+        assert child.train.optimizer.weight_decay <= 0.2
+    if child.train.optimizer.eps is not None:
+        assert child.train.optimizer.eps > 0.0
+    if child.train.optimizer.betas is not None:
+        beta1, beta2 = child.train.optimizer.betas
+        assert 0.0 <= beta1 < 1.0
+        assert 0.0 <= beta2 < 1.0
+
+
+def test_tune_warmup_changes_value(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(11)  # noqa: S311 - deterministic unit tests
+    child = tune_warmup(tiny_spec, rng=rng)
+    assert child.train.warmup >= 0
+    assert child.train.warmup != tiny_spec.train.warmup
+
+
+def test_tune_clip_keeps_positive(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(12)  # noqa: S311 - deterministic unit tests
+    child = tune_clip(tiny_spec, rng=rng)
+    assert child.train.clip > 0.0

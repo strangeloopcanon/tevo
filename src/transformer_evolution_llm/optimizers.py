@@ -1,6 +1,7 @@
 """Optimizer registry (AdamW built-in + optional Lion).
 
-We keep optimizer as a run-level knob, not typically mutated by evolution.
+Optimizer configuration lives in the DSL. Evolution can optionally mutate it via
+registered mutations.
 """
 
 from __future__ import annotations

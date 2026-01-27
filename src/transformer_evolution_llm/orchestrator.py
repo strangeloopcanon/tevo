@@ -400,9 +400,13 @@ class EvolutionRunner:
             if not isinstance(base_steps, int):
                 base_steps = 100
             # Rung 1
-            self.trainer.steps = max(1, int(base_steps * self._rung1_ratio))
+            rung1_steps = (
+                base_steps if rung2_extra <= 0 else max(1, int(base_steps * self._rung1_ratio))
+            )
+            self.trainer.steps = rung1_steps
             if rung1_tokens <= 0:
                 candidate.status = "failed"
+                self.trainer.steps = base_steps
                 return
             batches = self.data_module.batches(max_tokens=rung1_tokens)
             seed_state = candidate.seed_state_path or candidate.parent_checkpoint
@@ -425,6 +429,7 @@ class EvolutionRunner:
                 candidate.checkpoint = None
                 self._cleanup_seed_state(candidate)
                 self._remove_candidate_artifacts(candidate)
+                self.trainer.steps = base_steps
                 return
             candidate.metrics.update(metrics1)
             candidate.checkpoint = checkpoint
@@ -433,6 +438,7 @@ class EvolutionRunner:
                 self._cleanup_seed_state(candidate)
                 self._remove_candidate_artifacts(candidate)
                 candidate.checkpoint = None
+                self.trainer.steps = base_steps
                 return
             # Early stop heuristic: clearly poor ppl
             ppl1 = float(candidate.metrics.get("ppl_code", 1e9))
@@ -445,6 +451,40 @@ class EvolutionRunner:
                 # restore trainer steps
                 self.trainer.steps = base_steps
                 return
+
+            # Adaptive rung budget: check improvement rate
+            adaptive_rung = bool(getattr(self.cfg, "adaptive_rung_budget", False))
+            improvement_rate = float(candidate.metrics.get("improvement_rate", 0.0))
+
+            if adaptive_rung:
+                fast_promote = float(
+                    getattr(self.cfg, "adaptive_rung_fast_promote_threshold", 0.15) or 0.15
+                )
+                slow_stop = float(
+                    getattr(self.cfg, "adaptive_rung_slow_stop_threshold", 0.02) or 0.02
+                )
+
+                # Early stop if improvement rate is too low (plateau)
+                if improvement_rate < slow_stop:
+                    console.print(
+                        f"[yellow]Early stop {candidate.ident}:[/] low improvement rate "
+                        f"({improvement_rate:.3f} < {slow_stop})"
+                    )
+                    self._cleanup_seed_state(candidate)
+                    candidate.status = "completed"
+                    self._apply_composite_metrics(candidate)
+                    self.frontier.update(candidate)
+                    self.trainer.steps = base_steps
+                    return
+
+                # Fast promote: increase rung2 budget for rapidly improving candidates
+                if improvement_rate > fast_promote:
+                    console.print(
+                        f"[green]Fast promote {candidate.ident}:[/] high improvement rate "
+                        f"({improvement_rate:.3f} > {fast_promote})"
+                    )
+                    # Give 50% extra budget
+                    rung2_extra = int(rung2_extra * 1.5)
             # Rung 2 (full)
             if rung2_extra <= 0:
                 self._cleanup_seed_state(candidate)
@@ -806,6 +846,11 @@ class EvolutionRunner:
             keep_ids.update(elite_ids)
             candidates = [c for c in candidates if c.ident in keep_ids]
 
+        if strategy == "epsilon_lexicase" and candidates:
+            # Epsilon-lexicase: like lexicase but with tolerance bands for near-ties.
+            # Candidates within epsilon of the best are all considered "tied".
+            return self._select_epsilon_lexicase(candidates)
+
         if strategy == "lexicase" and candidates:
             # Lexicase: randomly order objectives; progressively filter to the best on each
             objectives = list(self.objective_dir.keys())
@@ -853,6 +898,49 @@ class EvolutionRunner:
         )
         return max(contenders, key=lambda cand: cand.score(self.score_weights))
 
+    def _select_epsilon_lexicase(self, candidates: list[Candidate]) -> Candidate:
+        """Epsilon-lexicase selection with tolerance bands.
+
+        Unlike strict lexicase, candidates within epsilon of the best value
+        on each objective are all considered "tied" and pass to the next round.
+        This prevents good candidates from being eliminated due to noise.
+
+        The epsilon is computed as a fraction of the objective's range in the
+        current candidate pool.
+        """
+        epsilon_frac = float(getattr(self.cfg, "epsilon_lexicase_epsilon", 0.05) or 0.05)
+        objectives = list(self.objective_dir.keys())
+        self.rng.shuffle(objectives)
+        remaining = list(candidates)
+
+        for obj in objectives:
+            if len(remaining) <= 1:
+                break
+
+            direction = self.objective_dir[obj]
+            values = [c.metrics.get(obj, 0.0) for c in remaining]
+
+            # Compute range for epsilon calculation
+            min_val = min(values)
+            max_val = max(values)
+            obj_range = max_val - min_val
+            epsilon = epsilon_frac * obj_range if obj_range > 0 else 1e-9
+
+            # Find the best value
+            if direction == "max":
+                best_val = max(values)
+                threshold = best_val - epsilon
+                filtered = [c for c in remaining if c.metrics.get(obj, 0.0) >= threshold]
+            else:
+                best_val = min(values)
+                threshold = best_val + epsilon
+                filtered = [c for c in remaining if c.metrics.get(obj, 0.0) <= threshold]
+
+            if filtered:
+                remaining = filtered
+
+        return self.rng.choice(remaining) if remaining else self.rng.choice(candidates)
+
     def _update_archive(self, candidate: Candidate) -> None:
         if self.archive_max_elites <= 0:
             return
@@ -894,6 +982,13 @@ class EvolutionRunner:
             self.archive.pop(worst_key, None)
 
     def _maybe_update_mutation_weights(self, candidate: Candidate) -> None:
+        """Update mutation weights based on improvement magnitude, not just success/failure.
+
+        Instead of binary success (did it reach frontier?), we track the actual
+        improvement delta and weight mutations by how much they improve objectives.
+        This allows mutations that produce large improvements to be favored over
+        those that produce small ones.
+        """
         if not self._adaptive_mutation or not candidate.parent:
             return
         parent = next((c for c in self.pool if c.ident == candidate.parent), None)
@@ -901,17 +996,56 @@ class EvolutionRunner:
             parent = next((c for c in self._history if c.ident == candidate.parent), None)
         if parent is None:
             return
+
+        # Calculate improvement delta
         delta = float(candidate.score(self.score_weights) - parent.score(self.score_weights))
-        reward = 1.0 if delta > 0.0 else 0.0
+
+        # Track running average of improvement magnitudes for normalization
+        if not hasattr(self, "_improvement_baseline"):
+            self._improvement_baseline = 0.1  # Initial baseline
+        if not hasattr(self, "_improvement_count"):
+            self._improvement_count = 0
+
+        # Update baseline with exponential moving average of absolute deltas
+        self._improvement_count += 1
+        baseline_eta = 0.05  # Slow adaptation for baseline
+        self._improvement_baseline = (
+            1.0 - baseline_eta
+        ) * self._improvement_baseline + baseline_eta * abs(delta)
+        baseline = max(self._improvement_baseline, 1e-6)
+
+        # Compute magnitude-weighted reward:
+        # - Positive delta: reward = 0.5 + 0.5 * tanh(delta / baseline)
+        # - Negative delta: reward = 0.5 + 0.5 * tanh(delta / baseline)
+        # This gives a smooth reward in [0, 1] that scales with improvement magnitude
+        import math
+
+        normalized_delta = delta / baseline
+        reward = 0.5 + 0.5 * math.tanh(normalized_delta)
+
         label = candidate.ident.rsplit("-", 2)[0]
         names = [name for name in label.split("+") if name in MUTATION_REGISTRY]
         if not names:
             return
         if self.mutation_weights is None:
             self.mutation_weights = dict.fromkeys(MUTATION_REGISTRY, 1.0)
+
+        # Track improvement deltas per mutation for analysis
+        if not hasattr(self, "_mutation_deltas"):
+            self._mutation_deltas: dict[str, list[float]] = {}
+
         eta = max(1e-6, min(1.0, self._adaptive_mutation_eta))
         for name in names:
             self._mutation_counts[name] = int(self._mutation_counts.get(name, 0)) + 1
+
+            # Track raw deltas for analysis
+            if name not in self._mutation_deltas:
+                self._mutation_deltas[name] = []
+            self._mutation_deltas[name].append(delta)
+            # Keep only last 100 deltas per mutation
+            if len(self._mutation_deltas[name]) > 100:
+                self._mutation_deltas[name] = self._mutation_deltas[name][-100:]
+
             prev = float(self._mutation_success.get(name, 0.5))
             updated = (1.0 - eta) * prev + eta * reward
             self._mutation_success[name] = updated
@@ -1032,8 +1166,12 @@ class EvolutionRunner:
                 seed_state_path=seed_path,
             )
         parent = self._select_parent()
+        # Get context-aware mutation weights if enabled
+        mutation_weights = self._context_aware_mutation_weights(parent)
+        if mutation_weights is None:
+            mutation_weights = self.mutation_weights
         name, spec = mutate(
-            parent.spec, self.rng, self.mutation_weights, steps=getattr(self, "mutation_steps", 1)
+            parent.spec, self.rng, mutation_weights, steps=getattr(self, "mutation_steps", 1)
         )
         child = Candidate(
             ident=self._new_id(name),
@@ -1043,6 +1181,83 @@ class EvolutionRunner:
         )
         self._parents[child.ident] = [parent.ident]
         return child
+
+    def _context_aware_mutation_weights(self, parent: Candidate) -> dict[str, float] | None:
+        """Compute context-aware mutation weights based on candidate architecture state.
+
+        Analyzes the parent's structure and metrics to prioritize mutations that
+        address weaknesses or explore underutilized components.
+
+        Returns:
+            Mutation weight overrides, or None to use default weights.
+        """
+        if not bool(getattr(self.cfg, "context_aware_mutation", False)):
+            return None
+
+        spec = parent.spec
+        metrics = parent.metrics
+
+        # Start with uniform weights
+        weights = dict.fromkeys(MUTATION_REGISTRY, 1.0)
+
+        # Analyze architecture state
+        n_layers = spec.model.n_layers
+        moe_blocks = int(metrics.get("moe_blocks", 0))
+        memory_blocks = int(metrics.get("memory_blocks", 0))
+        selector_blocks = int(metrics.get("selector_blocks", 0))
+        router_entropy = float(metrics.get("router_entropy", 1.0))
+        ssm_blocks = int(metrics.get("ssm_blocks", 0))
+
+        # Context 1: Shallow stack -> prioritize depth mutations
+        if n_layers < 6:
+            weights["duplicate_block_span"] = 3.0
+            weights["add_recurrence"] = 2.0
+            weights["add_additional_recurrence"] = 2.0
+
+        # Context 2: Many MoE blocks but low router entropy -> prioritize router tuning
+        if moe_blocks >= 2 and router_entropy < 0.8:
+            weights["tune_router"] = 3.0
+            weights["tune_router_coeffs"] = 3.0
+            weights["tune_experts"] = 2.0
+
+        # Context 3: No memory modules -> prioritize memory insertion
+        if memory_blocks == 0:
+            weights["insert_retro_module"] = 3.0
+            weights["insert_assoc_memory"] = 2.5
+            weights["insert_memory_tokens"] = 2.0
+            weights["insert_chunk_memory"] = 2.0
+            weights["insert_lookup_memory"] = 2.0
+
+        # Context 4: No selectors -> prioritize selector mutations
+        if selector_blocks == 0 and n_layers >= 4:
+            weights["toggle_selector"] = 2.5
+
+        # Context 5: No SSM blocks -> consider adding
+        if ssm_blocks == 0 and n_layers >= 4:
+            weights["toggle_ssm"] = 1.5
+
+        # Context 6: High instability -> prioritize stability mutations
+        instability = float(metrics.get("instability", 0.0))
+        if instability > 2.0:
+            weights["toggle_qk_norm"] = 2.5
+            weights["insert_layer_scale"] = 2.0
+            weights["tune_layer_scale"] = 2.0
+
+        # Context 7: Poor long-recall -> prioritize memory/recurrence
+        long_recall = float(metrics.get("long_recall", 0.5))
+        if long_recall < 0.5:
+            weights["insert_retro_module"] = 2.0
+            weights["add_recurrence"] = 2.0
+            weights["insert_chunk_memory"] = 2.0
+
+        # Merge with existing adaptive weights if present
+        if self.mutation_weights:
+            for name, weight in self.mutation_weights.items():
+                if name in weights:
+                    # Average context-aware and adaptive weights
+                    weights[name] = (weights[name] + weight) / 2
+
+        return weights
 
     def _structural_score(self, cand: Candidate) -> float:
         """Score structural richness to keep depth/MoE/selector candidates alive."""

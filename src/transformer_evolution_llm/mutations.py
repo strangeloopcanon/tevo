@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import random
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
+
+from pydantic import ValidationError
 
 from .dsl import (
     ArchitectureSpec,
@@ -29,6 +31,65 @@ from .template_mutation import apply_template_mutation_with_name
 
 MutationResult = ArchitectureSpec | tuple[str, ArchitectureSpec]
 MutationFn = Callable[[ArchitectureSpec, random.Random], MutationResult]
+
+
+class MutationError(Exception):
+    """Raised when a mutation produces an invalid spec."""
+
+    def __init__(self, mutation_name: str, message: str, diff: str | None = None) -> None:
+        self.mutation_name = mutation_name
+        self.diff = diff
+        super().__init__(f"{mutation_name} produced invalid spec: {message}")
+
+
+def diff_specs(before: ArchitectureSpec, after: dict[str, Any]) -> str:
+    """Return a human-readable diff of two specs (before as spec, after as dict).
+
+    Shows only the changed fields to help debug mutation issues.
+    """
+    before_dict = before.model_dump(mode="python")
+    changes: list[str] = []
+
+    def _diff(path: str, old: Any, new: Any) -> None:
+        if isinstance(old, dict) and isinstance(new, dict):
+            all_keys = set(old.keys()) | set(new.keys())
+            for key in sorted(all_keys):
+                _diff(f"{path}.{key}" if path else key, old.get(key), new.get(key))
+        elif isinstance(old, list) and isinstance(new, list):
+            if len(old) != len(new):
+                changes.append(f"{path}: list length {len(old)} -> {len(new)}")
+            for i, (o, n) in enumerate(zip(old, new, strict=False)):
+                _diff(f"{path}[{i}]", o, n)
+            # Show added items
+            for i in range(len(old), len(new)):
+                changes.append(f"{path}[{i}]: (added) {new[i]}")
+        elif old != new:
+            old_str = str(old)[:50] if old is not None else "None"
+            new_str = str(new)[:50] if new is not None else "None"
+            changes.append(f"{path}: {old_str} -> {new_str}")
+
+    _diff("", before_dict, after)
+    return "\n".join(changes[:20]) if changes else "(no changes detected)"
+
+
+def validate_mutation_result(
+    mutation_name: str, before: ArchitectureSpec, after_dict: dict[str, Any]
+) -> ArchitectureSpec:
+    """Validate a mutated spec and raise MutationError with helpful info if invalid."""
+    try:
+        return ArchitectureSpec(**after_dict)
+    except ValidationError as e:
+        diff = diff_specs(before, after_dict)
+        # Extract the most useful error message from Pydantic
+        errors = e.errors()
+        if errors:
+            first_error = errors[0]
+            loc = ".".join(str(x) for x in first_error.get("loc", []))
+            msg = first_error.get("msg", str(e))
+            error_msg = f"At {loc}: {msg}" if loc else msg
+        else:
+            error_msg = str(e)
+        raise MutationError(mutation_name, error_msg, diff) from e
 
 
 def clone_spec(spec: ArchitectureSpec) -> ArchitectureSpec:
@@ -146,6 +207,77 @@ def make_gqa(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
 def toggle_precision(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     child = clone_spec(spec)
     child.train.bf16 = not child.train.bf16
+    return child
+
+
+def toggle_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    name = str(getattr(child.train.optimizer, "name", "adamw") or "adamw").lower()
+    child.train.optimizer.name = "lion" if name == "adamw" else "adamw"
+    # Reset optimizer-specific moment knobs; keep lr/wd overrides if already set.
+    child.train.optimizer.betas = None
+    child.train.optimizer.eps = None
+    return child
+
+
+def tune_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Jitter optimizer hyperparameters to explore training dynamics."""
+    child = clone_spec(spec)
+    opt = child.train.optimizer
+    name = str(getattr(opt, "name", "adamw") or "adamw").lower()
+
+    base_lr = float(opt.lr if opt.lr is not None else child.train.lr)
+    if rng.random() < 0.2:
+        opt.lr = None
+    else:
+        factor = float(rng.choice([0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0]))
+        opt.lr = float(max(1e-6, min(base_lr * factor, 5e-3)))
+
+    base_wd = float(opt.weight_decay if opt.weight_decay is not None else child.train.weight_decay)
+    if rng.random() < 0.2:
+        opt.weight_decay = None
+    else:
+        if rng.random() < 0.1:
+            opt.weight_decay = 0.0
+        else:
+            factor = float(rng.choice([0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]))
+            opt.weight_decay = float(max(0.0, min(base_wd * factor, 0.2)))
+
+    if name == "adamw":
+        opt.betas = rng.choice(
+            [
+                None,
+                (0.9, 0.95),
+                (0.9, 0.98),
+                (0.9, 0.99),
+                (0.9, 0.999),
+                (0.95, 0.999),
+            ]
+        )
+        opt.eps = rng.choice([None, 1e-8, 1e-6, 1e-5])
+    else:
+        opt.betas = rng.choice([None, (0.9, 0.99), (0.9, 0.98), (0.95, 0.98)])
+        opt.eps = None
+
+    return child
+
+
+def tune_warmup(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    current = int(getattr(child.train, "warmup", 0) or 0)
+    options = [0, 5, 10, 20, 40, 80, 160, 320]
+    choices = [v for v in options if v != current]
+    child.train.warmup = int(rng.choice(choices or [current]))
+    return child
+
+
+def tune_clip(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    choices = [0.5, 0.8, 1.0, 1.5, 2.0, 4.0]
+    current = float(getattr(child.train, "clip", 1.0) or 1.0)
+    # Avoid a no-op when possible.
+    options = [v for v in choices if abs(v - current) > 1e-9]
+    child.train.clip = float(rng.choice(options or [current]))
     return child
 
 
@@ -1119,6 +1251,10 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_router": tune_router,
     "make_gqa": make_gqa,
     "toggle_precision": toggle_precision,
+    "toggle_optimizer": toggle_optimizer,
+    "tune_optimizer": tune_optimizer,
+    "tune_warmup": tune_warmup,
+    "tune_clip": tune_clip,
     "insert_retro_module": insert_retro_module,
     "insert_custom_module": insert_custom_module,
     "insert_graph_module": insert_graph_module,
@@ -1165,8 +1301,24 @@ def mutate(
     rng: random.Random | None = None,
     weights: dict[str, float] | None = None,
     steps: int = 1,
+    validate: bool = True,
 ) -> tuple[str, ArchitectureSpec]:
-    """Apply one or more registered mutations. If weights provided, sample by weight."""
+    """Apply one or more registered mutations. If weights provided, sample by weight.
+
+    Args:
+        spec: The architecture specification to mutate.
+        rng: Random number generator for reproducibility.
+        weights: Optional mutation weights for weighted sampling.
+        steps: Number of mutations to chain.
+        validate: If True, validate the spec after each mutation and raise
+            MutationError with a diff if validation fails.
+
+    Returns:
+        A tuple of (mutation_label, mutated_spec).
+
+    Raises:
+        MutationError: If validate=True and a mutation produces an invalid spec.
+    """
     rng = rng or random.Random()  # noqa: S311  # nosec B311 - deterministic enough for search
     names = list(REGISTRY)
 
@@ -1183,12 +1335,27 @@ def mutate(
     current = spec
     for _ in range(max(1, steps)):
         name = _pick()
+        before = current
         result = REGISTRY[name](current, rng)
         if isinstance(result, tuple) and len(result) == 2:
-            label, current = result
+            label, mutated = result
             applied.append(str(label))
         else:
-            current = result
+            mutated = result
+            label = name
             applied.append(name)
+
+        # Validate the mutated spec if requested
+        if validate:
+            try:
+                # Re-validate by round-tripping through dict
+                mutated_dict = mutated.model_dump(mode="python")
+                current = validate_mutation_result(label, before, mutated_dict)
+            except MutationError:
+                # Re-raise with full context
+                raise
+        else:
+            current = mutated
+
     label = "+".join(applied) if len(applied) > 1 else applied[0]
     return label, current
