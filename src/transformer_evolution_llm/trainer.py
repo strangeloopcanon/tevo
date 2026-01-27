@@ -24,9 +24,7 @@ from .morphology import match_experts_to_parent, sort_moe_experts
 from .optimizers import build_optimizer
 
 
-def compute_speedrun_auc(
-    thresholds: list[float], tokens_to_threshold: list[float | None]
-) -> float:
+def compute_speedrun_auc(thresholds: list[float], tokens_to_threshold: list[float | None]) -> float:
     """Compute area under the tokens-to-threshold curve.
 
     Uses trapezoidal integration over thresholds where we reached the target.
@@ -42,7 +40,7 @@ def compute_speedrun_auc(
     # Filter to thresholds we actually reached
     valid_pairs = [
         (t, tok)
-        for t, tok in zip(thresholds, tokens_to_threshold)
+        for t, tok in zip(thresholds, tokens_to_threshold, strict=False)
         if tok is not None and math.isfinite(tok)
     ]
 
@@ -99,7 +97,9 @@ def fit_learning_curve(
 
     # Filter out invalid values
     valid_pairs = [
-        (s, l) for s, l in zip(steps, losses) if s > 0 and math.isfinite(l) and l > 0
+        (step, loss)
+        for step, loss in zip(steps, losses, strict=False)
+        if step > 0 and math.isfinite(loss) and loss > 0
     ]
     if len(valid_pairs) < 3:
         result["fit_error"] = 1.0
@@ -115,17 +115,17 @@ def fit_learning_curve(
         c_est = min(losses_arr) * 0.9  # Slightly below minimum
 
         # Shift losses
-        shifted = [max(l - c_est, 1e-9) for l in losses_arr]
+        shifted = [max(loss - c_est, 1e-9) for loss in losses_arr]
 
         # Log-transform
         log_t = [math.log(s) for s in steps_arr]
-        log_l = [math.log(l) for l in shifted]
+        log_loss = [math.log(loss) for loss in shifted]
 
         # Linear regression: log_l = log_a - b * log_t
         n = len(log_t)
         sum_x = sum(log_t)
-        sum_y = sum(log_l)
-        sum_xy = sum(x * y for x, y in zip(log_t, log_l))
+        sum_y = sum(log_loss)
+        sum_xy = sum(x * y for x, y in zip(log_t, log_loss, strict=False))
         sum_x2 = sum(x * x for x in log_t)
 
         denom = n * sum_x2 - sum_x * sum_x
@@ -140,9 +140,9 @@ def fit_learning_curve(
 
         # Compute R-squared
         mean_y = sum_y / n
-        ss_tot = sum((y - mean_y) ** 2 for y in log_l)
+        ss_tot = sum((y - mean_y) ** 2 for y in log_loss)
         predicted = [log_a - b * x for x in log_t]
-        ss_res = sum((y - p) ** 2 for y, p in zip(log_l, predicted))
+        ss_res = sum((y - p) ** 2 for y, p in zip(log_loss, predicted, strict=False))
         r_squared = 1.0 - (ss_res / max(ss_tot, 1e-12)) if ss_tot > 0 else 0.0
 
         result["learning_curve_a"] = float(a)
@@ -365,13 +365,14 @@ class FullWeightTrainer:
                 speedrun_target_ppl = None
         if speedrun_target_loss is None and speedrun_target_ppl is not None:
             speedrun_target_loss = math.log(speedrun_target_ppl)
-        speedrun_enabled = speedrun_interval > 0 and speedrun_target_loss is not None
+        speedrun_enabled = speedrun_interval > 0
         speedrun_eval_failed = False
         speedrun_eval_module: DataModule | None = None
         speedrun_eval_tokens = 0
         speedrun_error = 0.0
         speedrun_reached = False
         speedrun_best_loss = float("inf")
+        speedrun_eval_points: list[tuple[float, float]] = []
         speedrun_steps_to_target = 0.0
         speedrun_tokens_to_target = 0.0
         speedrun_time_to_target = 0.0
@@ -390,13 +391,11 @@ class FullWeightTrainer:
             multi_thresholds = sorted(
                 [float(t) for t in multi_thresholds_raw if t > 0], reverse=True
             )
-        multi_threshold_reached: dict[float, bool] = {t: False for t in multi_thresholds}
-        multi_threshold_tokens: dict[float, float | None] = {t: None for t in multi_thresholds}
-        multi_threshold_flops: dict[float, float | None] = {t: None for t in multi_thresholds}
+        multi_threshold_reached: dict[float, bool] = dict.fromkeys(multi_thresholds, False)
+        multi_threshold_tokens: dict[float, float | None] = dict.fromkeys(multi_thresholds, None)
+        multi_threshold_flops: dict[float, float | None] = dict.fromkeys(multi_thresholds, None)
         # Track eval history for interpolation
-        eval_history: list[tuple[float, float, float, float]] = (
-            []
-        )  # (tokens, flops, time, ppl)
+        eval_history: list[tuple[float, float, float, float]] = []  # (tokens, flops, time, ppl)
         flops_per_token_est = estimate_flops_per_token(
             spec,
             recurrence_steps=self._recurrence_schedule(spec, self.steps, total_steps),
@@ -519,7 +518,6 @@ class FullWeightTrainer:
                 )
             if (
                 speedrun_enabled
-                and not speedrun_reached
                 and not speedrun_eval_failed
                 and (step_idx + 1) % speedrun_interval == 0
             ):
@@ -548,9 +546,16 @@ class FullWeightTrainer:
                     loss_val = 1e9
                 if loss_val < speedrun_best_loss:
                     speedrun_best_loss = loss_val
+                if math.isfinite(float(loss_val)):
+                    speedrun_eval_points.append((float(tokens_seen), float(loss_val)))
                 if self.speedrun_callback is not None and math.isfinite(float(loss_val)):
                     self.speedrun_callback(int(step_idx + 1), float(loss_val), int(tokens_seen))
-                if speedrun_target_loss is not None and loss_val <= speedrun_target_loss:
+                if (
+                    not speedrun_reached
+                    and speedrun_target_loss is not None
+                    and math.isfinite(float(loss_val))
+                    and loss_val <= speedrun_target_loss
+                ):
                     elapsed = max(time.perf_counter() - start_time, 1e-6)
                     eval_step = int(step_idx + 1)
                     eval_tokens = float(tokens_seen)
@@ -664,6 +669,7 @@ class FullWeightTrainer:
             ppl_eval = ppl_train
             ppl_eval_error = 1.0
         perplexity = ppl_eval
+        speedrun_end_eval_loss = math.log(max(float(perplexity), 1e-12))
         long_recall_proxy = _estimate_long_recall(spec)
         passkey_metrics = self._passkey_probe(model, spec)
         long_recall = float(passkey_metrics.get("passkey_acc", long_recall_proxy))
@@ -769,7 +775,9 @@ class FullWeightTrainer:
         loss_variance = 0.0
         if len(recent_losses) >= 3:
             mean_loss = sum(recent_losses) / len(recent_losses)
-            loss_variance = sum((l - mean_loss) ** 2 for l in recent_losses) / len(recent_losses)
+            loss_variance = sum((loss - mean_loss) ** 2 for loss in recent_losses) / len(
+                recent_losses
+            )
 
         grad_norm_mean = sum(grad_norms) / len(grad_norms) if grad_norms else 0.0
         grad_norm_std = 0.0
@@ -797,17 +805,84 @@ class FullWeightTrainer:
             if first_avg > 0:
                 improvement_rate = max(0.0, (first_avg - last_avg) / first_avg)
 
-        metrics.update({
-            "loss_variance": float(loss_variance),
-            "grad_norm_mean": float(grad_norm_mean),
-            "grad_norm_std": float(grad_norm_std),
-            "grad_norm_spikes": float(grad_norm_spikes),
-            "instability_score": float(instability_score),
-            "improvement_rate": float(improvement_rate),
-        })
+        metrics.update(
+            {
+                "loss_variance": float(loss_variance),
+                "grad_norm_mean": float(grad_norm_mean),
+                "grad_norm_std": float(grad_norm_std),
+                "grad_norm_spikes": float(grad_norm_spikes),
+                "instability_score": float(instability_score),
+                "improvement_rate": float(improvement_rate),
+            }
+        )
         if speedrun_enabled:
             missing_penalty = 1e9
             missing_penalty_flops = missing_penalty * max(float(flops_per_token_est), 1.0)
+            missing_penalty_time = missing_penalty
+            best_eval_loss = (
+                float(speedrun_best_loss) if math.isfinite(speedrun_best_loss) else missing_penalty
+            )
+            target_loss = float(speedrun_target_loss) if speedrun_target_loss is not None else None
+            if target_loss is not None and math.isfinite(best_eval_loss):
+                loss_gap = max(0.0, best_eval_loss - target_loss)
+            else:
+                loss_gap = missing_penalty
+            gap_cap = 2.0
+            gap_beta = 4.0
+
+            tokens_budget = getattr(batch_iter, "max_tokens", None)
+            if tokens_budget is None:
+                tokens_budget = getattr(spec.train, "max_tokens", None)
+            if tokens_budget is None:
+                tokens_budget = tokens_seen
+            tokens_budget = max(float(tokens_budget), float(tokens_seen), 1.0)
+
+            flops_per_token_run = float(flops_seen) / max(float(tokens_seen), 1.0)
+            if not math.isfinite(flops_per_token_run) or flops_per_token_run <= 0.0:
+                flops_per_token_run = float(flops_per_token_est)
+            flops_budget = tokens_budget * max(float(flops_per_token_run), 1.0)
+            time_budget = tokens_budget / max(float(throughput), 1e-6)
+
+            speedrun_loss_auc = missing_penalty
+            if speedrun_eval_points and math.isfinite(tokens_budget) and tokens_budget > 0.0:
+                token_cap = float(tokens_budget)
+                cleaned = [
+                    (max(0.0, min(float(t), token_cap)), float(loss))
+                    for t, loss in speedrun_eval_points
+                    if math.isfinite(float(loss))
+                ]
+                cleaned.sort(key=lambda pair: pair[0])
+                points: list[tuple[float, float]] = []
+                for t, loss in cleaned:
+                    if points and abs(t - points[-1][0]) < 1e-9:
+                        points[-1] = (t, loss)
+                    else:
+                        points.append((t, loss))
+                if points:
+                    if points[0][0] > 0.0:
+                        points = [(0.0, points[0][1]), *points]
+                    if points[-1][0] < token_cap:
+                        points.append((token_cap, points[-1][1]))
+                    auc = 0.0
+                    prev_t, prev_l = points[0]
+                    for t, loss in points[1:]:
+                        dt = max(0.0, float(t) - float(prev_t))
+                        auc += 0.5 * (float(prev_l) + float(loss)) * dt
+                        prev_t, prev_l = t, loss
+                        if prev_t >= token_cap:
+                            break
+                    speedrun_loss_auc = float(auc) / max(token_cap, 1.0)
+
+            if speedrun_reached:
+                speedrun_score = float(speedrun_flops_to_target)
+                speedrun_time_score = float(speedrun_time_to_target)
+            elif math.isfinite(float(speedrun_best_loss)):
+                penalty = math.exp(gap_beta * min(float(loss_gap), gap_cap))
+                speedrun_score = max(flops_budget, 1.0) * penalty
+                speedrun_time_score = max(time_budget, 1.0) * penalty
+            else:
+                speedrun_score = missing_penalty_flops
+                speedrun_time_score = missing_penalty_time
             metrics.update(
                 {
                     "speedrun_reached": 1.0 if speedrun_reached else 0.0,
@@ -823,9 +898,12 @@ class FullWeightTrainer:
                     "speedrun_flops_to_target": (
                         speedrun_flops_to_target if speedrun_reached else missing_penalty_flops
                     ),
-                    "speedrun_best_eval_loss": (
-                        speedrun_best_loss if math.isfinite(speedrun_best_loss) else missing_penalty
-                    ),
+                    "speedrun_best_eval_loss": best_eval_loss,
+                    "speedrun_end_eval_loss": float(speedrun_end_eval_loss),
+                    "speedrun_loss_auc": float(speedrun_loss_auc),
+                    "speedrun_loss_gap": float(loss_gap),
+                    "speedrun_score": float(speedrun_score),
+                    "speedrun_time_score": float(speedrun_time_score),
                     "speedrun_error": speedrun_error,
                 }
             )
@@ -835,9 +913,7 @@ class FullWeightTrainer:
                 tokens_list = [
                     multi_threshold_tokens.get(t) for t in sorted(multi_thresholds, reverse=True)
                 ]
-                auc = compute_speedrun_auc(
-                    sorted(multi_thresholds, reverse=True), tokens_list
-                )
+                auc = compute_speedrun_auc(sorted(multi_thresholds, reverse=True), tokens_list)
                 metrics["speedrun_auc"] = auc if math.isfinite(auc) else missing_penalty
 
                 # Add per-threshold metrics
@@ -875,13 +951,15 @@ class FullWeightTrainer:
                 metrics.update(downstream_metrics)
                 del probe_model
             except Exception:
-                metrics.update({
-                    "code_probe_acc": 0.0,
-                    "math_probe_acc": 0.0,
-                    "recall_probe_acc": 0.0,
-                    "downstream_avg_acc": 0.0,
-                    "downstream_error": 1.0,
-                })
+                metrics.update(
+                    {
+                        "code_probe_acc": 0.0,
+                        "math_probe_acc": 0.0,
+                        "recall_probe_acc": 0.0,
+                        "downstream_avg_acc": 0.0,
+                        "downstream_error": 1.0,
+                    }
+                )
         if spec.model.recurrences:
             metrics.update(self._recurrence_evaluations(model, spec, batch_iter, criterion))
         result = (metrics, checkpoint_path)
@@ -1218,12 +1296,10 @@ def run_multi_needle_probes(
 
                 for _ in range(eval_batches):
                     ids = torch.randint(
-                        0, noise_vocab, (batch_size, seq_len),
-                        generator=generator, dtype=torch.long
+                        0, noise_vocab, (batch_size, seq_len), generator=generator, dtype=torch.long
                     )
                     target = torch.randint(
-                        0, noise_vocab, (batch_size,),
-                        generator=generator, dtype=torch.long
+                        0, noise_vocab, (batch_size,), generator=generator, dtype=torch.long
                     )
 
                     if probe_type == "first":
@@ -1326,7 +1402,7 @@ def run_downstream_probes(
                 ids[:, -1] = close_token
 
                 input_ids = ids[:, :-1].to(device)
-                target = close_token
+                target = int(close_token)
 
                 logits = model(input_ids)
                 if logits.size(1) > 0:
@@ -1346,9 +1422,9 @@ def run_downstream_probes(
 
         with torch.no_grad():
             for _ in range(n_examples):
-                a = torch.randint(1, min(50, vocab // 4), (1,), generator=generator).item()
-                b = torch.randint(1, min(50, vocab // 4), (1,), generator=generator).item()
-                answer = (a + b) % max(1, vocab // 2)
+                a = int(torch.randint(1, min(50, vocab // 4), (1,), generator=generator).item())
+                b = int(torch.randint(1, min(50, vocab // 4), (1,), generator=generator).item())
+                answer = int((a + b) % max(1, vocab // 2))
 
                 # Create: [noise] A + B = [answer]
                 ids = torch.randint(0, min(100, vocab), (batch_size, seq_len), dtype=torch.long)
@@ -1359,7 +1435,7 @@ def run_downstream_probes(
                 ids[:, -1] = answer
 
                 input_ids = ids[:, :-1].to(device)
-                target = answer
+                target = int(answer)
 
                 logits = model(input_ids)
                 if logits.size(1) > 0:
@@ -1379,7 +1455,7 @@ def run_downstream_probes(
 
         with torch.no_grad():
             for _ in range(n_examples):
-                value = torch.randint(0, min(100, vocab), (1,), generator=generator).item()
+                value = int(torch.randint(0, min(100, vocab), (1,), generator=generator).item())
 
                 # Create: [marker] [value] [noise] [query] -> [value]
                 ids = torch.randint(0, min(100, vocab), (batch_size, seq_len), dtype=torch.long)
@@ -1389,7 +1465,7 @@ def run_downstream_probes(
                 ids[:, -1] = value
 
                 input_ids = ids[:, :-1].to(device)
-                target = value
+                target = int(value)
 
                 logits = model(input_ids)
                 if logits.size(1) > 0:
@@ -1401,8 +1477,11 @@ def run_downstream_probes(
         results["recall_probe_acc"] = float(recall_correct) / max(1, recall_total)
 
         # Compute aggregate
-        accs = [results.get("code_probe_acc", 0), results.get("math_probe_acc", 0),
-                results.get("recall_probe_acc", 0)]
+        accs = [
+            results.get("code_probe_acc", 0),
+            results.get("math_probe_acc", 0),
+            results.get("recall_probe_acc", 0),
+        ]
         results["downstream_avg_acc"] = sum(accs) / len(accs)
 
     except Exception:

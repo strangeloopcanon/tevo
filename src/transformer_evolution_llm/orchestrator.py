@@ -400,9 +400,13 @@ class EvolutionRunner:
             if not isinstance(base_steps, int):
                 base_steps = 100
             # Rung 1
-            self.trainer.steps = max(1, int(base_steps * self._rung1_ratio))
+            rung1_steps = (
+                base_steps if rung2_extra <= 0 else max(1, int(base_steps * self._rung1_ratio))
+            )
+            self.trainer.steps = rung1_steps
             if rung1_tokens <= 0:
                 candidate.status = "failed"
+                self.trainer.steps = base_steps
                 return
             batches = self.data_module.batches(max_tokens=rung1_tokens)
             seed_state = candidate.seed_state_path or candidate.parent_checkpoint
@@ -425,6 +429,7 @@ class EvolutionRunner:
                 candidate.checkpoint = None
                 self._cleanup_seed_state(candidate)
                 self._remove_candidate_artifacts(candidate)
+                self.trainer.steps = base_steps
                 return
             candidate.metrics.update(metrics1)
             candidate.checkpoint = checkpoint
@@ -433,6 +438,7 @@ class EvolutionRunner:
                 self._cleanup_seed_state(candidate)
                 self._remove_candidate_artifacts(candidate)
                 candidate.checkpoint = None
+                self.trainer.steps = base_steps
                 return
             # Early stop heuristic: clearly poor ppl
             ppl1 = float(candidate.metrics.get("ppl_code", 1e9))
@@ -1004,8 +1010,8 @@ class EvolutionRunner:
         self._improvement_count += 1
         baseline_eta = 0.05  # Slow adaptation for baseline
         self._improvement_baseline = (
-            (1.0 - baseline_eta) * self._improvement_baseline + baseline_eta * abs(delta)
-        )
+            1.0 - baseline_eta
+        ) * self._improvement_baseline + baseline_eta * abs(delta)
         baseline = max(self._improvement_baseline, 1e-6)
 
         # Compute magnitude-weighted reward:
@@ -1013,6 +1019,7 @@ class EvolutionRunner:
         # - Negative delta: reward = 0.5 + 0.5 * tanh(delta / baseline)
         # This gives a smooth reward in [0, 1] that scales with improvement magnitude
         import math
+
         normalized_delta = delta / baseline
         reward = 0.5 + 0.5 * math.tanh(normalized_delta)
 
@@ -1175,9 +1182,7 @@ class EvolutionRunner:
         self._parents[child.ident] = [parent.ident]
         return child
 
-    def _context_aware_mutation_weights(
-        self, parent: Candidate
-    ) -> dict[str, float] | None:
+    def _context_aware_mutation_weights(self, parent: Candidate) -> dict[str, float] | None:
         """Compute context-aware mutation weights based on candidate architecture state.
 
         Analyzes the parent's structure and metrics to prioritize mutations that

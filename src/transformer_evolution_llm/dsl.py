@@ -820,10 +820,6 @@ class TrainSchedule(BaseModel):
     @model_validator(mode="after")
     def _validate_speedrun(self) -> TrainSchedule:
         if self.speedrun_eval_interval > 0:
-            if self.speedrun_target_loss is None and self.speedrun_target_ppl is None:
-                raise ValueError(
-                    "speedrun_eval_interval requires speedrun_target_loss or speedrun_target_ppl"
-                )
             if self.speedrun_target_loss is not None and self.speedrun_target_ppl is not None:
                 raise ValueError("Provide only one of speedrun_target_loss or speedrun_target_ppl")
         return self
