@@ -8,6 +8,7 @@ back into the local repo.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -150,9 +151,29 @@ def run_live(
     if lineage:
         cmd.extend(["--lineage-out", str(lineage_path)])
 
-    subprocess.run(cmd, check=True)
-    RUNS_VOL.commit()
-    HF_VOL.commit()
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    try:
+        meta = {
+            "returncode": result.returncode,
+            "cmd": cmd,
+            "timestamp_unix_s": time.time(),
+        }
+        (run_root / "run_live.subprocess.json").write_text(json.dumps(meta, indent=2))
+        if result.stdout:
+            (run_root / "run_live.stdout.txt").write_text(result.stdout[-50_000:])
+        if result.stderr:
+            (run_root / "run_live.stderr.txt").write_text(result.stderr[-50_000:])
+        if result.returncode != 0:
+            (run_root / "run_live.error.txt").write_text(
+                f"subprocess failed (returncode={result.returncode})\n"
+            )
+    except Exception:
+        pass
+    try:
+        RUNS_VOL.commit()
+        HF_VOL.commit()
+    except Exception:
+        pass
     resolved_lineage = lineage_path if lineage else default_lineage_path
     return {
         "run_id": run_name,
@@ -160,6 +181,7 @@ def run_live(
         "state": f"{run_name}/frontier.state.json",
         "lineage": f"{run_name}/{resolved_lineage.name}",
         "manifest": f"{run_name}/frontier.manifest.json",
+        "returncode": str(result.returncode),
     }
 
 

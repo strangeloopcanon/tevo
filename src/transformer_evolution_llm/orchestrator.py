@@ -295,16 +295,50 @@ class EvolutionRunner:
             if self._init_checkpoint is not None:
                 base_candidate.seed_state_path = self._init_checkpoint
             self._parents[base_candidate.ident] = []
-            self._evaluate_candidate(base_candidate)
+            try:
+                self._evaluate_candidate(base_candidate)
+            except Exception as exc:
+                console.print(f"[red]Seed candidate {base_candidate.ident} crashed:[/] {exc}")
+                base_candidate.status = "failed"
+                base_candidate.checkpoint = None
+                try:
+                    self._cleanup_seed_state(base_candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Seed cleanup failed:[/] {cleanup_exc}")
+                try:
+                    self._remove_candidate_artifacts(base_candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Seed artifact cleanup failed:[/] {cleanup_exc}")
             if base_candidate.status == "completed":
                 self._update_archive(base_candidate)
                 survivors.append(base_candidate)
             self.pool.append(base_candidate)
             self._history.append(base_candidate)
         for _ in range(generations):
-            candidate = self._spawn_candidate()
+            try:
+                candidate = self._spawn_candidate()
+            except Exception as exc:
+                console.print(f"[red]Failed to spawn candidate:[/] {exc}")
+                continue
             console.print(f"[cyan]Evaluating[/] {candidate.ident}")
-            self._evaluate_candidate(candidate)
+            try:
+                self._evaluate_candidate(candidate)
+            except Exception as exc:
+                console.print(
+                    f"[red]Candidate {candidate.ident} crashed during evaluation:[/] {exc}"
+                )
+                if self._is_resource_error(exc):
+                    self._empty_device_cache()
+                candidate.status = "failed"
+                candidate.checkpoint = None
+                try:
+                    self._cleanup_seed_state(candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Candidate cleanup failed:[/] {cleanup_exc}")
+                try:
+                    self._remove_candidate_artifacts(candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Candidate artifact cleanup failed:[/] {cleanup_exc}")
             if candidate.status == "completed":
                 self._update_archive(candidate)
                 self._maybe_update_mutation_weights(candidate)
@@ -313,9 +347,18 @@ class EvolutionRunner:
                 survivors.append(candidate)
             self.pool.append(candidate)
             self._history.append(candidate)
-            self._trim_pool()
-            self._garbage_collect_checkpoints()
-        flush_template_learning()
+            try:
+                self._trim_pool()
+            except Exception as exc:
+                console.print(f"[red]Pool trim failed:[/] {exc}")
+            try:
+                self._garbage_collect_checkpoints()
+            except Exception as exc:
+                console.print(f"[red]Checkpoint GC failed:[/] {exc}")
+        try:
+            flush_template_learning()
+        except Exception as exc:
+            console.print(f"[red]Template learning flush failed:[/] {exc}")
         return survivors
 
     def _evaluate_candidate(self, candidate: Candidate) -> None:
