@@ -251,6 +251,14 @@ class EvolutionRunner:
     def _objective_metrics_ok(self, candidate: Candidate) -> bool:
         if float(candidate.metrics.get("nan_seen", 0.0) or 0.0) > 0.0:
             return False
+        stop_reason = candidate.metrics.get("stop_reason_code")
+        if stop_reason is not None:
+            try:
+                stop_code = float(stop_reason)
+            except (TypeError, ValueError):
+                return False
+            if stop_code in (1.0, 2.0):  # high_grad / low_entropy
+                return False
         for name in self.objective_dir:
             val = candidate.metrics.get(name)
             if val is None:

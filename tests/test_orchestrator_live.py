@@ -109,3 +109,35 @@ def test_live_runner_single_rung_uses_full_steps(monkeypatch, tiny_spec, tmp_pat
     runner.trainer.train = fake_train  # type: ignore[assignment]
     results = runner.run(generations=1)
     assert results
+
+
+def test_live_runner_rejects_low_entropy_candidates(monkeypatch, tiny_spec, tmp_path):
+    monkeypatch.setattr("transformer_evolution_llm.orchestrator.DataModule", DummyDataModule)
+    runner = EvolutionRunner(tiny_spec, tiny_spec.evolution, mode="live", seed=0)
+
+    def fake_train(candidate, spec, batch_iter, seed_state_path=None):
+        stop_code = 4.0 if candidate.ident.startswith("seed") else 2.0
+        ckpt = tmp_path / f"{candidate.ident}.pt"
+        ckpt.write_text("checkpoint")
+        return (
+            {
+                "ppl_code": 1.2,
+                "ppl_math": 1.3,
+                "throughput": 20.0,
+                "params": 10,
+                "ram": 0.001,
+                "long_recall": 0.2,
+                "stop_reason_code": stop_code,
+            },
+            ckpt,
+        )
+
+    trainer = DummyTrainer()
+    runner.trainer = trainer
+    runner.trainer.train = fake_train  # type: ignore[assignment]
+
+    results = runner.run(generations=1)
+    assert len(results) == 1, "expected only the seed to be completed"
+    assert all(
+        cand.metrics.get("stop_reason_code") != 2.0 for cand in runner.frontier.entries
+    ), "low-entropy candidates should not enter the frontier"
