@@ -44,8 +44,9 @@ train:
   seed: 0
   passkey_eval_steps: 0
   # "Anytime" speedrun probes: no fixed target; just measure the learning curve.
-  speedrun_eval_interval: 8
-  speedrun_eval_batches: 8
+  # Keep total eval compute roughly constant: fewer probes, more batches per probe.
+  speedrun_eval_interval: 16
+  speedrun_eval_batches: 16
   ppl_stop_threshold: null
   entropy_threshold: 0.5
   entropy_patience: 3
@@ -89,8 +90,15 @@ evolution:
   adaptive_mutation_min_weight: 0.05
   adaptive_mutation_max_weight: 5.0
   weight_inheritance: scratch
-  # Optimize the full learning curve (AUC), the end-of-budget loss, and speed.
+  composite_metrics:
+    # Couple quality and speed to avoid Pareto-admitting "fast-but-bad" candidates.
+    - name: efficiency_score
+      op: ratio
+      numerator: speedrun_loss_auc
+      denominator: throughput
+      epsilon: 1.0e-6
+  # Optimize the full learning curve (AUC) and the end-of-budget loss.
   objectives:
     speedrun_loss_auc: min
     speedrun_end_eval_loss: min
-    throughput: max
+    efficiency_score: min

@@ -259,6 +259,21 @@ class EvolutionRunner:
                 return False
             if stop_code in (1.0, 2.0):  # high_grad / low_entropy
                 return False
+        thresholds = getattr(self.cfg, "rung0_thresholds", {}) or {}
+        for key, limit in thresholds.items():
+            if not isinstance(key, str) or not key.startswith("max_"):
+                continue
+            metric_name = key[len("max_") :]
+            metric_val = candidate.metrics.get(metric_name)
+            if metric_val is None:
+                return False
+            try:
+                metric_f = float(metric_val)
+                limit_f = float(limit)
+            except (TypeError, ValueError):
+                return False
+            if metric_f > limit_f:
+                return False
         for name in self.objective_dir:
             val = candidate.metrics.get(name)
             if val is None:
@@ -416,6 +431,9 @@ class EvolutionRunner:
                 candidate.status = "failed"
                 self.trainer.steps = base_steps
                 return
+            seed_value = int(getattr(candidate.spec.train, "seed", 0) or 0)
+            if hasattr(self.data_module, "reset_rng"):
+                self.data_module.reset_rng(seed_value)
             batches = self.data_module.batches(max_tokens=rung1_tokens)
             seed_state = candidate.seed_state_path or candidate.parent_checkpoint
             if self.weight_inheritance == "scratch":
