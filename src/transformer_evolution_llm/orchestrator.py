@@ -502,6 +502,9 @@ class EvolutionRunner:
                 return
             candidate.metrics.update(metrics1)
             candidate.checkpoint = checkpoint
+            # Composite metrics may be part of the objective set (e.g.,
+            # efficiency_score). Compute them before objective gating.
+            self._apply_composite_metrics(candidate)
             if not self._objective_metrics_ok(candidate):
                 candidate.status = "failed"
                 self._cleanup_seed_state(candidate)
@@ -589,6 +592,7 @@ class EvolutionRunner:
                 return
             candidate.metrics.update(metrics2)
             candidate.checkpoint = checkpoint
+            self._apply_composite_metrics(candidate)
             if not self._objective_metrics_ok(candidate):
                 candidate.status = "failed"
                 self._cleanup_seed_state(candidate)
