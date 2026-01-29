@@ -151,7 +151,7 @@ def run_live(
     if lineage:
         cmd.extend(["--lineage-out", str(lineage_path)])
 
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    result = subprocess.run(cmd, check=False)
     try:
         meta = {
             "returncode": result.returncode,
@@ -159,10 +159,6 @@ def run_live(
             "timestamp_unix_s": time.time(),
         }
         (run_root / "run_live.subprocess.json").write_text(json.dumps(meta, indent=2))
-        if result.stdout:
-            (run_root / "run_live.stdout.txt").write_text(result.stdout[-50_000:])
-        if result.stderr:
-            (run_root / "run_live.stderr.txt").write_text(result.stderr[-50_000:])
         if result.returncode != 0:
             (run_root / "run_live.error.txt").write_text(
                 f"subprocess failed (returncode={result.returncode})\n"
