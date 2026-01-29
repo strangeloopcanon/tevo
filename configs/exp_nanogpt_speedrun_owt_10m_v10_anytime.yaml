@@ -75,6 +75,10 @@ evolution:
     max_kv_bytes_per_token: 45000
     min_throughput_proxy: 1.0
     min_layers: 12
+    # Prevent Pareto-admitting models that are meaningfully worse than baseline
+    # (e.g. very high loss but high throughput).
+    max_speedrun_loss_auc: 8.0
+    max_speedrun_end_eval_loss: 8.0
   # Fair benchmark budget: do not scale tokens by depth/MoE heuristics.
   fixed_token_budget: true
   rung1_tokens: 900000

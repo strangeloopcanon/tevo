@@ -74,11 +74,48 @@ def test_spawn_candidate_crossover(monkeypatch, tiny_spec, tmp_path):
     runner.trainer = DummyTrainer()
     state_path = tmp_path / "parent.pt"
     torch.save(EvolutionModel(tiny_spec.model).state_dict(), state_path)
-    parent_candidate = Candidate(ident="parent-1", spec=tiny_spec, checkpoint=state_path)
-    parent_candidate_2 = Candidate(ident="parent-2", spec=tiny_spec, checkpoint=state_path)
+    spec_a = tiny_spec.model_copy(deep=True)
+    spec_b = tiny_spec.model_copy(deep=True)
+    # Ensure splice_blocks can create genuinely novel children.
+    spec_a.model.blocks = [spec_a.model.blocks[0], spec_a.model.blocks[0]]
+    spec_b.model.blocks = [spec_b.model.blocks[0], spec_b.model.blocks[0]]
+    spec_a.model.blocks[0].attn.kind = "GQA"
+    spec_a.model.blocks[1].attn.kind = "GQA"
+    spec_b.model.blocks[0].attn.kind = "MHA"
+    spec_b.model.blocks[1].attn.kind = "MHA"
+    parent_candidate = Candidate(ident="parent-1", spec=spec_a, checkpoint=state_path)
+    parent_candidate_2 = Candidate(ident="parent-2", spec=spec_b, checkpoint=state_path)
     runner.pool = [parent_candidate, parent_candidate_2]
     child = runner._spawn_candidate()
     assert child.seed_state_path is not None
+
+
+def test_spawn_candidate_resamples_noop_mutations(monkeypatch, tiny_spec):
+    runner = EvolutionRunner(tiny_spec, tiny_spec.evolution, mode="simulate", seed=0)
+    parent_candidate = Candidate(
+        ident="parent-1",
+        spec=tiny_spec.model_copy(deep=True),
+        status="completed",
+        metrics={"ppl_code": 1.0, "throughput": 1.0},
+    )
+    runner.pool = [parent_candidate]
+
+    calls = {"n": 0}
+
+    def fake_mutate(spec, rng, weights, steps=1, validate=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First attempt is a no-op clone.
+            return ("noop", spec.model_copy(deep=True))
+        # Second attempt changes the spec.
+        updated = spec.model_copy(deep=True)
+        updated.train.lr = float(updated.train.lr) * 1.01
+        return ("lr_jitter", updated)
+
+    monkeypatch.setattr("transformer_evolution_llm.orchestrator.mutate", fake_mutate)
+    child = runner._spawn_candidate()
+    assert calls["n"] >= 2
+    assert float(child.spec.train.lr) != float(parent_candidate.spec.train.lr)
 
 
 def test_live_runner_single_rung_uses_full_steps(monkeypatch, tiny_spec, tmp_path):

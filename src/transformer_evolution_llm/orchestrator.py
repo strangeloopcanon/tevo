@@ -6,6 +6,8 @@ import math
 import random
 import uuid
 from collections import Counter
+from hashlib import sha256
+from json import dumps as json_dumps
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,12 @@ def default_objectives() -> ObjectiveDir:
 
 class EvolutionRunner:
     """Coordinates mutation, evaluation, and frontier tracking."""
+
+    @staticmethod
+    def _spec_fingerprint(spec: ArchitectureSpec) -> str:
+        payload = spec.model_dump(mode="json")
+        blob = json_dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return sha256(blob.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _empty_device_cache() -> None:
@@ -180,6 +188,7 @@ class EvolutionRunner:
         self._composite_metrics = self._merge_composites(
             configured_composites, self._default_composites()
         )
+        self._seen_spec_fingerprints: set[str] = set()
         self.pool: list[Candidate] = []
         self.counter = 0
         self.checkpoint_dir = Path("runs/checkpoints")
@@ -229,6 +238,14 @@ class EvolutionRunner:
             )
         else:
             configure_template_learning(enabled=False)
+
+    def _remember_spec(self, spec: ArchitectureSpec) -> None:
+        self._seen_spec_fingerprints.add(self._spec_fingerprint(spec))
+
+    def _rebuild_seen_specs(self) -> None:
+        self._seen_spec_fingerprints = {
+            self._spec_fingerprint(c.spec) for c in self.pool + self._history
+        }
 
     def _cleanup_seed_state(self, candidate: Candidate) -> None:
         """Remove intermediate crossover seed checkpoints when no longer needed."""
@@ -314,6 +331,7 @@ class EvolutionRunner:
                 survivors.append(base_candidate)
             self.pool.append(base_candidate)
             self._history.append(base_candidate)
+            self._remember_spec(base_candidate.spec)
         for _ in range(generations):
             try:
                 candidate = self._spawn_candidate()
@@ -347,6 +365,7 @@ class EvolutionRunner:
                 survivors.append(candidate)
             self.pool.append(candidate)
             self._history.append(candidate)
+            self._remember_spec(candidate.spec)
             try:
                 self._trim_pool()
             except Exception as exc:
@@ -1207,44 +1226,98 @@ class EvolutionRunner:
                 continue
 
     def _spawn_candidate(self) -> Candidate:
+        if (self.pool or self._history) and not self._seen_spec_fingerprints:
+            # Helpful for tests / manual runner construction.
+            self._rebuild_seen_specs()
+        seen = self._seen_spec_fingerprints
+        max_attempts = 32
+
         if (
             self.mode == "live"
             and len(self.pool) >= 2
             and self.rng.random() < self.cfg.crossover_prob
         ):
-            parent_a, parent_b = self.rng.sample(self.pool, 2)
-            blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
-            spec_data = parent_a.spec.model_dump(mode="python")
-            spec_data["model"]["blocks"] = [block.model_dump(mode="python") for block in blocks]
-            spec = ArchitectureSpec(**spec_data)
-            child_id = self._new_id("xover")
-            seed_path: Path | None = None
-            if self.weight_inheritance == "parent":
-                seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
-                merge_checkpoints(
-                    child_spec=spec,
-                    cut_a=cut_a,
-                    cut_b=cut_b,
-                    parent_a_blocks=len(parent_a.spec.model.blocks),
-                    parent_b_blocks=len(parent_b.spec.model.blocks),
-                    parent_a_ckpt=parent_a.checkpoint,
-                    parent_b_ckpt=parent_b.checkpoint,
-                    out_path=seed_path,
+            for _ in range(max_attempts):
+                parent_a, parent_b = self.rng.sample(self.pool, 2)
+                spec: ArchitectureSpec | None = None
+                try:
+                    blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
+                    spec_data = parent_a.spec.model_dump(mode="python")
+                    spec_data["model"]["blocks"] = [
+                        block.model_dump(mode="python") for block in blocks
+                    ]
+                    spec = ArchitectureSpec(**spec_data)
+                except Exception:
+                    spec = None
+                if spec is None:
+                    continue
+                if self._spec_fingerprint(spec) in seen:
+                    continue
+                child_id = self._new_id("xover")
+                seed_path: Path | None = None
+                if self.weight_inheritance == "parent":
+                    seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
+                    merge_checkpoints(
+                        child_spec=spec,
+                        cut_a=cut_a,
+                        cut_b=cut_b,
+                        parent_a_blocks=len(parent_a.spec.model.blocks),
+                        parent_b_blocks=len(parent_b.spec.model.blocks),
+                        parent_a_ckpt=parent_a.checkpoint,
+                        parent_b_ckpt=parent_b.checkpoint,
+                        out_path=seed_path,
+                    )
+                self._parents[child_id] = [parent_a.ident, parent_b.ident]
+                return Candidate(
+                    ident=child_id,
+                    spec=spec,
+                    parent=None,
+                    seed_state_path=seed_path,
                 )
-            self._parents[child_id] = [parent_a.ident, parent_b.ident]
-            return Candidate(
-                ident=child_id,
-                spec=spec,
-                parent=None,
-                seed_state_path=seed_path,
+            console.print(
+                "[yellow]Warning:[/] crossover only produced already-seen specs; "
+                "falling back to mutation."
             )
         parent = self._select_parent()
         # Get context-aware mutation weights if enabled
         mutation_weights = self._context_aware_mutation_weights(parent)
         if mutation_weights is None:
             mutation_weights = self.mutation_weights
-        name, spec = mutate(
-            parent.spec, self.rng, mutation_weights, steps=getattr(self, "mutation_steps", 1)
+        parent_fp = self._spec_fingerprint(parent.spec)
+        last: tuple[str, ArchitectureSpec] | None = None
+        for _ in range(max_attempts):
+            result: tuple[str, ArchitectureSpec] | None = None
+            try:
+                result = mutate(
+                    parent.spec,
+                    self.rng,
+                    mutation_weights,
+                    steps=getattr(self, "mutation_steps", 1),
+                )
+            except Exception:
+                result = None
+            if result is None:
+                continue
+            name, spec = result
+            last = (name, spec)
+            spec_fp = self._spec_fingerprint(spec)
+            if spec_fp == parent_fp or spec_fp in seen:
+                continue
+            child = Candidate(
+                ident=self._new_id(name),
+                spec=spec,
+                parent=parent.ident,
+                parent_checkpoint=parent.checkpoint,
+            )
+            self._parents[child.ident] = [parent.ident]
+            return child
+        if last is None:
+            msg = "mutation produced no candidates"
+            raise RuntimeError(msg)
+        name, spec = last
+        console.print(
+            "[yellow]Warning:[/] mutation only produced already-seen/no-op specs; "
+            f"using last sample ({name})."
         )
         child = Candidate(
             ident=self._new_id(name),
@@ -1495,6 +1568,7 @@ class EvolutionRunner:
             runner._mutation_counts = {
                 str(k): int(v) for k, v in mutation_counts.items() if isinstance(v, (int, float))
             }
+        runner._rebuild_seen_specs()
         # Restore RNG
         rng_state = data.get("rng_state")
         if rng_state:
