@@ -101,8 +101,14 @@ evolution:
       numerator: speedrun_loss_auc
       denominator: throughput
       epsilon: 1.0e-6
+    # Scale to be comparable to loss magnitudes (~7-9) so the scalar score
+    # and MAP-Elites archive actually feel the efficiency objective.
+    - name: efficiency_score_scaled
+      op: weighted_sum
+      terms:
+        efficiency_score: 10000.0
   # Optimize the full learning curve (AUC) and the end-of-budget loss.
   objectives:
     speedrun_loss_auc: min
     speedrun_end_eval_loss: min
-    efficiency_score: min
+    efficiency_score_scaled: min
