@@ -83,8 +83,20 @@ def test_spawn_candidate_crossover(monkeypatch, tiny_spec, tmp_path):
     spec_a.model.blocks[1].attn.kind = "GQA"
     spec_b.model.blocks[0].attn.kind = "MHA"
     spec_b.model.blocks[1].attn.kind = "MHA"
-    parent_candidate = Candidate(ident="parent-1", spec=spec_a, checkpoint=state_path)
-    parent_candidate_2 = Candidate(ident="parent-2", spec=spec_b, checkpoint=state_path)
+    parent_candidate = Candidate(
+        ident="parent-1",
+        spec=spec_a,
+        checkpoint=state_path,
+        status="completed",
+        metrics={"ppl_code": 1.0, "throughput": 1.0},
+    )
+    parent_candidate_2 = Candidate(
+        ident="parent-2",
+        spec=spec_b,
+        checkpoint=state_path,
+        status="completed",
+        metrics={"ppl_code": 1.1, "throughput": 1.0},
+    )
     runner.pool = [parent_candidate, parent_candidate_2]
     child = runner._spawn_candidate()
     assert child.seed_state_path is not None

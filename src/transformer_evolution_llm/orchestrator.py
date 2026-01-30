@@ -1237,8 +1237,27 @@ class EvolutionRunner:
             and len(self.pool) >= 2
             and self.rng.random() < self.cfg.crossover_prob
         ):
+            parent_pool: list[Candidate] = []
+            strategy = getattr(self.cfg, "parent_selection", "weighted")
+            if strategy == "map_elites" and len(self.archive) >= 2:
+                parent_pool = list(self.archive.values())
+            else:
+                parent_pool = [c for c in self.pool if c.status == "completed"]
+                topk_keep = float(getattr(self.cfg, "topk_keep", 1.0) or 1.0)
+                if parent_pool and 0.0 < topk_keep < 1.0:
+                    scored = sorted(
+                        parent_pool,
+                        key=lambda cand: cand.score(self.score_weights),
+                        reverse=True,
+                    )
+                    keep_n = max(2, int(round(topk_keep * len(scored))))
+                    parent_pool = scored[:keep_n]
+            if len(parent_pool) < 2:
+                parent_pool = []
             for _ in range(max_attempts):
-                parent_a, parent_b = self.rng.sample(self.pool, 2)
+                if not parent_pool:
+                    break
+                parent_a, parent_b = self.rng.sample(parent_pool, 2)
                 spec: ArchitectureSpec | None = None
                 try:
                     blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
