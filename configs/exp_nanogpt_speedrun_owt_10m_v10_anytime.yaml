@@ -37,7 +37,7 @@ train:
   lr: 6.0e-4
   warmup: 20
   clip: 1.0
-  bf16: false
+  bf16: true
   grad_ckpt: true
   max_tokens: 900000
   weight_decay: 0.1
