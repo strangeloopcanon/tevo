@@ -325,6 +325,7 @@ flowchart LR
 - **Explicit memory is stable**: When long-context probes are used, survivors almost always carry memory primitives (retro + token/chunk/assoc variants).
 - **Selection pressure dominates**: Different selection strategies (`map_elites` vs. lexicase) maintain different niches.
 - **Convergent Evolution**: The system reliably rediscovers known distinct classes of building blocks (explicit memory, routing/gating, depth reuse) without being explicitly told to look for them.
+- **Speedrun objectives expose “recipe correctness”**: In a 256‑candidate NanoGPT anytime-speedrun sweep on Modal A10G (`modal_speedrun_owt10m_v10_anytime_full9`), the top frontier point reduced `speedrun_end_eval_loss` from `7.72 → 6.61` (so `ppl_eval≈2251 → ≈745`) and `speedrun_loss_auc` from `7.68 → 7.03`, with a small throughput drop (~2.4%). The winner is still a 12‑layer MHA baseline, but evolution added lightweight extras (`memory_tokens`, LayerScale, gating) and AdamW tweaks; the final large jump was switching CUDA precision to bf16 (our fp16 path uses autocast without a GradScaler).
 
 ### So what (what this implies)
 - These runs are an *architecture microscope*: at ~65–85M params and a few hundred steps, the loop finds convergent motifs (memory, routing/gating, depth reuse) without being told to chase any named target.
@@ -501,6 +502,7 @@ export TOKENIZERS_PARALLELISM=false
 - Lower `instability_threshold` in train config to catch unstable models earlier
 - Check that learning rate isn't too high
 - Some mutations produce unstable architectures—this is expected; they get filtered
+- On CUDA, prefer bf16: set `train.bf16: true` (fp16 currently uses autocast without a GradScaler)
 
 **MPS (Apple Silicon) quirks**
 - Some operations fall back to CPU; this is normal

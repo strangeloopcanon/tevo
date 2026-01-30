@@ -6,6 +6,8 @@ import math
 import random
 import uuid
 from collections import Counter
+from hashlib import sha256
+from json import dumps as json_dumps
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,12 @@ def default_objectives() -> ObjectiveDir:
 
 class EvolutionRunner:
     """Coordinates mutation, evaluation, and frontier tracking."""
+
+    @staticmethod
+    def _spec_fingerprint(spec: ArchitectureSpec) -> str:
+        payload = spec.model_dump(mode="json")
+        blob = json_dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return sha256(blob.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _empty_device_cache() -> None:
@@ -180,6 +188,7 @@ class EvolutionRunner:
         self._composite_metrics = self._merge_composites(
             configured_composites, self._default_composites()
         )
+        self._seen_spec_fingerprints: set[str] = set()
         self.pool: list[Candidate] = []
         self.counter = 0
         self.checkpoint_dir = Path("runs/checkpoints")
@@ -230,6 +239,14 @@ class EvolutionRunner:
         else:
             configure_template_learning(enabled=False)
 
+    def _remember_spec(self, spec: ArchitectureSpec) -> None:
+        self._seen_spec_fingerprints.add(self._spec_fingerprint(spec))
+
+    def _rebuild_seen_specs(self) -> None:
+        self._seen_spec_fingerprints = {
+            self._spec_fingerprint(c.spec) for c in self.pool + self._history
+        }
+
     def _cleanup_seed_state(self, candidate: Candidate) -> None:
         """Remove intermediate crossover seed checkpoints when no longer needed."""
         seed_state_path = candidate.seed_state_path
@@ -251,6 +268,29 @@ class EvolutionRunner:
     def _objective_metrics_ok(self, candidate: Candidate) -> bool:
         if float(candidate.metrics.get("nan_seen", 0.0) or 0.0) > 0.0:
             return False
+        stop_reason = candidate.metrics.get("stop_reason_code")
+        if stop_reason is not None:
+            try:
+                stop_code = float(stop_reason)
+            except (TypeError, ValueError):
+                return False
+            if stop_code in (1.0, 2.0):  # high_grad / low_entropy
+                return False
+        thresholds = getattr(self.cfg, "rung0_thresholds", {}) or {}
+        for key, limit in thresholds.items():
+            if not isinstance(key, str) or not key.startswith("max_"):
+                continue
+            metric_name = key[len("max_") :]
+            metric_val = candidate.metrics.get(metric_name)
+            if metric_val is None:
+                return False
+            try:
+                metric_f = float(metric_val)
+                limit_f = float(limit)
+            except (TypeError, ValueError):
+                return False
+            if metric_f > limit_f:
+                return False
         for name in self.objective_dir:
             val = candidate.metrics.get(name)
             if val is None:
@@ -272,16 +312,51 @@ class EvolutionRunner:
             if self._init_checkpoint is not None:
                 base_candidate.seed_state_path = self._init_checkpoint
             self._parents[base_candidate.ident] = []
-            self._evaluate_candidate(base_candidate)
+            try:
+                self._evaluate_candidate(base_candidate)
+            except Exception as exc:
+                console.print(f"[red]Seed candidate {base_candidate.ident} crashed:[/] {exc}")
+                base_candidate.status = "failed"
+                base_candidate.checkpoint = None
+                try:
+                    self._cleanup_seed_state(base_candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Seed cleanup failed:[/] {cleanup_exc}")
+                try:
+                    self._remove_candidate_artifacts(base_candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Seed artifact cleanup failed:[/] {cleanup_exc}")
             if base_candidate.status == "completed":
                 self._update_archive(base_candidate)
                 survivors.append(base_candidate)
             self.pool.append(base_candidate)
             self._history.append(base_candidate)
+            self._remember_spec(base_candidate.spec)
         for _ in range(generations):
-            candidate = self._spawn_candidate()
+            try:
+                candidate = self._spawn_candidate()
+            except Exception as exc:
+                console.print(f"[red]Failed to spawn candidate:[/] {exc}")
+                continue
             console.print(f"[cyan]Evaluating[/] {candidate.ident}")
-            self._evaluate_candidate(candidate)
+            try:
+                self._evaluate_candidate(candidate)
+            except Exception as exc:
+                console.print(
+                    f"[red]Candidate {candidate.ident} crashed during evaluation:[/] {exc}"
+                )
+                if self._is_resource_error(exc):
+                    self._empty_device_cache()
+                candidate.status = "failed"
+                candidate.checkpoint = None
+                try:
+                    self._cleanup_seed_state(candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Candidate cleanup failed:[/] {cleanup_exc}")
+                try:
+                    self._remove_candidate_artifacts(candidate)
+                except Exception as cleanup_exc:
+                    console.print(f"[red]Candidate artifact cleanup failed:[/] {cleanup_exc}")
             if candidate.status == "completed":
                 self._update_archive(candidate)
                 self._maybe_update_mutation_weights(candidate)
@@ -290,9 +365,19 @@ class EvolutionRunner:
                 survivors.append(candidate)
             self.pool.append(candidate)
             self._history.append(candidate)
-            self._trim_pool()
-            self._garbage_collect_checkpoints()
-        flush_template_learning()
+            self._remember_spec(candidate.spec)
+            try:
+                self._trim_pool()
+            except Exception as exc:
+                console.print(f"[red]Pool trim failed:[/] {exc}")
+            try:
+                self._garbage_collect_checkpoints()
+            except Exception as exc:
+                console.print(f"[red]Checkpoint GC failed:[/] {exc}")
+        try:
+            flush_template_learning()
+        except Exception as exc:
+            console.print(f"[red]Template learning flush failed:[/] {exc}")
         return survivors
 
     def _evaluate_candidate(self, candidate: Candidate) -> None:
@@ -408,6 +493,9 @@ class EvolutionRunner:
                 candidate.status = "failed"
                 self.trainer.steps = base_steps
                 return
+            seed_value = int(getattr(candidate.spec.train, "seed", 0) or 0)
+            if hasattr(self.data_module, "reset_rng"):
+                self.data_module.reset_rng(seed_value)
             batches = self.data_module.batches(max_tokens=rung1_tokens)
             seed_state = candidate.seed_state_path or candidate.parent_checkpoint
             if self.weight_inheritance == "scratch":
@@ -433,6 +521,9 @@ class EvolutionRunner:
                 return
             candidate.metrics.update(metrics1)
             candidate.checkpoint = checkpoint
+            # Composite metrics may be part of the objective set (e.g.,
+            # efficiency_score). Compute them before objective gating.
+            self._apply_composite_metrics(candidate)
             if not self._objective_metrics_ok(candidate):
                 candidate.status = "failed"
                 self._cleanup_seed_state(candidate)
@@ -520,6 +611,7 @@ class EvolutionRunner:
                 return
             candidate.metrics.update(metrics2)
             candidate.checkpoint = checkpoint
+            self._apply_composite_metrics(candidate)
             if not self._objective_metrics_ok(candidate):
                 candidate.status = "failed"
                 self._cleanup_seed_state(candidate)
@@ -1134,44 +1226,117 @@ class EvolutionRunner:
                 continue
 
     def _spawn_candidate(self) -> Candidate:
+        if (self.pool or self._history) and not self._seen_spec_fingerprints:
+            # Helpful for tests / manual runner construction.
+            self._rebuild_seen_specs()
+        seen = self._seen_spec_fingerprints
+        max_attempts = 32
+
         if (
             self.mode == "live"
             and len(self.pool) >= 2
             and self.rng.random() < self.cfg.crossover_prob
         ):
-            parent_a, parent_b = self.rng.sample(self.pool, 2)
-            blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
-            spec_data = parent_a.spec.model_dump(mode="python")
-            spec_data["model"]["blocks"] = [block.model_dump(mode="python") for block in blocks]
-            spec = ArchitectureSpec(**spec_data)
-            child_id = self._new_id("xover")
-            seed_path: Path | None = None
-            if self.weight_inheritance == "parent":
-                seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
-                merge_checkpoints(
-                    child_spec=spec,
-                    cut_a=cut_a,
-                    cut_b=cut_b,
-                    parent_a_blocks=len(parent_a.spec.model.blocks),
-                    parent_b_blocks=len(parent_b.spec.model.blocks),
-                    parent_a_ckpt=parent_a.checkpoint,
-                    parent_b_ckpt=parent_b.checkpoint,
-                    out_path=seed_path,
+            parent_pool: list[Candidate] = []
+            strategy = getattr(self.cfg, "parent_selection", "weighted")
+            if strategy == "map_elites" and len(self.archive) >= 2:
+                parent_pool = list(self.archive.values())
+            else:
+                parent_pool = [c for c in self.pool if c.status == "completed"]
+                topk_keep = float(getattr(self.cfg, "topk_keep", 1.0) or 1.0)
+                if parent_pool and 0.0 < topk_keep < 1.0:
+                    scored = sorted(
+                        parent_pool,
+                        key=lambda cand: cand.score(self.score_weights),
+                        reverse=True,
+                    )
+                    keep_n = max(2, int(round(topk_keep * len(scored))))
+                    parent_pool = scored[:keep_n]
+            if len(parent_pool) < 2:
+                parent_pool = []
+            for _ in range(max_attempts):
+                if not parent_pool:
+                    break
+                parent_a, parent_b = self.rng.sample(parent_pool, 2)
+                spec: ArchitectureSpec | None = None
+                try:
+                    blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
+                    spec_data = parent_a.spec.model_dump(mode="python")
+                    spec_data["model"]["blocks"] = [
+                        block.model_dump(mode="python") for block in blocks
+                    ]
+                    spec = ArchitectureSpec(**spec_data)
+                except Exception:
+                    spec = None
+                if spec is None:
+                    continue
+                if self._spec_fingerprint(spec) in seen:
+                    continue
+                child_id = self._new_id("xover")
+                seed_path: Path | None = None
+                if self.weight_inheritance == "parent":
+                    seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
+                    merge_checkpoints(
+                        child_spec=spec,
+                        cut_a=cut_a,
+                        cut_b=cut_b,
+                        parent_a_blocks=len(parent_a.spec.model.blocks),
+                        parent_b_blocks=len(parent_b.spec.model.blocks),
+                        parent_a_ckpt=parent_a.checkpoint,
+                        parent_b_ckpt=parent_b.checkpoint,
+                        out_path=seed_path,
+                    )
+                self._parents[child_id] = [parent_a.ident, parent_b.ident]
+                return Candidate(
+                    ident=child_id,
+                    spec=spec,
+                    parent=None,
+                    seed_state_path=seed_path,
                 )
-            self._parents[child_id] = [parent_a.ident, parent_b.ident]
-            return Candidate(
-                ident=child_id,
-                spec=spec,
-                parent=None,
-                seed_state_path=seed_path,
+            console.print(
+                "[yellow]Warning:[/] crossover only produced already-seen specs; "
+                "falling back to mutation."
             )
         parent = self._select_parent()
         # Get context-aware mutation weights if enabled
         mutation_weights = self._context_aware_mutation_weights(parent)
         if mutation_weights is None:
             mutation_weights = self.mutation_weights
-        name, spec = mutate(
-            parent.spec, self.rng, mutation_weights, steps=getattr(self, "mutation_steps", 1)
+        parent_fp = self._spec_fingerprint(parent.spec)
+        last: tuple[str, ArchitectureSpec] | None = None
+        for _ in range(max_attempts):
+            result: tuple[str, ArchitectureSpec] | None = None
+            try:
+                result = mutate(
+                    parent.spec,
+                    self.rng,
+                    mutation_weights,
+                    steps=getattr(self, "mutation_steps", 1),
+                )
+            except Exception:
+                result = None
+            if result is None:
+                continue
+            name, spec = result
+            last = (name, spec)
+            spec_fp = self._spec_fingerprint(spec)
+            if spec_fp == parent_fp or spec_fp in seen:
+                continue
+            child = Candidate(
+                ident=self._new_id(name),
+                spec=spec,
+                parent=parent.ident,
+                parent_checkpoint=parent.checkpoint,
+            )
+            self._parents[child.ident] = [parent.ident]
+            return child
+        if last is None:
+            msg = "mutation produced no candidates"
+            raise RuntimeError(msg)
+        name, spec = last
+        console.print(
+            "[yellow]Warning:[/] mutation only produced already-seen/no-op specs; "
+            f"using last sample ({name})."
         )
         child = Candidate(
             ident=self._new_id(name),
@@ -1422,6 +1587,7 @@ class EvolutionRunner:
             runner._mutation_counts = {
                 str(k): int(v) for k, v in mutation_counts.items() if isinstance(v, (int, float))
             }
+        runner._rebuild_seen_specs()
         # Restore RNG
         rng_state = data.get("rng_state")
         if rng_state:

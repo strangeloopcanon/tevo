@@ -37,15 +37,16 @@ train:
   lr: 6.0e-4
   warmup: 20
   clip: 1.0
-  bf16: false
+  bf16: true
   grad_ckpt: true
   max_tokens: 900000
   weight_decay: 0.1
   seed: 0
   passkey_eval_steps: 0
   # "Anytime" speedrun probes: no fixed target; just measure the learning curve.
-  speedrun_eval_interval: 8
-  speedrun_eval_batches: 8
+  # Keep total eval compute roughly constant: fewer probes, more batches per probe.
+  speedrun_eval_interval: 16
+  speedrun_eval_batches: 16
   ppl_stop_threshold: null
   entropy_threshold: 0.5
   entropy_patience: 3
@@ -74,6 +75,10 @@ evolution:
     max_kv_bytes_per_token: 45000
     min_throughput_proxy: 1.0
     min_layers: 12
+    # Prevent Pareto-admitting models that are meaningfully worse than baseline
+    # (e.g. very high loss but high throughput).
+    max_speedrun_loss_auc: 8.0
+    max_speedrun_end_eval_loss: 8.0
   # Fair benchmark budget: do not scale tokens by depth/MoE heuristics.
   fixed_token_budget: true
   rung1_tokens: 900000
@@ -89,8 +94,21 @@ evolution:
   adaptive_mutation_min_weight: 0.05
   adaptive_mutation_max_weight: 5.0
   weight_inheritance: scratch
-  # Optimize the full learning curve (AUC), the end-of-budget loss, and speed.
+  composite_metrics:
+    # Couple quality and speed to avoid Pareto-admitting "fast-but-bad" candidates.
+    - name: efficiency_score
+      op: ratio
+      numerator: speedrun_loss_auc
+      denominator: throughput
+      epsilon: 1.0e-6
+    # Scale to be comparable to loss magnitudes (~7-9) so the scalar score
+    # and MAP-Elites archive actually feel the efficiency objective.
+    - name: efficiency_score_scaled
+      op: weighted_sum
+      terms:
+        efficiency_score: 10000.0
+  # Optimize the full learning curve (AUC) and the end-of-budget loss.
   objectives:
     speedrun_loss_auc: min
     speedrun_end_eval_loss: min
-    throughput: max
+    efficiency_score_scaled: min

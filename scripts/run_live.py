@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import traceback
 from pathlib import Path
 
 import typer
@@ -252,8 +253,17 @@ def main(
     except Exception:
         pass
     runner.checkpoint_dir = checkpoint_dir
-    runner.run(generations=generations)
-    runner.save_frontier(out)
+    run_error: str | None = None
+    try:
+        runner.run(generations=generations)
+    except Exception as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
+        typer.echo(f"[runner] run crashed: {run_error}")
+        typer.echo(traceback.format_exc())
+    try:
+        runner.save_frontier(out)
+    except Exception as exc:
+        typer.echo(f"[runner] failed to write frontier: {exc}")
     if state_out is None:
         state_out = out.with_name(out.stem + ".state.json")
     try:
@@ -267,6 +277,11 @@ def main(
         runner.save_lineage(lineage_out)
     except Exception:
         pass
+    if run_error is not None:
+        try:
+            out.with_name(out.stem + ".error.txt").write_text(run_error + "\n")
+        except Exception:
+            pass
     manifest_path = out.with_name(out.stem + ".manifest.json")
     manifest = {
         "config": str(config.resolve()),
@@ -301,6 +316,8 @@ def main(
         _prune_checkpoints_to_frontier(out, checkpoint_dir)
     if cleanup_old_checkpoints:
         _cleanup_old_checkpoint_roots(checkpoint_dir)
+    if run_error is not None:
+        raise RuntimeError(run_error)
 
 
 def _cleanup_old_checkpoint_roots(current_root: Path) -> None:
