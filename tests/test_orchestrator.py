@@ -50,3 +50,41 @@ def test_static_checker_reads_resource_thresholds(tiny_spec):
     assert runner.checker.max_params == 123.0
     assert runner.checker.max_kv_bytes == 456.0
     assert runner.checker.min_throughput == 7.0
+
+
+def test_state_roundtrip_preserves_min_objective_signs(tmp_path: Path, tiny_spec):
+    runner = EvolutionRunner(
+        base_spec=tiny_spec,
+        evolution_cfg=tiny_spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    runner.run(generations=1)
+    state_path = tmp_path / "runner.state.json"
+    runner.save_state(state_path)
+
+    restored = EvolutionRunner.load_state(state_path, mode="simulate")
+    for metric, direction in runner.objective_dir.items():
+        if direction != "min":
+            continue
+        assert restored.score_weights[metric] == runner.score_weights[metric]
+
+
+def test_checkpoint_gc_keeps_init_checkpoint(tmp_path: Path, tiny_spec):
+    runner = EvolutionRunner(
+        base_spec=tiny_spec,
+        evolution_cfg=tiny_spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    runner.checkpoint_dir = tmp_path
+    init_ckpt = tmp_path / "init.pt"
+    orphan_ckpt = tmp_path / "orphan.pt"
+    init_ckpt.write_text("init")
+    orphan_ckpt.write_text("orphan")
+    runner._init_checkpoint = init_ckpt
+
+    runner._garbage_collect_checkpoints()
+
+    assert init_ckpt.exists()
+    assert not orphan_ckpt.exists()

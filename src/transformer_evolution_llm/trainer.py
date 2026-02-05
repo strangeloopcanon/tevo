@@ -388,9 +388,20 @@ class FullWeightTrainer:
         multi_thresholds_raw = getattr(spec.train, "speedrun_multi_thresholds", None)
         multi_thresholds: list[float] = []
         if multi_thresholds_raw:
-            multi_thresholds = sorted(
-                [float(t) for t in multi_thresholds_raw if t > 0], reverse=True
-            )
+            threshold_inputs: list[Any]
+            if isinstance(multi_thresholds_raw, (str, int, float)):
+                threshold_inputs = [multi_thresholds_raw]
+            else:
+                threshold_inputs = list(multi_thresholds_raw)
+            parsed_thresholds: list[float] = []
+            for raw in threshold_inputs:
+                try:
+                    threshold = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if threshold > 0:
+                    parsed_thresholds.append(threshold)
+            multi_thresholds = sorted(parsed_thresholds, reverse=True)
         multi_threshold_reached: dict[float, bool] = dict.fromkeys(multi_thresholds, False)
         multi_threshold_tokens: dict[float, float | None] = dict.fromkeys(multi_thresholds, None)
         multi_threshold_flops: dict[float, float | None] = dict.fromkeys(multi_thresholds, None)
@@ -1010,7 +1021,7 @@ class FullWeightTrainer:
         criterion: nn.Module,
     ) -> float:
         loss = self._evaluate_loss(
-            model, spec, batch_iter, criterion, eval_batches=self.eval_batches, empty_value=0.0
+            model, spec, batch_iter, criterion, eval_batches=self.eval_batches, empty_value=1e9
         )
         if not math.isfinite(loss) or loss >= 1e8:
             return 1e9

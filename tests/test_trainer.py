@@ -5,6 +5,7 @@ import torch
 
 from transformer_evolution_llm.candidates import Candidate
 from transformer_evolution_llm.data import TokenBatch
+from transformer_evolution_llm.models import EvolutionModel
 from transformer_evolution_llm.trainer import FullWeightTrainer
 
 
@@ -93,3 +94,57 @@ def test_full_weight_trainer_speedrun_metrics(tmp_path: Path, tiny_spec) -> None
     ):
         assert key in metrics
         assert math.isfinite(float(metrics[key]))
+
+
+def test_evaluate_perplexity_empty_iter_returns_penalty(tmp_path: Path, tiny_spec) -> None:
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=1, eval_batches=1, device="cpu")
+    model = EvolutionModel(tiny_spec.model)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    ppl = trainer._evaluate_perplexity(model, tiny_spec, iter(()), criterion)
+    assert ppl >= 1e9
+
+
+def test_speedrun_multi_thresholds_accept_strings(tmp_path: Path, tiny_spec, monkeypatch) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.speedrun_eval_interval = 1
+    spec.train.speedrun_eval_batches = 1
+    spec.train.speedrun_multi_thresholds = ["3.5", "2.5", "bad"]
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=1, eval_batches=1, device="cpu")
+    candidate = Candidate(ident="cand-speedrun-thresholds", spec=spec)
+
+    class DummyEvalModule:
+        def __init__(self, vocab: int, seq_len: int):
+            self.vocab = vocab
+            self.seq_len = seq_len
+
+        def reset_rng(self, seed: int) -> None:
+            _ = seed
+
+        def batches(self, max_tokens: int | None = None):
+            _ = max_tokens
+            ids = torch.randint(0, self.vocab, (2, self.seq_len))
+            yield TokenBatch(
+                input_ids=ids,
+                attention_mask=torch.ones_like(ids),
+                uids=["eval"],
+            )
+
+    eval_module = DummyEvalModule(spec.model.head.vocab, spec.data.seq_len)
+    monkeypatch.setattr(
+        trainer,
+        "_get_eval_module",
+        lambda _spec, eval_batches=None: (
+            eval_module,
+            spec.data.seq_len * spec.data.batch_size * int(eval_batches or 1),
+        ),
+    )
+
+    metrics, _ = trainer.train(
+        candidate,
+        spec,
+        synthetic_batches(spec.model.head.vocab, spec.data.seq_len, steps=3),
+    )
+
+    assert "speedrun_auc" in metrics
+    assert "speedrun_reached_3" in metrics
+    assert "speedrun_reached_2" in metrics

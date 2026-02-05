@@ -8,6 +8,7 @@ from transformer_evolution_llm.dsl import (
     RetroConfig,
 )
 from transformer_evolution_llm.mutations import (
+    add_additional_recurrence,
     dense_to_moe,
     insert_custom_module,
     insert_lookup_memory,
@@ -126,3 +127,13 @@ def test_tune_clip_keeps_positive(tiny_spec: ArchitectureSpec) -> None:
     rng = random.Random(12)  # noqa: S311 - deterministic unit tests
     child = tune_clip(tiny_spec, rng=rng)
     assert child.train.clip > 0.0
+
+
+def test_add_additional_recurrence_keeps_train_le_max(tiny_spec: ArchitectureSpec) -> None:
+    base = tiny_spec.model_copy(deep=True)
+    base.model.blocks = [base.model.blocks[0], base.model.blocks[0].model_copy(deep=True)]
+    for seed in range(200):
+        child = add_additional_recurrence(base, rng=random.Random(seed))  # noqa: S311
+        assert child.model.recurrences, "expected recurrence to be added"
+        rec = child.model.recurrences[-1]
+        assert rec.train_recurrence <= rec.max_train_recurrence

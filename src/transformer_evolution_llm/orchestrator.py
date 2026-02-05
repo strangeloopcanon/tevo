@@ -303,6 +303,17 @@ class EvolutionRunner:
                 return False
         return True
 
+    def _score_weight_overrides(self) -> dict[str, float]:
+        """Recover unsigned weight overrides from signed score weights."""
+        overrides: dict[str, float] = {}
+        for metric, direction in self.objective_dir.items():
+            weight = self.score_weights.get(metric)
+            if weight is None:
+                continue
+            sign = 1.0 if direction == "max" else -1.0
+            overrides[metric] = float(weight) / sign
+        return overrides
+
     def run(self, generations: int) -> list[Candidate]:
         survivors: list[Candidate] = []
         if not self.pool:
@@ -574,8 +585,9 @@ class EvolutionRunner:
                         f"[green]Fast promote {candidate.ident}:[/] high improvement rate "
                         f"({improvement_rate:.3f} > {fast_promote})"
                     )
-                    # Give 50% extra budget
+                    # Give 50% extra budget but never exceed total token budget.
                     rung2_extra = int(rung2_extra * 1.5)
+                    rung2_extra = min(rung2_extra, max(0, int(tokens_budget) - int(rung1_tokens)))
             # Rung 2 (full)
             if rung2_extra <= 0:
                 self._cleanup_seed_state(candidate)
@@ -623,9 +635,22 @@ class EvolutionRunner:
             if candidate.seed_state_path is not None:
                 self._cleanup_seed_state(candidate)
             candidate.status = "completed"
+            rung_tokens_used = int(rung1_tokens) + int(rung2_extra)
             # Optional promotion rung: give complex candidates extra budget
-            if self._should_promote(candidate, tokens_budget, rung2_tokens):
-                self._run_promotion(candidate, base_steps, tokens_budget, rung2_tokens)
+            promoted = False
+            if self._should_promote(candidate, tokens_budget, rung_tokens_used):
+                promoted = self._run_promotion(
+                    candidate, base_steps, tokens_budget, rung_tokens_used
+                )
+            if promoted:
+                self._apply_composite_metrics(candidate)
+                if not self._objective_metrics_ok(candidate):
+                    candidate.status = "failed"
+                    self._cleanup_seed_state(candidate)
+                    self._remove_candidate_artifacts(candidate)
+                    candidate.checkpoint = None
+                    self.trainer.steps = base_steps
+                    return
             # Prior distance metric (not in objectives by default)
             candidate.metrics["prior_distance"] = self._prior_distance(candidate.spec)
             self._apply_composite_metrics(candidate)
@@ -678,17 +703,17 @@ class EvolutionRunner:
         base_steps: int,
         tokens_budget: int,
         used_tokens: int,
-    ) -> None:
+    ) -> bool:
         """Apply an additional high-budget training rung to the candidate."""
         if self.trainer is None or self.data_module is None:
-            return
+            return False
         extra_tokens = int(self._promotion_tokens_multiplier * max(tokens_budget - used_tokens, 0))
         if extra_tokens <= 0:
-            return
+            return False
         max_tokens = min(tokens_budget, used_tokens + extra_tokens)
         promo_tokens = max(0, int(max_tokens - used_tokens))
         if promo_tokens <= 0:
-            return
+            return False
         promo_steps = max(1, int(base_steps * self._promotion_steps_multiplier))
         original_steps = self.trainer.steps
         try:
@@ -706,10 +731,12 @@ class EvolutionRunner:
                 )
                 candidate.metrics.update(metrics3)
                 candidate.checkpoint = checkpoint3
+                return True
             except Exception as exc:
                 console.print(f"[yellow]Promotion rung failed for {candidate.ident}:[/] {exc}")
                 if self._is_resource_error(exc):
                     self._empty_device_cache()
+                return False
         finally:
             self.trainer.steps = original_steps
 
@@ -1208,6 +1235,7 @@ class EvolutionRunner:
             except Exception:
                 return
 
+        _add(self._init_checkpoint)
         for cand in self.pool:
             _add(cand.checkpoint)
             _add(cand.seed_state_path)
@@ -1474,6 +1502,7 @@ class EvolutionRunner:
             "init_checkpoint": str(self._init_checkpoint) if self._init_checkpoint else None,
             "objective_dir": self.objective_dir,
             "score_weights": self.score_weights,
+            "score_weight_overrides": self._score_weight_overrides(),
             "pool": [c.serialize() for c in self.pool],
             "frontier": [c.ident for c in self.frontier.entries],
             "parents": self._parents,
@@ -1518,13 +1547,34 @@ class EvolutionRunner:
         seed_val = data.get("seed")
         if not isinstance(seed_val, int):
             seed_val = 0
+        resolved_overrides = score_weight_overrides
+        if resolved_overrides is None:
+            saved_overrides = data.get("score_weight_overrides")
+            if isinstance(saved_overrides, dict):
+                resolved_overrides = {
+                    str(k): float(v)
+                    for k, v in saved_overrides.items()
+                    if isinstance(v, (int, float))
+                }
+            else:
+                saved_signed = data.get("score_weights")
+                saved_objective_dir = data.get("objective_dir")
+                if isinstance(saved_signed, dict) and isinstance(saved_objective_dir, dict):
+                    decoded: dict[str, float] = {}
+                    for metric, direction in saved_objective_dir.items():
+                        value = saved_signed.get(metric)
+                        if not isinstance(value, (int, float)):
+                            continue
+                        sign = 1.0 if direction == "max" else -1.0
+                        decoded[str(metric)] = float(value) / sign
+                    resolved_overrides = decoded
         runner = cls(
             base_spec=base_spec,
             evolution_cfg=evo_cfg,
             mode=mode,
             objective_dir=data.get("objective_dir"),
             seed=seed_val,
-            score_weight_overrides=score_weight_overrides or data.get("score_weights"),
+            score_weight_overrides=resolved_overrides,
         )
         runner.mutation_weights = data.get("mutation_weights")
         if "mutation_steps" in data:
