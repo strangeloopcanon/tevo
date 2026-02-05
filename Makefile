@@ -13,7 +13,7 @@ PIP_AUDIT := $(VENV_BIN)/pip-audit
 APP := $(VENV_BIN)/python -m transformer_evolution_llm
 AGENT_MODE ?= baseline
 
-.PHONY: setup check format lint type security test llm-live deps-audit all release clean
+.PHONY: setup check format format-check lint type security test llm-live deps-audit all release clean
 
 $(VENV):
 	$(PYTHON) -m venv $(VENV)
@@ -26,6 +26,9 @@ setup: $(VENV)
 format:
 	$(FMT) src tests
 
+format-check:
+	$(FMT) --check src tests
+
 lint:
 	$(LINT) check src tests
 
@@ -36,7 +39,7 @@ security:
 	$(BANDIT) -q -r src
 	$(DETECT_SECRETS) scan --baseline .secrets.baseline
 
-check: format lint type security
+check: format-check lint type security
 
 test:
 	$(PYTEST)

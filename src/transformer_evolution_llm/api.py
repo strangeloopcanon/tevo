@@ -11,7 +11,6 @@ import torch
 import ujson as json
 
 from .dsl import ArchitectureSpec, load_architecture_spec, save_architecture_spec
-from .orchestrator import EvolutionRunner
 
 __all__ = [
     "ArchitectureSpec",
@@ -42,6 +41,8 @@ def run_evolution(
     out_path: str | Path = "runs/frontier.json",
 ) -> None:
     """Entry point used by the CLI to run a full search."""
+    from .orchestrator import EvolutionRunner
+
     spec = load_spec(config_path)
     runner = EvolutionRunner(
         base_spec=spec,

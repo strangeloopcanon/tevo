@@ -61,6 +61,9 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
 select = [
   "E",
   "F",
@@ -74,7 +77,6 @@ select = [
 ignore = [
   "S101"  # asserts are allowed in tests
 ]
-src = ["src", "tests"]
 
 [tool.mypy]
 python_version = "3.11"

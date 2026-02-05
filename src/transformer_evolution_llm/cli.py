@@ -13,7 +13,6 @@ from rich.table import Table
 from . import get_version
 from .api import convert_checkpoints, export_frontier_seed, prune_checkpoints, run_evolution
 from .cache_builder import synthesize_cache
-from .orchestrator import EvolutionRunner
 
 app = typer.Typer(help="Evolutionary search loop utilities")
 console = Console()
@@ -102,6 +101,8 @@ def resume_state(
     out: Annotated[Path, typer.Option()] = Path("runs/frontier.json"),
 ) -> None:
     """Resume from a saved state and continue for more generations."""
+    from .orchestrator import EvolutionRunner
+
     runner = EvolutionRunner.load_state(state_path, mode=mode)
     runner.rng.seed(seed)
     runner.run(generations)
