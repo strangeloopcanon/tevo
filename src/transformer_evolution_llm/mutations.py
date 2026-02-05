@@ -1148,6 +1148,9 @@ def add_additional_recurrence(spec: ArchitectureSpec, rng: random.Random) -> Arc
         return child
     start = rng.randrange(0, len(child.model.blocks) - 1)
     end = rng.randrange(start + 1, len(child.model.blocks) + 1)
+    train_recurrence = int(rng.choice([1, 2, 3]))
+    max_recurrence_choices = [value for value in [2, 4, 6] if value >= train_recurrence]
+    max_train_recurrence = int(rng.choice(max_recurrence_choices or [train_recurrence]))
     rec = RecurrenceConfig(
         start=start,
         end=end,
@@ -1156,8 +1159,8 @@ def add_additional_recurrence(spec: ArchitectureSpec, rng: random.Random) -> Arc
         concat_prelude=rng.choice([True, False]),
         init_state=rng.choice(["zeros", "noise"]),
         noise_std=rng.uniform(0.01, 0.05),
-        train_recurrence=rng.choice([1, 2, 3]),
-        max_train_recurrence=rng.choice([2, 4, 6]),
+        train_recurrence=train_recurrence,
+        max_train_recurrence=max_train_recurrence,
         curriculum_fraction=rng.uniform(0.1, 0.4),
         test_recurrences=[1, 2, 4, 8],
     )
