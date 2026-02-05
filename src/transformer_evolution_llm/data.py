@@ -7,13 +7,34 @@ import random
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer
 
 from .dsl import DataConfig, DatasetShard
+
+# Lazy-loaded callables (kept as module globals so tests can monkeypatch them).
+load_dataset: Any | None = None
+AutoTokenizer: Any | None = None
+
+
+def _resolve_dataset_loader() -> Any:
+    global load_dataset
+    if load_dataset is None:
+        from datasets import load_dataset as hf_load_dataset
+
+        load_dataset = hf_load_dataset
+    return load_dataset
+
+
+def _resolve_auto_tokenizer() -> Any:
+    global AutoTokenizer
+    if AutoTokenizer is None:
+        import transformers
+
+        AutoTokenizer = transformers.AutoTokenizer
+    return AutoTokenizer
 
 
 @dataclass
@@ -33,7 +54,8 @@ class DataModule:
         self._dataset_cache: dict[tuple[str, str, str, bool, str | None], object] = {}
         self._packed = bool(getattr(cfg, "packed", False))
         self._packed_cache: dict[str, np.memmap] = {}
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        auto_tokenizer = _resolve_auto_tokenizer()
+        self.tokenizer = auto_tokenizer.from_pretrained(
             cfg.tokenizer,
             revision=cfg.hf_revision,
         )  # nosec B615 - revision pinned via config
@@ -63,9 +85,10 @@ class DataModule:
         cached = self._dataset_cache.get(cache_key)
         if cached is not None:
             return cached
+        dataset_loader = _resolve_dataset_loader()
         if ":" in split_raw:
             cfg_name, split_name = split_raw.split(":", 1)
-            dataset = load_dataset(  # nosec B615 - revision pinned via config
+            dataset = dataset_loader(  # nosec B615 - revision pinned via config
                 shard.name,
                 cfg_name,
                 split=split_name,
@@ -76,7 +99,7 @@ class DataModule:
             self._dataset_cache[cache_key] = dataset
             return dataset
         try:
-            dataset = load_dataset(  # nosec B615 - revision pinned via config
+            dataset = dataset_loader(  # nosec B615 - revision pinned via config
                 shard.name,
                 split=split_raw,
                 streaming=streaming,
@@ -90,7 +113,7 @@ class DataModule:
             # (e.g., wikitext-2-raw-v1). Detect and retry with a default split.
             msg = str(exc)
             if "Config name is missing" in msg or "available configs" in msg:
-                dataset = load_dataset(  # nosec B615 - revision pinned via config
+                dataset = dataset_loader(  # nosec B615 - revision pinned via config
                     shard.name,
                     split_raw,
                     split="train",
