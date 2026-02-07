@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Create venv and install deps
+        run: |
+          python -m venv .venv
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: Contract check
+        run: AGENT_MODE=baseline make check
+
+  test:
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Create venv and install deps
+        run: |
+          python -m venv .venv
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: Run tests
+        run: AGENT_MODE=baseline make test
+
+      - name: LLM live stub
+        run: AGENT_MODE=baseline make llm-live

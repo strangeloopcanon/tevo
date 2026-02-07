@@ -1,0 +1,359 @@
+model:
+  name: exp-nanochat-d20-modal-evolve-aeff095e
+  emb:
+    dim: 1280
+    vocab: 32768
+    dropout: 0.0
+  blocks:
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+      sparsity: sliding
+      sliding_window: 1024
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  - attn:
+      kind: MHA
+      heads: 10
+      head_dim: 128
+      rope: standard
+      kv_groups: 1
+      dropout: 0.0
+    ffn:
+      type: dense
+      hidden: 5120
+      activation: relu
+      dropout: 0.0
+  head:
+    tie_embeddings: false
+    vocab: 32768
+  norm: rmsnorm
+train:
+  lr: 0.0003
+  warmup: 2000
+  clip: 1.0
+  bf16: true
+  grad_ckpt: true
+  max_tokens: 1200000
+  weight_decay: 0.2
+  seed: 0
+  passkey_eval_steps: 0
+  speedrun_eval_interval: 24
+  speedrun_eval_batches: 12
+  ppl_stop_threshold: null
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 500.0
+  no_improve_patience: 60
+  improvement_tolerance: 0.001
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    betas:
+    - 0.8
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 0.2
+  speedrun_target_ppl: 2000.0
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  packed: true
+  packed_train_path: runs/packed/openwebtext_10m/train.bin
+  packed_val_path: runs/packed/openwebtext_10m/val.bin
+  packed_dtype: uint16
+  seq_len: 2048
+  batch_size: 2
+  workers: 0
+  shards: []
+  eval_tokens: 131072
+  healing_shards: []
+  healing_tokens: null
+evolution:
+  rung0_thresholds:
+    max_params: 700000000
+    max_kv_bytes_per_token: 220000
+    min_layers: 16
+    min_throughput_proxy: 0.9
+    max_stop_reason_code: 1
+    max_speedrun_end_eval_loss: 8.2
+    max_speedrun_loss_auc: 8.4
+  rung1_tokens: 400000
+  rung2_tokens: 1200000
+  population: 24
+  topk_keep: 0.4
+  crossover_prob: 0.4
+  parent_selection: map_elites
+  archive_max_elites: 64
+  structural_elite_k: 4
+  adaptive_mutation: true
+  adaptive_mutation_eta: 0.1
+  adaptive_mutation_min_weight: 0.05
+  adaptive_mutation_max_weight: 5.0
+  weight_inheritance: scratch
+  objectives:
+    speedrun_loss_auc: min
+    speedrun_end_eval_loss: min
+    efficiency_score_scaled: min
+  composite_metrics:
+  - name: efficiency_score
+    op: ratio
+    numerator: speedrun_loss_auc
+    denominator: throughput
+    epsilon: 1.0e-06
+  - name: efficiency_score_scaled
+    op: weighted_sum
+    terms:
+      efficiency_score: 10000.0

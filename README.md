@@ -55,6 +55,49 @@ At a high level:
 
 </details>
 
+## Architecture Map: Legacy vs Speedrun vs TEVO Seed
+
+So what: these are three different model families. Comparing them directly is useful, but they are not interchangeable baselines.
+
+| Axis | Legacy GPT-2 (2019) | nanochat speedrun recipe (current) | TEVO starting seed (this repo run) | Latest evolved frontier point (`xover-3-56da`) |
+|---|---|---|---|---|
+| Family | Original GPT-2 | nanochat GPT variant | TEVO DSL seed inspired by speedrun constraints | TEVO child from crossover lineage |
+| Core stack | Dense causal attention + LayerNorm + GELU | RoPE + RMSNorm + QK norm + ReLU^2 + sliding/full pattern | RoPE + RMSNorm + ReLU + mostly sliding-window MHA | Same family as seed; no new primitive class added |
+| Scale | Larger legacy GPT-2 variants (e.g., XL line) | Depth dial, GPT-2-grade around d24/d26 | d20 seed (`d_model=1280`, `10x128` heads) | d18 (`d_model=1280`, `10x128` heads) |
+| Context | 1024 | 2048 | 2048 | 2048 |
+| Vocab/tokenizer | GPT-2 tokenizer (`50,257`) | nanochat tokenizer (`~32k`) | GPT-2 tokenizer (`50,257`) | GPT-2 tokenizer (`50,257`) |
+| Attention density | Fully dense | Mixed sliding/full by pattern | Mostly sliding-window (`1024`) with some full layers | Similar pattern, but one fewer sparse layer (`15 -> 14`) |
+| Throughput (our run) | N/A | N/A | `2675.55 tok/s` | `2913.84 tok/s` (`+8.9%`) |
+| Speedrun loss AUC (our run) | N/A | N/A | `9.5766` | `9.5952` (slightly worse) |
+| Speedrun end eval loss (our run) | N/A | N/A | `9.3410` | `9.3607` (slightly worse) |
+| What changed vs seed | N/A | N/A | Baseline for this run | `20 -> 18` layers, better efficiency/throughput trade-off point |
+
+Why we started from a different seed than nanochat `speedrun.sh`:
+- **Cost envelope for evolution loops:** we used the d20 branch (`~477M params`) instead of d26 (`~973M params`) so multiple generations are feasible on Modal A10G.
+- **Tokenizer/data compatibility in this repo:** we ran with GPT-2 vocab (`50,257`) and packed FineWeb token IDs used by this code path, avoiding index mismatches in short-loop sweeps.
+- **Goal of this run:** architecture search under TEVO’s runged objectives, not a full reproduction of nanochat’s end-to-end 8xH100 speedrun pipeline.
+- **Reference parity still exists:** a d26 reference config is available here: `configs/ref_nanochat_speedrun_d26_aeff095e.yaml` (see `docs/nanochat_alignment.md`).
+
+<details>
+<summary>Mermaid version (optional, only if your Markdown renderer supports Mermaid)</summary>
+
+```mermaid
+flowchart LR
+    A["2019 Legacy GPT-2\nDense causal attention\nLearned absolute positions\nLayerNorm + GELU\nContext 1024, vocab 50,257"] --> B["nanochat speedrun recipe (current)\nDepth dial (d24/d26 typical)\nRoPE + RMSNorm + QK norm + ReLU^2\nSliding/full attention pattern\nContext 2048, tokenizer ~32k"]
+    B --> C["TEVO starting seed (this repo)\nConfig: exp_nanochat_gpt2grade_d20_modal_evolve_fineweb_staggered_gpt2vocab_aeff095e.yaml\n20 layers, d_model 1280, 10 heads x 128\nRoPE + RMSNorm + ReLU\nMHA + dense FFN, mostly sliding-window=1024\nContext 2048, GPT-2 vocab 50,257"]
+    C --> D["Example evolved frontier point\nxover-3-56da\n18 layers\n+8.9% throughput vs seed\nSlightly worse speedrun loss metrics"]
+```
+
+</details>
+
+<details>
+<summary>Exact seed used for the latest Modal evolution run</summary>
+
+- Seed architecture file: `configs/exp_nanochat_gpt2grade_d20_modal_evolve_fineweb_staggered_gpt2vocab_aeff095e.yaml`
+- Output frontier: `runs/modal/modal_nanochat_fineweb_d20_staggered_a10g_g8_s140_seed0_20260206_160807/frontier.json`
+
+</details>
+
 ## Installation
 
 ### Prerequisites
@@ -251,7 +294,113 @@ evolution:
 
 See [`src/transformer_evolution_llm/dsl.py`](src/transformer_evolution_llm/dsl.py) for the full schema definition.
 
-## Example Long-Context Frontier (Illustrative Survivors)
+## Objective & Selection Cookbook
+
+So what: in practice, the frontier is mostly controlled by three things: `rung0_thresholds` (what is allowed), `objectives` (what is rewarded), and `parent_selection` (how pressure is applied).
+
+### Profile A: Quality + Compute (default strong baseline)
+
+Use when you want better short-budget learning efficiency without over-optimizing for one serving metric.
+
+```yaml
+evolution:
+  rung0_thresholds:
+    max_params: 150000000
+    max_kv_bytes_per_token: 45000
+    min_throughput_proxy: 1.0
+    min_layers: 12
+  rung1_tokens: 300000
+  rung2_tokens: 900000
+  population: 24
+  topk_keep: 0.45
+  crossover_prob: 0.4
+  parent_selection: map_elites
+  archive_max_elites: 64
+  structural_elite_k: 4
+  adaptive_mutation: true
+  objectives:
+    ppl_code: min
+    speedrun_flops_to_target: min
+```
+
+### Profile B: Serving-Oriented (quality + KV + throughput)
+
+Use when deployment memory/latency matters and you still need reasonable quality.
+
+```yaml
+evolution:
+  rung0_thresholds:
+    max_params: 150000000
+    max_kv_bytes_per_token: 45000
+    min_throughput_proxy: 1.0
+    min_layers: 12
+    min_selector_blocks: 1
+  rung1_tokens: 300000
+  rung2_tokens: 900000
+  population: 24
+  topk_keep: 0.45
+  crossover_prob: 0.4
+  parent_selection: map_elites
+  archive_max_elites: 64
+  structural_elite_k: 4
+  objectives:
+    ppl_code: min
+    speedrun_flops_to_target: min
+    kv_bytes_per_token: min
+    throughput: max
+```
+
+### Profile C: Diversity Discovery (find new motifs)
+
+Use when you want multiple structurally different lineages instead of one dominant family.
+
+```yaml
+evolution:
+  rung0_thresholds:
+    max_params: 150000000
+    max_kv_bytes_per_token: 45000
+    min_throughput_proxy: 1.0
+    min_layers: 10
+  rung1_tokens: 300000
+  rung2_tokens: 900000
+  population: 24
+  topk_keep: 0.8
+  crossover_prob: 0.3
+  parent_selection: epsilon_lexicase
+  epsilon_lexicase_epsilon: 0.05
+  structural_elite_k: 4
+  objectives:
+    ppl_code: min
+    novelty: max
+    graph_entropy: max
+    throughput: max
+```
+
+### Parent Selection Cheat Sheet
+
+| Strategy | When to use | Trade-off |
+|---|---|---|
+| `map_elites` | Best default for broad search and niche retention | More exploration, slower collapse |
+| `epsilon_lexicase` | Noisy metrics and multi-niche pressure | More variance run-to-run |
+| `lexicase` | Strong niche pressure with low noise | Can be brittle with noisy objectives |
+| `pareto_uniform` | Objective scales differ a lot | Weaker exploitation |
+| `weighted` | Late-phase exploitation | Sensitive to metric scales |
+
+### Knob Priority (What Usually Matters Most)
+
+1. Set hard gates first (`rung0_thresholds`) for non-negotiables.
+2. Keep `objectives` to 2-4 metrics that match the run goal.
+3. Pick `parent_selection` for the phase: exploration (`map_elites` / `epsilon_lexicase`) vs exploitation (`weighted`).
+4. Tune exploration pressure with `topk_keep` (higher = broader search).
+5. Tune compute fidelity with `rung1_tokens`/`rung2_tokens`; complex motifs usually need more rung budget.
+6. Use `adaptive_mutation` and `structural_elite_k` to avoid early collapse.
+
+### Score-Weight Notes
+
+- `scripts/run_live.py` supports CLI score-weight overrides for common metrics (`ppl`, `throughput`, `long_recall`, `ram`, `layers`, `moe_blocks`, `novelty`, `instability`, `prior_distance`).
+- If your objective list includes very large-scale metrics (for example `speedrun_flops_to_target`), avoid `weighted` selection unless you intentionally normalize; `map_elites`, `pareto_uniform`, or `epsilon_lexicase` are usually safer.
+
+## Example Survivors from A Long-Context Run
 
 These are illustrative survivors from the newest long‑context sweep (11‑entry Pareto frontier at ~65–85M params), archived as YAML for inspection/reseeding.
 

@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from .attention_patterns import resolve_attention_pattern
 from .dsl import (
     ArchitectureSpec,
     AssociativeMemoryConfig,
@@ -218,10 +219,9 @@ def _average_keys_per_query(attn: Any, *, seq_len: int) -> float:
             return float(min(topk, (t + 1) / 2.0))
         return float(topk)
 
-    sparsity = str(getattr(attn, "sparsity", "none") or "none")
-    sw = getattr(attn, "sw", None)
-    if sparsity == "none" and sw:
-        sparsity = "sliding"
+    pattern = resolve_attention_pattern(attn)
+    sparsity = pattern.sparsity
+    sw = pattern.sw
 
     if sparsity == "sliding":
         w = int(sw or 0)
@@ -230,22 +230,22 @@ def _average_keys_per_query(attn: Any, *, seq_len: int) -> float:
         return float(min(w, (t + 1) / 2.0) if causal and w >= t else min(w, t))
 
     if sparsity == "block":
-        bsz = int(getattr(attn, "block_size", 0) or 0)
+        bsz = int(pattern.block_size or 0)
         if bsz <= 0:
             return float((t + 1) / 2.0 if causal else t)
         bsz = min(bsz, t)
         return float((bsz + 1) / 2.0 if causal else bsz)
 
     if sparsity == "dilated":
-        dilation = int(getattr(attn, "dilation", 0) or 0)
+        dilation = int(pattern.dilation or 0)
         dilation = max(1, dilation)
         eff = int(math.ceil(t / float(dilation)))
         return float((eff + 1) / 2.0 if causal else eff)
 
     if sparsity == "local_global":
-        w = int(getattr(attn, "sw", 0) or 0)
+        w = int(pattern.sw or 0)
         w = max(1, min(w, t))
-        gstride = int(getattr(attn, "global_stride", 0) or 0)
+        gstride = int(pattern.global_stride or 0)
         gstride = max(1, min(gstride, t))
         # Approximate average number of "global" keys available in the past.
         avg_globals = 0.5 * float(int(math.ceil(t / float(gstride))))
@@ -255,9 +255,9 @@ def _average_keys_per_query(attn: Any, *, seq_len: int) -> float:
         return float(min(base, t))
 
     if sparsity == "local_block":
-        w = int(getattr(attn, "sw", 0) or 0)
+        w = int(pattern.sw or 0)
         w = max(1, min(w, t))
-        bsz = int(getattr(attn, "block_size", 0) or 0)
+        bsz = int(pattern.block_size or 0)
         bsz = max(1, min(bsz, t))
         base = float(w + bsz)
         if causal:
@@ -463,14 +463,17 @@ class StaticChecker:
                 reasons.append("kv_policy.cache=latent requires kv_policy.latent_dim > 0")
         # Sanity bounds for new knobs
         for block in spec.model.blocks:
+            pattern = resolve_attention_pattern(block.attn) if block.attn is not None else None
             if block.attn:
+                if pattern is None:
+                    continue
                 kind = str(getattr(block.attn, "kind", "MHA") or "MHA").upper()
                 if kind == "LINEAR":
                     if getattr(block.attn, "selector", "none") != "none":
                         reasons.append("LINEAR attention does not support selector sparsity")
-                    if getattr(block.attn, "sparsity", "none") != "none":
+                    if pattern.sparsity != "none":
                         reasons.append("LINEAR attention does not support sparsity patterns")
-                    if getattr(block.attn, "sw", None) is not None:
+                    if pattern.sw is not None:
                         reasons.append("LINEAR attention does not support sliding_window")
                     if bool(getattr(block.attn, "alibi", False)):
                         reasons.append("LINEAR attention does not support ALiBi")
@@ -512,38 +515,49 @@ class StaticChecker:
                     reasons.append("heads must be divisible by kv_groups")
             if (
                 block.attn
-                and block.attn.block_size is not None
-                and block.attn.block_size > spec.data.seq_len
+                and pattern is not None
+                and pattern.block_size is not None
+                and pattern.block_size > spec.data.seq_len
             ):
                 reasons.append("block_size exceeds seq_len")
-            if block.attn and block.attn.block_stride is not None:
-                if block.attn.block_stride <= 0 or block.attn.block_stride > spec.data.seq_len:
+            if block.attn and pattern is not None and pattern.block_stride is not None:
+                if pattern.block_stride <= 0 or pattern.block_stride > spec.data.seq_len:
                     reasons.append("block_stride must be in (0, seq_len]")
-            if block.attn and block.attn.sw is not None and block.attn.sw <= 0:
+            if block.attn and pattern is not None and pattern.sw is not None and pattern.sw <= 0:
                 reasons.append("sliding_window must be > 0")
-            if block.attn and block.attn.sw is not None and block.attn.sw > spec.data.seq_len:
+            if (
+                block.attn
+                and pattern is not None
+                and pattern.sw is not None
+                and pattern.sw > spec.data.seq_len
+            ):
                 reasons.append("sliding_window exceeds seq_len")
-            if block.attn and block.attn.sparsity == "local_global":
-                if block.attn.sw is None or block.attn.sw <= 0:
+            if block.attn and pattern is not None and pattern.sparsity == "local_global":
+                if pattern.sw is None or pattern.sw <= 0:
                     reasons.append("local_global requires positive sliding_window (sw)")
                 if (
-                    block.attn.global_stride is None
-                    or block.attn.global_stride <= 0
-                    or block.attn.global_stride > spec.data.seq_len
+                    pattern.global_stride is None
+                    or pattern.global_stride <= 0
+                    or pattern.global_stride > spec.data.seq_len
                 ):
                     reasons.append("local_global requires 0 < global_stride <= seq_len")
-            if block.attn and block.attn.sparsity == "local_block":
-                if block.attn.sw is None or block.attn.sw <= 0:
+            if block.attn and pattern is not None and pattern.sparsity == "local_block":
+                if pattern.sw is None or pattern.sw <= 0:
                     reasons.append("local_block requires sliding_window (sw)")
-                if block.attn.block_size is None or block.attn.block_size <= 0:
+                if pattern.block_size is None or pattern.block_size <= 0:
                     reasons.append("local_block requires block_size > 0")
                 if (
-                    block.attn.block_stride is None
-                    or block.attn.block_stride <= 0
-                    or block.attn.block_stride > spec.data.seq_len
+                    pattern.block_stride is None
+                    or pattern.block_stride <= 0
+                    or pattern.block_stride > spec.data.seq_len
                 ):
                     reasons.append("local_block requires 0 < block_stride <= seq_len")
-            if block.attn and block.attn.dilation is not None and block.attn.dilation <= 0:
+            if (
+                block.attn
+                and pattern is not None
+                and pattern.dilation is not None
+                and pattern.dilation <= 0
+            ):
                 reasons.append("dilation must be > 0 when using dilated sparsity")
             for extra in block.extras:
                 if isinstance(extra, MemoryTokensConfig):

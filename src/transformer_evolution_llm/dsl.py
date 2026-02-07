@@ -477,7 +477,7 @@ class DenseFFNConfig(BaseModel):
 
     type: Literal["dense"] = "dense"
     hidden: int = Field(gt=0)
-    activation: Literal["silu", "gelu", "relu", "swiglu"] = "swiglu"
+    activation: Literal["silu", "gelu", "relu", "relu_squared", "swiglu"] = "swiglu"
     dropout: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
@@ -516,7 +516,7 @@ class MoEDenseExpertConfig(BaseModel):
 
     type: Literal["dense"] = "dense"
     hidden: int | None = Field(default=None, gt=0)
-    activation: Literal["silu", "gelu", "relu", "swiglu"] = "swiglu"
+    activation: Literal["silu", "gelu", "relu", "relu_squared", "swiglu"] = "swiglu"
     hops: int = Field(default=1, ge=1)
 
 
@@ -828,11 +828,15 @@ class TrainSchedule(BaseModel):
 class OptimizerConfig(BaseModel):
     """Optimizer selection and hyperparameters (non-evolvable by default)."""
 
-    name: Literal["adamw", "lion"] = "adamw"
+    name: Literal["adamw", "lion", "muon"] = "adamw"
     lr: float | None = Field(default=None, gt=0.0)
     betas: tuple[float, float] | None = None
     eps: float | None = Field(default=None, gt=0.0)
     weight_decay: float | None = Field(default=None, ge=0.0)
+    # Muon-specific knobs
+    muon_momentum: float | None = Field(default=None, ge=0.0, le=1.0)
+    muon_nesterov: bool = True
+    muon_ns_steps: int = Field(default=5, ge=1)
 
 
 class DatasetShard(BaseModel):
@@ -935,7 +939,7 @@ class EvolutionConfig(BaseModel):
     )
     rung1_tokens: int = 200_000
     rung2_tokens: int = 1_000_000
-    population: int = 12
+    population: int = Field(default=12, ge=1)
     topk_keep: float = Field(default=0.33, gt=0.0, le=1.0)
     crossover_prob: float = Field(default=0.2, ge=0.0, le=1.0)
     parent_selection: Literal[

@@ -25,6 +25,7 @@ from .dsl import (
     MoEFFNConfig,
     RecurrenceConfig,
     RetroConfig,
+    SoftmaxConfig,
     SSMConfig,
 )
 from .template_mutation import apply_template_mutation_with_name
@@ -1046,7 +1047,7 @@ def tune_ffn_width_activation(spec: ArchitectureSpec, rng: random.Random) -> Arc
         scale = rng.uniform(0.75, 1.5)
         new_hidden = max(256, min(int(hidden * scale), 8192))
         block.ffn.hidden = new_hidden
-    block.ffn.activation = rng.choice(["swiglu", "gelu", "silu", "relu"])
+    block.ffn.activation = rng.choice(["swiglu", "gelu", "silu", "relu", "relu_squared"])
     return child
 
 
@@ -1108,6 +1109,50 @@ def toggle_qk_norm(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSp
         attn.qk_norm_max = rng.choice([0.5, 1.0, 2.0, 4.0])
     else:
         attn.qk_norm_max = None
+    return child
+
+
+def tune_softmax_policy(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Mutate softmax policy: toggle softcap, qk_norm type, or qk_scale."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.attn is not None]
+    if not blocks:
+        return child
+    b = rng.choice(blocks)
+    attn = b.attn
+    if attn is None:
+        return child
+    # Ensure softmax config exists
+    if attn.softmax is None:
+        attn.softmax = SoftmaxConfig()
+    aspect = rng.choice(["softcap", "qk_norm", "qk_scale"])
+    if aspect == "softcap":
+        if attn.softmax.softcap is None:
+            attn.softmax.softcap = rng.choice([30.0, 50.0, 80.0])
+        else:
+            attn.softmax.softcap = None
+    elif aspect == "qk_norm":
+        attn.softmax.qk_norm = rng.choice(["none", "rms", "layer"])
+    else:
+        if attn.softmax.qk_scale is None:
+            attn.softmax.qk_scale = rng.choice([0.05, 0.1, 0.125, 0.15])
+        else:
+            attn.softmax.qk_scale = None
+    return child
+
+
+def toggle_value_glu(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Toggle value GLU gating on a random attention block."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.attn is not None]
+    if not blocks:
+        return child
+    b = rng.choice(blocks)
+    attn = b.attn
+    if attn is None:
+        return child
+    current = bool(getattr(attn, "value_glu", False) or False)
+    attn.value_glu = not current
     return child
 
 
@@ -1291,6 +1336,8 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_router_coeffs": tune_router_coeffs,
     "tune_retro": tune_retro,
     "toggle_qk_norm": toggle_qk_norm,
+    "tune_softmax_policy": tune_softmax_policy,
+    "toggle_value_glu": toggle_value_glu,
     "add_recurrence": add_recurrence,
     "tune_recurrence": tune_recurrence,
     "graph_jitter": graph_jitter,

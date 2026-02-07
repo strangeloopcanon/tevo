@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from transformer_evolution_llm import api
 from transformer_evolution_llm.dsl import (
     ArchitectureSpec,
@@ -110,3 +112,10 @@ def test_hyper_connections_roundtrip(tiny_spec: ArchitectureSpec, tmp_path: Path
     assert loaded.model.hyper is not None
     assert loaded.model.hyper.streams == 4
     assert loaded.summary()["hyper_streams"] == 4
+
+
+def test_evolution_population_must_be_positive(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.evolution.population = 0
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        ArchitectureSpec.model_validate(spec.model_dump(mode="python"))

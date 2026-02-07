@@ -1,6 +1,7 @@
-from transformer_evolution_llm.dsl import ArchitectureSpec, HyperConnectionsConfig
+from transformer_evolution_llm.dsl import ArchitectureSpec, HyperConnectionsConfig, StencilConfig
 from transformer_evolution_llm.evaluation import (
     StaticChecker,
+    estimate_flops_per_token,
     estimate_params,
     kv_bytes_per_token,
     throughput_proxy,
@@ -53,3 +54,38 @@ def test_estimate_params_includes_hyper_connections(tiny_spec: ArchitectureSpec)
     hyper = estimate_params(spec)
     expected = float(spec.model.n_layers * (4 * 4 + 2 * 4) + 4)
     assert hyper == base + expected
+
+
+def test_estimate_flops_interprets_stencil_like_equivalent_sparsity(
+    tiny_spec: ArchitectureSpec,
+) -> None:
+    direct = tiny_spec.model_copy(deep=True)
+    block_direct = direct.model.blocks[0]
+    assert block_direct.attn is not None
+    block_direct.attn.sparsity = "local_global"
+    block_direct.attn.sw = 8
+    block_direct.attn.global_stride = 16
+
+    stencil = tiny_spec.model_copy(deep=True)
+    block_stencil = stencil.model.blocks[0]
+    assert block_stencil.attn is not None
+    block_stencil.attn.sparsity = "none"
+    block_stencil.attn.sw = None
+    block_stencil.attn.global_stride = None
+    block_stencil.attn.stencil = StencilConfig(kind="hybrid", window=8, globals=16)
+
+    assert estimate_flops_per_token(direct) == estimate_flops_per_token(stencil)
+
+
+def test_static_checker_validates_local_global_from_stencil(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    block = spec.model.blocks[0]
+    assert block.attn is not None
+    block.attn.sparsity = "none"
+    block.attn.sw = None
+    block.attn.global_stride = None
+    block.attn.stencil = StencilConfig(kind="hybrid")
+
+    result = StaticChecker().run(spec)
+    assert not result.ok
+    assert any("local_global requires positive sliding_window" in r for r in result.reasons)
