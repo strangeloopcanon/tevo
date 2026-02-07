@@ -30,6 +30,23 @@ TEVO_MODAL_GPU=A10G modal run scripts/modal_run_benchmark.py \
 
 This writes `summary.json` + `history.json` into a persisted volume and downloads them to `runs/modal/<run_id>/` when `--download` is set.
 
+## Nanochat-style FineWeb matrix (staggered budgets)
+```bash
+./run_nanochat_fineweb_modal_matrix.sh
+```
+
+This script:
+- prepares packed FineWeb-EDU data on Modal (`karpathy/fineweb-edu-100b-shuffle`)
+- launches a multi-seed evolution matrix using
+  `configs/exp_nanochat_gpt2grade_d20_modal_evolve_fineweb_staggered_gpt2vocab_aeff095e.yaml`
+- downloads frontier/state/lineage artifacts to `runs/modal/`
+
+Use env overrides for cost control:
+```bash
+TEVO_MODAL_GPU=A10G TEVO_GENERATIONS=12 TEVO_STEPS=160 TEVO_SEEDS=0,1 \
+  ./run_nanochat_fineweb_modal_matrix.sh
+```
+
 <details>
 <summary>GPU presets (A10G / A100)</summary>
 
