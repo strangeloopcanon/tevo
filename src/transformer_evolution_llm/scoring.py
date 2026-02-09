@@ -158,6 +158,95 @@ def graph_entropy(spec: ArchitectureSpec) -> float:
     return float(entropy + 0.05 * diversity + 0.1 * depth_bonus)
 
 
+def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
+    """Encode architecture structure as a fixed-size novelty descriptor."""
+    layers = max(1, int(spec.model.n_layers))
+    moe_blocks = 0
+    ssm_blocks = 0
+    selector_blocks = 0
+    linear_blocks = 0
+    mla_blocks = 0
+    sparse_blocks = 0
+    qk_norm_blocks = 0
+    extras_total = 0
+    head_dim_sum = 0.0
+    kv_groups_sum = 0.0
+    attn_blocks = 0
+
+    for block in spec.model.blocks:
+        if getattr(block.ffn, "type", "dense") == "moe":
+            moe_blocks += 1
+        if block.ssm is not None:
+            ssm_blocks += 1
+        extras_total += len(block.extras)
+        attn = block.attn
+        if attn is None:
+            continue
+        attn_blocks += 1
+        kind = str(getattr(attn, "kind", "MHA") or "MHA").upper()
+        if kind == "LINEAR":
+            linear_blocks += 1
+        if kind == "MLA":
+            mla_blocks += 1
+        if str(getattr(attn, "selector", "none") or "none") != "none":
+            selector_blocks += 1
+        if getattr(attn, "qk_norm_max", None) is not None:
+            qk_norm_blocks += 1
+        pattern = resolve_attention_pattern(attn)
+        if pattern.sparsity != "none":
+            sparse_blocks += 1
+        head_dim_sum += float(getattr(attn, "head_dim", 0) or 0)
+        kv_groups_sum += float(getattr(attn, "kv_groups", 1) or 1)
+
+    recurrences = len(spec.model.recurrences)
+    attn_den = float(max(1, attn_blocks))
+    layers_f = float(layers)
+    descriptor = [
+        layers_f,
+        float(moe_blocks) / layers_f,
+        float(ssm_blocks) / layers_f,
+        float(selector_blocks) / layers_f,
+        float(linear_blocks) / layers_f,
+        float(mla_blocks) / layers_f,
+        float(sparse_blocks) / layers_f,
+        float(extras_total) / layers_f,
+        float(recurrences) / layers_f,
+        head_dim_sum / attn_den,
+        kv_groups_sum / attn_den,
+        graph_entropy(spec),
+    ]
+    return descriptor
+
+
+def archive_novelty(
+    descriptor: list[float],
+    archive: list[list[float]],
+    *,
+    k: int = 15,
+) -> float:
+    """Compute novelty as average distance to k nearest archive descriptors."""
+    if not archive:
+        return 0.0
+    if not descriptor:
+        return 0.0
+    k_eff = max(1, min(int(k), len(archive)))
+    distances: list[float] = []
+    for item in archive:
+        dim = min(len(descriptor), len(item))
+        if dim <= 0:
+            continue
+        total = 0.0
+        for idx in range(dim):
+            delta = float(descriptor[idx]) - float(item[idx])
+            total += delta * delta
+        distances.append(math.sqrt(total))
+    if not distances:
+        return 0.0
+    distances.sort()
+    nearest = distances[:k_eff]
+    return float(sum(nearest) / len(nearest))
+
+
 def compute_composite(comp: CompositeMetricConfig, metrics: dict[str, float]) -> float | None:
     """Evaluate a single composite metric expression against a metrics dict."""
     try:

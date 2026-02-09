@@ -126,6 +126,13 @@ def main(
         None,
         help="Optional mutation weights as name=weight (repeatable). Example: --mutation-weight dense_to_moe=3.0",
     ),
+    mutation_plugin: list[str] = typer.Option(
+        None,
+        help=(
+            "Optional importable modules that register extra mutations "
+            "(repeatable). Example: --mutation-plugin my_pkg.evo_mutations"
+        ),
+    ),
     mutation_steps: int = typer.Option(
         1,
         min=1,
@@ -224,6 +231,17 @@ def main(
                 continue
         if weights:
             runner.mutation_weights = weights
+    if mutation_plugin:
+        runner.cfg.mutation_plugins = [
+            *list(getattr(runner.cfg, "mutation_plugins", []) or []),
+            *[str(item) for item in mutation_plugin if str(item).strip()],
+        ]
+        # Runner loads plugins during initialization; apply here for immediate effect too.
+        from transformer_evolution_llm.mutations import load_mutation_plugins, register_template_mutations
+
+        load_mutation_plugins(runner.cfg.mutation_plugins)
+        if bool(getattr(runner.cfg, "register_template_entries", True)):
+            register_template_mutations()
     runner.mutation_steps = mutation_steps
     # Override selection strategy from CLI if provided
     if parent_selection is not None:
@@ -292,6 +310,7 @@ def main(
         "checkpoint_dir": str(checkpoint_dir.resolve()),
         "seed": seed,
         "parent_selection": parent_selection,
+        "mutation_plugins": list(getattr(runner.cfg, "mutation_plugins", []) or []),
         "score_weights": {
             "ppl": score_weight_ppl,
             "throughput": score_weight_throughput,

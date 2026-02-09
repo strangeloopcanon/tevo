@@ -25,6 +25,8 @@ class Candidate:
     status: Status = "pending"
     metrics: dict[str, float] = field(default_factory=dict)
     checkpoint: Path | None = None
+    mutation_trace: list[str] = field(default_factory=list)
+    crossover_report: dict[str, Any] | None = None
 
     def record_metric(self, name: str, value: float) -> None:
         self.metrics[name] = value
@@ -57,6 +59,8 @@ class Candidate:
             "metrics": self.metrics,
             "spec": self.spec.model_dump(mode="python"),
             "checkpoint": str(self.checkpoint) if self.checkpoint else None,
+            "mutation_trace": self.mutation_trace,
+            "crossover_report": self.crossover_report,
         }
 
     @classmethod
@@ -75,6 +79,13 @@ class Candidate:
         metrics = data.get("metrics", {}) or {}
         if not isinstance(metrics, dict):
             metrics = {}
+        mutation_trace = data.get("mutation_trace", []) or []
+        if not isinstance(mutation_trace, list):
+            mutation_trace = []
+        mutation_trace = [str(name) for name in mutation_trace if isinstance(name, str)]
+        crossover_report = data.get("crossover_report")
+        if not isinstance(crossover_report, dict):
+            crossover_report = None
         return cls(
             ident=ident,
             spec=ArchitectureSpec(**spec_data),
@@ -85,6 +96,8 @@ class Candidate:
             status=data.get("status", "pending"),
             metrics=metrics,
             checkpoint=checkpoint,
+            mutation_trace=mutation_trace,
+            crossover_report=crossover_report,
         )
 
 

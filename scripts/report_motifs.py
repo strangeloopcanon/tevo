@@ -229,7 +229,11 @@ def main() -> None:
     print(f"Frontier entries: {n}")
 
     if args.lineage is not None:
-        lineage = json.loads(args.lineage.read_text())
+        payload = json.loads(args.lineage.read_text())
+        if isinstance(payload, dict):
+            lineage = payload.get("nodes", [])
+        else:
+            lineage = payload
         if not isinstance(lineage, list):
             raise SystemExit("lineage JSON must be a list of entries")
         completed = [

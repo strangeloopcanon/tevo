@@ -697,6 +697,8 @@ class BlockConfig(BaseModel):
     """Single transformer block definition."""
 
     name: str | None = None
+    origin_id: str | None = None
+    parent_origin: str | None = None
     attn: AttentionConfig | None = None
     ffn: FfnConfig | None = None
     ssm: SSMConfig | None = None
@@ -931,12 +933,20 @@ class ModelConfig(BaseModel):
         return sum(1 for block in self.blocks if isinstance(block.ffn, MoEFFNConfig))
 
 
+class GateStep(BaseModel):
+    """Threshold overrides activated at a specific generation."""
+
+    generation: int = Field(ge=0)
+    thresholds: dict[str, float] = Field(default_factory=dict)
+
+
 class EvolutionConfig(BaseModel):
     """Tunable parameters governing mutation + selection."""
 
     rung0_thresholds: dict[str, float] = Field(
         default_factory=lambda: {"gate_entropy_min": 1.0, "gate_entropy_max": 3.0}
     )
+    gate_schedule: list[GateStep] = Field(default_factory=list)
     rung1_tokens: int = 200_000
     rung2_tokens: int = 1_000_000
     population: int = Field(default=12, ge=1)
@@ -967,6 +977,8 @@ class EvolutionConfig(BaseModel):
     promotion_min_recurrence_gain: float = Field(default=0.0)
     promotion_max_instability: float | None = Field(default=None, ge=0.0)
     archive_max_elites: int = Field(default=0, ge=0)
+    map_elites_complexity_band: bool = False
+    complexity_band_width: float = Field(default=4.0, gt=0.0)
     structural_elite_k: int = Field(default=2, ge=0)
     structural_elite_weights: dict[str, float] | None = None
     adaptive_mutation: bool = False
@@ -979,6 +991,16 @@ class EvolutionConfig(BaseModel):
     adaptive_mutation_min_weight: float = Field(default=0.05, gt=0.0)
     adaptive_mutation_max_weight: float = Field(default=5.0, gt=0.0)
     weight_inheritance: Literal["parent", "init", "scratch"] = "parent"
+    register_template_entries: bool = Field(
+        default=True,
+        description="Register persisted template mutations as first-class mutation entries.",
+    )
+    mutation_plugins: list[str] = Field(
+        default_factory=list,
+        description="Importable Python modules that register extra mutations at runtime.",
+    )
+    novelty_archive_k: int = Field(default=15, ge=1)
+    novelty_archive_max: int = Field(default=500, ge=1)
     # Adaptive rung budgets: promote/demote candidates based on improvement rate
     adaptive_rung_budget: bool = Field(
         default=False,
@@ -1008,6 +1030,17 @@ class EvolutionConfig(BaseModel):
     def validate_rung_tokens(self) -> EvolutionConfig:
         if self.rung1_tokens > self.rung2_tokens:
             raise ValueError("evolution.rung1_tokens must be <= evolution.rung2_tokens")
+        return self
+
+    @model_validator(mode="after")
+    def validate_gate_schedule(self) -> EvolutionConfig:
+        if not self.gate_schedule:
+            return self
+        generations = [int(step.generation) for step in self.gate_schedule]
+        if generations != sorted(generations):
+            raise ValueError("evolution.gate_schedule must be sorted by generation")
+        if len(set(generations)) != len(generations):
+            raise ValueError("evolution.gate_schedule cannot contain duplicate generations")
         return self
 
 

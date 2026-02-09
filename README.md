@@ -18,19 +18,21 @@ The goal is to use laptop-scale surrogates (~65–100M params) as a fast feedbac
 ## Key Features
 
 - **Typed DSL**: Architectures are defined in YAML/JSON using a strict Pydantic-based schema (`src/transformer_evolution_llm/dsl.py`), ensuring all generated candidates are valid by construction.
-- **Weight Inheritance + Checkpoint-Aware Crossover**: Children can inherit parent weights; crossover attempts to merge state dicts so you don’t always restart from scratch.
-- **Multi-Objective Optimization**: Maintains a Pareto frontier over metrics like perplexity, throughput, RAM proxy, and structural complexity.
-- **Rich Mutation Primitives**: Includes structural mutations (add/remove blocks, split layers), component swaps (Attention ↔ MoE ↔ SSM), and hyperparameter tuning.
+- **Aligned Crossover + Checkpoint Merge Reports**: Crossover aligns blocks by structural similarity and lineage IDs (`origin_id`/`parent_origin`), then merges checkpoints using that alignment with per-child transfer reports.
+- **Archive Novelty + Multi-Objective Optimization**: Maintains a Pareto frontier and can score novelty via archive kNN sparseness (with parent-relative novelty kept as a diagnostic metric).
+- **Rich Mutation Primitives (Grow + Shrink)**: Includes additive and simplifying operators (for example `remove_block_span`, `moe_to_dense`, `strip_extras`, `remove_recurrence`, `simplify_attention`) plus component/hyperparameter mutations.
+- **Extensible Mutation Registry**: Built-ins, template mutations (`tpl::...`) and runtime plugin mutations can all be registered for autonomous selection and adaptive weighting.
+- **Progressive Complexity Schedules**: Optional `gate_schedule` supports generation-based threshold ramps; MAP-Elites can optionally include complexity bands in archive keys.
 - **Template Learning (experimental)**: Optionally adjusts and persists mutation templates based on which template mutations improve objectives (`evolution.template_learning`, `evolution.template_learning_save_path`).
 - **Graph Module Primitive (experimental)**: A built-in `graph_module` component that can be inserted as a custom extra so search can explore small operator graphs, not just fixed blocks.
-- **Audit Lineage**: Every discovery comes with a full JSON lineage and visualization tools, explaining exactly *how* a specific architecture was derived.
+- **Audit Lineage**: Every discovery comes with a full lineage payload (`nodes`, mutation traces, crossover reports, novelty archive snapshot) plus visualization tools.
 - **NanoGPT-style benchmark path (implemented)**: A repeatable speedrun-style metric (`tokens/time to target`) for comparing training efficiency inside this repo (see `docs/nanogpt_benchmark.md`).
 
 ## What You Get From A Run
 
 A run writes a small set of artifacts under `runs/<run_id>/`:
 - `frontier.json`: the non-dominated candidates (each has a full `spec` + `metrics` + `id`).
-- `lineage.json` / `frontier_lineage.json`: parent links and mutation/crossover history.
+- `lineage.json` / `frontier_lineage.json`: lineage payload with `nodes` (parent links, mutation traces, crossover reports) and novelty archive state.
 - `frontier.manifest.json`: the run recipe + environment snapshot.
 - `checkpoints/` (optional): model checkpoints (often pruned to frontier-only).
 
@@ -42,6 +44,19 @@ See “Run Folder: What’s What” below for the full list.
 - **Short-budget proxies:** most metrics come from short surrogate training. Expect the frontier to move when you increase data, steps, or change objectives.
 - **Not a leaderboard:** the NanoGPT-style benchmark is for repeatable *within-repo* comparisons. The micro-benchmark numbers in this README used a tiny packed OpenWebText subset; regenerate a larger cache before drawing conclusions.
 - **Not interpretability tooling:** this repo can discover motifs; it does not (yet) provide mechanistic explanations for why a motif works.
+
+## Practical NAS vs NEAT-Lineage Modes
+
+So what: this repo supports both "practical constrained NAS" and "more open-ended lineage pressure" without maintaining separate code paths.
+
+- **Practical constrained NAS (default posture):**
+  - Fixed `rung0_thresholds`, stronger quality/efficiency objectives, and selection tuned for stable gains.
+  - Best when you want reproducible improvements around a known baseline family.
+- **NEAT-lineage exploration posture (config-driven):**
+  - Enable `gate_schedule`, novelty-heavy objectives, MAP-Elites complexity banding, and broader mutation mix.
+  - Best when you want multiple structurally distinct lineages and gradual complexification pressure.
+
+In both modes, the search space is still bounded by the DSL + registered mutations.
 
 <details>
 <summary>Extending the search space (adding a new primitive)</summary>
@@ -374,6 +389,37 @@ evolution:
     novelty: max
     graph_entropy: max
     throughput: max
+```
+
+### Profile D: Progressive NEAT-Lineage Exploration
+
+Use when you want minimal-to-complex pressure, novelty niches, and broader structural exploration in one run.
+
+```yaml
+evolution:
+  rung0_thresholds:
+    max_params: 160000000
+    max_kv_bytes_per_token: 50000
+    min_throughput_proxy: 0.8
+    min_layers: 2
+  gate_schedule:
+    - generation: 0
+      thresholds: { min_layers: 2 }
+    - generation: 15
+      thresholds: { min_layers: 4, min_moe_blocks: 1 }
+    - generation: 30
+      thresholds: { min_layers: 8, min_moe_blocks: 2 }
+  parent_selection: map_elites
+  map_elites_complexity_band: true
+  complexity_band_width: 4.0
+  topk_keep: 0.8
+  crossover_prob: 0.35
+  adaptive_mutation: true
+  register_template_entries: true
+  objectives:
+    ppl_code: min
+    novelty: max
+    graph_entropy: max
 ```
 
 ### Parent Selection Cheat Sheet
