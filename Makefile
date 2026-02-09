@@ -1,4 +1,5 @@
-SHELL := /bin/zsh
+# Keep recipes portable across macOS + Ubuntu CI (GitHub runners don't include /bin/zsh by default).
+SHELL := /bin/sh
 PYTHON ?= python3
 VENV := .venv
 VENV_BIN := $(VENV)/bin
