@@ -1,0 +1,670 @@
+model:
+  name: exp-titan-like-memory-modal-test-v1
+  emb:
+    dim: 512
+    vocab: 50257
+    rope: null
+    dropout: 0.0
+  blocks:
+  - name: block-0
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: dsa
+      selector_topk: 64
+      selector_heads: 2
+      selector_dim: 64
+      selector_rope: partial
+      selector_detach: true
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 256
+      stride: 32
+      aggregator: gate
+      gating_weight: 0.25
+  - name: block-1
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: none
+      selector_topk: null
+      selector_heads: null
+      selector_dim: null
+      selector_rope: none
+      selector_detach: false
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 256
+      stride: 32
+      aggregator: gate
+      gating_weight: 0.25
+  - name: block-2
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: dsa
+      selector_topk: 64
+      selector_heads: 2
+      selector_dim: 64
+      selector_rope: partial
+      selector_detach: true
+    ffn:
+      type: moe
+      hidden: 2048
+      n_experts: 32
+      k: 4
+      capacity_factor: 1.2
+      balance: 0.05
+      shared: 1
+      router_temperature: null
+      router_type: sigmoid
+      router_bias_detached: true
+      shared_expert: true
+      router_aux_weight: null
+      router_lb_weight: null
+      drop_policy: none
+      experts: []
+    ssm: null
+    extras: []
+  - name: block-3
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: none
+      selector_topk: null
+      selector_heads: null
+      selector_dim: null
+      selector_rope: none
+      selector_detach: false
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 512
+      stride: 64
+      aggregator: gate
+      gating_weight: 0.3
+  - name: block-4
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: dsa
+      selector_topk: 64
+      selector_heads: 2
+      selector_dim: 64
+      selector_rope: partial
+      selector_detach: true
+    ffn:
+      type: moe
+      hidden: 2048
+      n_experts: 32
+      k: 4
+      capacity_factor: 1.2
+      balance: 0.05
+      shared: 1
+      router_temperature: null
+      router_type: sigmoid
+      router_bias_detached: true
+      shared_expert: true
+      router_aux_weight: null
+      router_lb_weight: null
+      drop_policy: none
+      experts: []
+    ssm: null
+    extras: []
+  - name: block-5
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: none
+      selector_topk: null
+      selector_heads: null
+      selector_dim: null
+      selector_rope: none
+      selector_detach: false
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 256
+      stride: 32
+      aggregator: gate
+      gating_weight: 0.25
+  - name: block-6
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: dsa
+      selector_topk: 64
+      selector_heads: 2
+      selector_dim: 64
+      selector_rope: partial
+      selector_detach: true
+    ffn:
+      type: moe
+      hidden: 2048
+      n_experts: 32
+      k: 4
+      capacity_factor: 1.2
+      balance: 0.05
+      shared: 1
+      router_temperature: null
+      router_type: sigmoid
+      router_bias_detached: true
+      shared_expert: true
+      router_aux_weight: null
+      router_lb_weight: null
+      drop_policy: none
+      experts: []
+    ssm: null
+    extras: []
+  - name: block-7
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: none
+      selector_topk: null
+      selector_heads: null
+      selector_dim: null
+      selector_rope: none
+      selector_detach: false
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 512
+      stride: 64
+      aggregator: gate
+      gating_weight: 0.3
+  - name: block-8
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: dsa
+      selector_topk: 64
+      selector_heads: 2
+      selector_dim: 64
+      selector_rope: partial
+      selector_detach: true
+    ffn:
+      type: moe
+      hidden: 2048
+      n_experts: 32
+      k: 4
+      capacity_factor: 1.2
+      balance: 0.05
+      shared: 1
+      router_temperature: null
+      router_type: sigmoid
+      router_bias_detached: true
+      shared_expert: true
+      router_aux_weight: null
+      router_lb_weight: null
+      drop_policy: none
+      experts: []
+    ssm: null
+    extras: []
+  - name: block-9
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: none
+      selector_topk: null
+      selector_heads: null
+      selector_dim: null
+      selector_rope: none
+      selector_detach: false
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 256
+      stride: 32
+      aggregator: gate
+      gating_weight: 0.25
+  - name: block-10
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: dsa
+      selector_topk: 64
+      selector_heads: 2
+      selector_dim: 64
+      selector_rope: partial
+      selector_detach: true
+    ffn:
+      type: moe
+      hidden: 2048
+      n_experts: 32
+      k: 4
+      capacity_factor: 1.2
+      balance: 0.05
+      shared: 1
+      router_temperature: null
+      router_type: sigmoid
+      router_bias_detached: true
+      shared_expert: true
+      router_aux_weight: null
+      router_lb_weight: null
+      drop_policy: none
+      experts: []
+    ssm: null
+    extras: []
+  - name: block-11
+    attn:
+      kind: GQA
+      heads: 8
+      head_dim: 64
+      rope: yarn
+      rope_theta: null
+      sw: 96
+      kv_groups: 2
+      dropout: 0.0
+      qk_norm_max: null
+      gating_pos: none
+      gating_op: dense
+      sparsity: local_global
+      block_size: null
+      block_stride: null
+      global_stride: 64
+      dilation: null
+      selector: none
+      selector_topk: null
+      selector_heads: null
+      selector_dim: null
+      selector_rope: none
+      selector_detach: false
+    ffn:
+      type: dense
+      hidden: 2048
+      activation: swiglu
+      dropout: 0.0
+    ssm: null
+    extras:
+    - type: retro
+      memory_tokens: 512
+      stride: 64
+      aggregator: gate
+      gating_weight: 0.3
+  head:
+    tie_embeddings: true
+    vocab: 50257
+  norm: layernorm
+  recurrences:
+  - start: 2
+    end: 8
+    adapter: linear
+    adapter_dim: null
+    concat_prelude: true
+    init_state: zeros
+    noise_std: 0.02
+    train_recurrence: 1
+    max_train_recurrence: 4
+    curriculum_fraction: 0.25
+    test_recurrences:
+    - 1
+    - 2
+    - 4
+    - 8
+  - start: 4
+    end: 12
+    adapter: gated
+    adapter_dim: null
+    concat_prelude: false
+    init_state: noise
+    noise_std: 0.03
+    train_recurrence: 1
+    max_train_recurrence: 6
+    curriculum_fraction: 0.3
+    test_recurrences:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+  - start: 9
+    end: 11
+    adapter: linear
+    adapter_dim: null
+    concat_prelude: true
+    init_state: zeros
+    noise_std: 0.015
+    train_recurrence: 1
+    max_train_recurrence: 4
+    curriculum_fraction: 0.2
+    test_recurrences:
+    - 1
+    - 2
+    - 4
+    - 8
+train:
+  lr: 0.0008
+  warmup: 500
+  clip: 1.0
+  bf16: false
+  grad_checkpoint: true
+  max_tokens: 180000
+  weight_decay: 0.02
+  seed: 4242
+  router_lb_coeff: 0.01
+  router_entropy_coeff: 0.005
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 500.0
+  no_improve_patience: 40
+  improvement_tolerance: 0.001
+  ppl_stop_threshold: null
+  passkey_eval_steps: 6
+  passkey_eval_batches: 2
+  passkey_eval_seq_len: 512
+  passkey_eval_min_distance: 384
+  passkey_eval_batch_size: 1
+  passkey_eval_lr: 0.001
+  passkey_eval_vocab_limit: 256
+  init_checkpoint: null
+  optimizer:
+    name: adamw
+    lr: null
+    betas: null
+    eps: null
+    weight_decay: null
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  packed: true
+  packed_train_path: runs/packed/openwebtext_10m/train.bin
+  packed_val_path: runs/packed/openwebtext_10m/val.bin
+  packed_dtype: uint16
+  seq_len: 512
+  batch_size: 1
+  workers: 0
+  shards: []
+  eval_tokens: 32768
+  healing_shards: []
+  healing_tokens: null
+evolution:
+  rung0_thresholds:
+    gate_entropy_min: 0.0
+    gate_entropy_max: 4.0
+    min_layers: 8.0
+    min_moe_blocks: 2.0
+    min_selector_blocks: 1.0
+    min_memory_blocks: 2.0
+    min_recurrences: 1.0
+  gate_schedule:
+  - generation: 0
+    thresholds:
+      min_layers: 8.0
+      min_moe_blocks: 2.0
+      min_selector_blocks: 1.0
+      min_memory_blocks: 2.0
+      min_recurrences: 1.0
+  - generation: 4
+    thresholds:
+      min_layers: 10.0
+      min_moe_blocks: 2.0
+      min_selector_blocks: 2.0
+      min_memory_blocks: 3.0
+      min_recurrences: 2.0
+  - generation: 6
+    thresholds:
+      min_layers: 12.0
+      min_moe_blocks: 3.0
+      min_selector_blocks: 2.0
+      min_memory_blocks: 4.0
+      min_recurrences: 2.0
+  rung1_tokens: 90000
+  rung2_tokens: 180000
+  population: 10
+  topk_keep: 0.6
+  crossover_prob: 0.45
+  parent_selection: map_elites
+  archive_max_elites: 32
+  map_elites_complexity_band: true
+  complexity_band_width: 3.0
+  adaptive_mutation: true
+  adaptive_mutation_eta: 0.1
+  adaptive_mutation_min_weight: 0.05
+  adaptive_mutation_max_weight: 5.0
+  weight_inheritance: parent
+  register_template_entries: true
+  novelty_archive_k: 15
+  novelty_archive_max: 500
+  pareto_objectives:
+  - ppl_code
+  - passkey_loss
+  - long_recall
+  - recurrence_gain
+  - memory_blocks
+  - recurrences
+  - throughput
+  - novelty
+  - graph_entropy
+  objectives:
+    ppl_code: min
+    passkey_loss: min
+    long_recall: max
+    recurrence_gain: max
+    memory_blocks: max
+    recurrences: max
+    throughput: max
+    novelty: max
+    graph_entropy: max
+    instability: min
+  composite_metrics:
+  - name: ppl_per_long_recall
+    op: ratio
+    numerator: ppl_code
+    denominator: long_recall
+    terms: {}
+    epsilon: 0.1
+  promotion_prob: 0.5
+  promotion_min_layers: 10
+  promotion_min_moe_blocks: 3
+  promotion_steps_multiplier: 1.5
+  promotion_tokens_multiplier: 1.5
+  promotion_min_router_entropy: 0.0
+  promotion_min_recurrence_gain: 0.0
+  promotion_max_instability: null
+  structural_elite_k: 4
+  structural_elite_weights:
+    layers: 1.0
+    moe_blocks: 3.0
+    selector_blocks: 2.0
+  template_learning: true
+  template_learning_eta: 0.2
+  template_learning_min_weight: 0.05
+  template_learning_max_weight: 5.0
+  template_learning_max_templates: 128
+  template_learning_save_every: 20
+  template_learning_save_path: runs/template_learning/exp_titan_like_memory_modal_test_v1_templates.json
+  template_learning_promote_min_delta: 0.0
+priors:
+  tokens_per_param: 4.0
+  window_scale: 6.0
+  rope_theta_default: 10000.0
+  prior_weight: 0.0
+  compute_penalty_weight: 0.0
