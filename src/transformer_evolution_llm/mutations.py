@@ -258,6 +258,7 @@ def dense_to_moe(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
     # Evolution can later scale experts up via tune_experts.
     n_experts = int(rng.choice([8, 12, 16]))
     block.ffn = MoEFFNConfig(
+        input_source=str(getattr(dense, "input_source", "residual") or "residual"),
         hidden=dense.hidden,
         n_experts=n_experts,
         k=2,
@@ -1198,6 +1199,78 @@ def tune_ffn_width_activation(spec: ArchitectureSpec, rng: random.Random) -> Arc
     return child
 
 
+def toggle_ffn_input_source(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Toggle whether a block's FFN reads from the residual stream or token embeddings."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.ffn is not None]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    ffn = block.ffn
+    if ffn is None:
+        return child
+    current = str(getattr(ffn, "input_source", "residual") or "residual")
+    ffn.input_source = "embedding" if current != "embedding" else "residual"
+    return child
+
+
+def add_embedding_ffn_branch(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Add a secondary FFN branch that can read from token embeddings."""
+    child = clone_spec(spec)
+    blocks = [
+        b
+        for b in child.model.blocks
+        if b.ffn is not None and getattr(b, "ffn_memory", None) is None
+    ]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    d_model = int(child.model.emb.dim)
+    hidden = int(rng.choice([2 * d_model, 4 * d_model]))
+    activation = "swiglu"
+    if isinstance(block.ffn, DenseFFNConfig):
+        activation = str(getattr(block.ffn, "activation", activation) or activation)
+    block.ffn_memory = DenseFFNConfig(
+        input_source="embedding",
+        hidden=max(256, hidden),
+        activation=activation,
+        dropout=0.0,
+    )
+    return child
+
+
+def remove_embedding_ffn_branch(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Remove an optional secondary embedding-conditioned FFN branch."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if getattr(b, "ffn_memory", None) is not None]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    block.ffn_memory = None
+    return child
+
+
+def tune_embedding_ffn_branch(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Adjust the embedding-conditioned FFN branch size/activation if present."""
+    child = clone_spec(spec)
+    blocks = [
+        b for b in child.model.blocks if isinstance(getattr(b, "ffn_memory", None), DenseFFNConfig)
+    ]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    ffn = getattr(block, "ffn_memory", None)
+    if not isinstance(ffn, DenseFFNConfig):
+        return child
+    hidden = int(ffn.hidden)
+    if hidden > 0:
+        scale = rng.uniform(0.75, 1.5)
+        new_hidden = max(256, min(int(hidden * scale), 8192))
+        ffn.hidden = new_hidden
+    ffn.activation = rng.choice(["swiglu", "gelu", "silu", "relu", "relu_squared"])
+    return child
+
+
 def tune_router_coeffs(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     """Jitter MoE router temperatures and load-balance coefficients."""
     child = clone_spec(spec)
@@ -1363,6 +1436,7 @@ def moe_to_dense(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
         return child
     hidden = int(block.ffn.hidden)
     block.ffn = DenseFFNConfig(
+        input_source=str(getattr(block.ffn, "input_source", "residual") or "residual"),
         hidden=hidden,
         activation=rng.choice(["swiglu", "gelu", "silu", "relu", "relu_squared"]),
         dropout=0.0,
@@ -1567,6 +1641,10 @@ BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "tune_attn_shape": tune_attn_shape,
     "tune_attn_sparsity": tune_attn_sparsity,
     "tune_ffn_width_activation": tune_ffn_width_activation,
+    "toggle_ffn_input_source": toggle_ffn_input_source,
+    "add_embedding_ffn_branch": add_embedding_ffn_branch,
+    "remove_embedding_ffn_branch": remove_embedding_ffn_branch,
+    "tune_embedding_ffn_branch": tune_embedding_ffn_branch,
     "tune_router_coeffs": tune_router_coeffs,
     "tune_retro": tune_retro,
     "toggle_qk_norm": toggle_qk_norm,

@@ -47,6 +47,18 @@ def structural_distance(a: ArchitectureSpec, b: ArchitectureSpec) -> float:
         tb = getattr(bb.ffn, "type", None) if bb.ffn else None
         if ta != tb:
             diff += 1.0
+        sa = getattr(ba.ffn, "input_source", "residual") if ba.ffn else None
+        sb = getattr(bb.ffn, "input_source", "residual") if bb.ffn else None
+        if sa != sb:
+            diff += 0.5
+        tma = getattr(getattr(ba, "ffn_memory", None), "type", None)
+        tmb = getattr(getattr(bb, "ffn_memory", None), "type", None)
+        if tma != tmb:
+            diff += 0.75
+        sma = getattr(getattr(ba, "ffn_memory", None), "input_source", "residual")
+        smb = getattr(getattr(bb, "ffn_memory", None), "input_source", "residual")
+        if sma != smb:
+            diff += 0.25
         if bool(ba.ssm) != bool(bb.ssm):
             diff += 1.0
         if len(ba.extras) != len(bb.extras):
@@ -140,7 +152,12 @@ def graph_entropy(spec: ArchitectureSpec) -> float:
             if block.attn.gating_pos and block.attn.gating_pos != "none":
                 tokens.append(f"gate:{block.attn.gating_pos}-{block.attn.gating_op or 'dense'}")
         if block.ffn:
-            tokens.append(f"ffn:{getattr(block.ffn, 'type', 'dense')}")
+            src = getattr(block.ffn, "input_source", "residual") or "residual"
+            tokens.append(f"ffn:{getattr(block.ffn, 'type', 'dense')}:{src}")
+        ffn_memory = getattr(block, "ffn_memory", None)
+        if ffn_memory:
+            src = getattr(ffn_memory, "input_source", "residual") or "residual"
+            tokens.append(f"ffn_mem:{getattr(ffn_memory, 'type', 'dense')}:{src}")
         if block.ssm:
             tokens.append(f"ssm:{block.ssm.kind}")
         for extra in block.extras:
@@ -162,6 +179,7 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
     """Encode architecture structure as a fixed-size novelty descriptor."""
     layers = max(1, int(spec.model.n_layers))
     moe_blocks = 0
+    embed_ffn_blocks = 0
     ssm_blocks = 0
     selector_blocks = 0
     linear_blocks = 0
@@ -174,8 +192,17 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
     attn_blocks = 0
 
     for block in spec.model.blocks:
-        if getattr(block.ffn, "type", "dense") == "moe":
-            moe_blocks += 1
+        ffns = [block.ffn, getattr(block, "ffn_memory", None)]
+        has_embed_ffn = False
+        for ffn in ffns:
+            if ffn is None:
+                continue
+            if getattr(ffn, "type", "dense") == "moe":
+                moe_blocks += 1
+            if str(getattr(ffn, "input_source", "residual") or "residual") == "embedding":
+                has_embed_ffn = True
+        if has_embed_ffn:
+            embed_ffn_blocks += 1
         if block.ssm is not None:
             ssm_blocks += 1
         extras_total += len(block.extras)
@@ -204,6 +231,7 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
     descriptor = [
         layers_f,
         float(moe_blocks) / layers_f,
+        float(embed_ffn_blocks) / layers_f,
         float(ssm_blocks) / layers_f,
         float(selector_blocks) / layers_f,
         float(linear_blocks) / layers_f,

@@ -476,6 +476,7 @@ class DenseFFNConfig(BaseModel):
     """Standard feed-forward block."""
 
     type: Literal["dense"] = "dense"
+    input_source: Literal["residual", "embedding"] = "residual"
     hidden: int = Field(gt=0)
     activation: Literal["silu", "gelu", "relu", "relu_squared", "swiglu"] = "swiglu"
     dropout: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -485,6 +486,7 @@ class MoEFFNConfig(BaseModel):
     """Mixture-of-Experts feed-forward block."""
 
     type: Literal["moe"] = "moe"
+    input_source: Literal["residual", "embedding"] = "residual"
     hidden: int = Field(gt=0)
     n_experts: int = Field(gt=1)
     k: int = Field(default=2, ge=1)
@@ -701,6 +703,7 @@ class BlockConfig(BaseModel):
     parent_origin: str | None = None
     attn: AttentionConfig | None = None
     ffn: FfnConfig | None = None
+    ffn_memory: FfnConfig | None = None
     ssm: SSMConfig | None = None
     extras: list[ExtraModuleConfig] = Field(default_factory=list)
 
@@ -708,6 +711,7 @@ class BlockConfig(BaseModel):
         return {
             "attn": self.attn.model_dump(mode="python") if self.attn else None,
             "ffn": self.ffn.model_dump(mode="python") if self.ffn else None,
+            "ffn_memory": self.ffn_memory.model_dump(mode="python") if self.ffn_memory else None,
             "ssm": self.ssm.model_dump(mode="python") if self.ssm else None,
             "extras": [extra.model_dump(mode="python") for extra in self.extras],
         }
@@ -930,7 +934,11 @@ class ModelConfig(BaseModel):
         return len(self.blocks)
 
     def moe_block_count(self) -> int:
-        return sum(1 for block in self.blocks if isinstance(block.ffn, MoEFFNConfig))
+        return sum(
+            1
+            for block in self.blocks
+            if isinstance(block.ffn, MoEFFNConfig) or isinstance(block.ffn_memory, MoEFFNConfig)
+        )
 
 
 class GateStep(BaseModel):

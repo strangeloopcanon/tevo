@@ -42,7 +42,7 @@ def test_graph_entropy_uses_resolved_sparsity_pattern(tiny_spec: ArchitectureSpe
 def test_behavioral_descriptor_fixed_shape(tiny_spec: ArchitectureSpec) -> None:
     descriptor = behavioral_descriptor(tiny_spec)
     assert isinstance(descriptor, list)
-    assert len(descriptor) == 12
+    assert len(descriptor) == 13
 
 
 def test_archive_novelty_decreases_for_similar_points() -> None:

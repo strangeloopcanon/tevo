@@ -169,6 +169,7 @@ class EvolutionRunner:
             "layers": 1.0,
             "moe_blocks": 3.0,
             "selector_blocks": 2.0,
+            "embedding_ffn_blocks": 2.0,
         }
         cfg_elite_weights = getattr(self.cfg, "structural_elite_weights", None)
         if isinstance(cfg_elite_weights, dict):
@@ -505,6 +506,8 @@ class EvolutionRunner:
         selector_count: float = 0.0
         # Memory proxies: count blocks with retro extras and number of recurrences
         memory_blocks: float = 0.0
+        embedding_ffn_blocks: float = 0.0
+        flex_ffn_blocks: float = 0.0
         ssm_blocks: float = 0.0
         mla_blocks: float = 0.0
         linear_blocks: float = 0.0
@@ -531,6 +534,17 @@ class EvolutionRunner:
                     qk_norm_blocks += 1.0
             if block.ssm is not None:
                 ssm_blocks += 1.0
+            embed_ffn = False
+            ffns = [block.ffn, getattr(block, "ffn_memory", None)]
+            for ffn in ffns:
+                if ffn is None:
+                    continue
+                if str(getattr(ffn, "input_source", "residual") or "residual") == "embedding":
+                    embed_ffn = True
+            if embed_ffn:
+                embedding_ffn_blocks += 1.0
+            if getattr(block, "ffn_memory", None) is not None:
+                flex_ffn_blocks += 1.0
             # Count memory-bearing blocks via retro extras
             for extra in block.extras:
                 extra_type = getattr(extra, "type", type(extra).__name__).lower()
@@ -542,6 +556,8 @@ class EvolutionRunner:
             selector_topk_sum / selector_count if selector_count > 0 else 0.0
         )
         candidate.metrics["memory_blocks"] = memory_blocks
+        candidate.metrics["embedding_ffn_blocks"] = embedding_ffn_blocks
+        candidate.metrics["flex_ffn_blocks"] = flex_ffn_blocks
         candidate.metrics["ssm_blocks"] = ssm_blocks
         candidate.metrics["mla_blocks"] = mla_blocks
         candidate.metrics["linear_blocks"] = linear_blocks
@@ -571,12 +587,14 @@ class EvolutionRunner:
         min_selector = float(thresholds.get("min_selector_blocks", 0.0) or 0.0)
         min_memory = float(thresholds.get("min_memory_blocks", 0.0) or 0.0)
         min_recurrences = float(thresholds.get("min_recurrences", 0.0) or 0.0)
+        min_embed_ffn = float(thresholds.get("min_embedding_ffn_blocks", 0.0) or 0.0)
         if (
             candidate.metrics["layers"] < min_layers
             or candidate.metrics["moe_blocks"] < min_moe
             or candidate.metrics["selector_blocks"] < min_selector
             or candidate.metrics["memory_blocks"] < min_memory
             or candidate.metrics["recurrences"] < min_recurrences
+            or candidate.metrics["embedding_ffn_blocks"] < min_embed_ffn
         ):
             candidate.status = "failed"
             self._cleanup_seed_state(candidate)
@@ -1016,6 +1034,7 @@ class EvolutionRunner:
         )
         selector_blocks = int(candidate.metrics.get("selector_blocks") or 0)
         memory_blocks = int(candidate.metrics.get("memory_blocks") or 0)
+        embedding_ffn_blocks = int(candidate.metrics.get("embedding_ffn_blocks") or 0)
         recurrences = int(candidate.metrics.get("recurrences") or 0)
         mla_blocks = int(candidate.metrics.get("mla_blocks") or 0)
         ssm_blocks = int(candidate.metrics.get("ssm_blocks") or 0)
@@ -1028,6 +1047,7 @@ class EvolutionRunner:
             f"_E{min(moe_blocks, 16)}"
             f"_S{min(selector_blocks, 16)}"
             f"_M{min(memory_blocks, 16)}"
+            f"_F{min(embedding_ffn_blocks, 16)}"
             f"_R{min(recurrences, 8)}"
             f"_A{min(mla_blocks, 16)}"
             f"_X{min(ssm_blocks, 16)}"

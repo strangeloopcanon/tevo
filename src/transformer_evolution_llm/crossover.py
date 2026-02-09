@@ -69,6 +69,22 @@ def _block_similarity(a: BlockConfig, b: BlockConfig) -> float:
     b_ffn = getattr(b.ffn, "type", "none") if b.ffn is not None else "none"
     if str(a_ffn) == str(b_ffn):
         score += 1.0
+        a_src = getattr(a.ffn, "input_source", "residual") if a.ffn is not None else None
+        b_src = getattr(b.ffn, "input_source", "residual") if b.ffn is not None else None
+        if a_src == b_src:
+            score += 0.25
+
+    a_mem = getattr(a, "ffn_memory", None)
+    b_mem = getattr(b, "ffn_memory", None)
+    if bool(a_mem) == bool(b_mem):
+        score += 0.25
+    if a_mem is not None and b_mem is not None:
+        if str(getattr(a_mem, "type", "none")) == str(getattr(b_mem, "type", "none")):
+            score += 0.5
+        if str(getattr(a_mem, "input_source", "residual") or "residual") == str(
+            getattr(b_mem, "input_source", "residual") or "residual"
+        ):
+            score += 0.2
 
     if bool(a.ssm) == bool(b.ssm):
         score += 0.4

@@ -110,6 +110,7 @@ def run_live(
     cleanup_old_checkpoints: bool,
     prune_checkpoints_to_frontier: bool,
     lineage: bool,
+    mutation_weight: list[str] | None = None,
 ) -> dict[str, str]:
     run_name = run_id or f"modal_{int(time.time())}"
     runs_root = Path("/runs")
@@ -145,6 +146,9 @@ def run_live(
         "--checkpoint-dir",
         str(checkpoint_dir),
     ]
+    if mutation_weight:
+        for item in mutation_weight:
+            cmd.extend(["--mutation-weight", str(item)])
     if cleanup_old_checkpoints:
         cmd.append("--cleanup-old-checkpoints")
     else:
@@ -170,6 +174,7 @@ def run_live(
         "cleanup_old_checkpoints": bool(cleanup_old_checkpoints),
         "prune_checkpoints_to_frontier": bool(prune_checkpoints_to_frontier),
         "register_template_entries": True,
+        "mutation_weight": list(mutation_weight or []),
     }
     try:
         (run_root / "run_live.started.json").write_text(json.dumps(started, indent=2))
@@ -266,6 +271,7 @@ def main(
     cleanup_old_checkpoints: bool = True,
     prune_checkpoints_to_frontier: bool = False,
     lineage: bool = False,
+    mutation_weight: list[str] | None = None,
 ) -> None:
     result = run_live.remote(
         config_path=config_path,
@@ -277,6 +283,7 @@ def main(
         cleanup_old_checkpoints=cleanup_old_checkpoints,
         prune_checkpoints_to_frontier=prune_checkpoints_to_frontier,
         lineage=lineage,
+        mutation_weight=mutation_weight,
     )
     print(result)
 
