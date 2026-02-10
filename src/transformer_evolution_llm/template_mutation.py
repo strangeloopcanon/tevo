@@ -74,6 +74,10 @@ class TemplateAction(TypedDict, total=False):
 ActionMap = dict[str, TemplateAction]
 
 
+def _new_origin_id(rng: random.Random) -> str:
+    return f"o{rng.getrandbits(48):012x}"
+
+
 @dataclass
 class MutationTemplate:
     name: str
@@ -105,6 +109,11 @@ def load_templates() -> list[MutationTemplate]:
             )
         )
     return templates
+
+
+def template_names() -> list[str]:
+    """Return known persisted template names."""
+    return [template.name for template in load_templates()]
 
 
 def configure_template_learning(
@@ -221,8 +230,43 @@ def apply_template_mutation_with_name(
     new_spec = spec.model_copy(deep=True)
     for action in template.actions:
         _apply_action(new_spec, action, rng)
+    _sanitize_topology(new_spec)
     _TEMPLATE_RECENT[template.name] = template
     return template.name, new_spec
+
+
+def apply_template_mutation_named_with_name(
+    spec: ArchitectureSpec,
+    rng: random.Random,
+    template_name: str,
+) -> tuple[str, ArchitectureSpec]:
+    """Apply a specific template by name when eligible."""
+    selected: MutationTemplate | None = None
+    for template in load_templates():
+        if template.name != template_name:
+            continue
+        if not _matches_conditions(spec, template.conditions):
+            continue
+        selected = template
+        break
+    if selected is None:
+        return "none", spec
+    new_spec = spec.model_copy(deep=True)
+    for action in selected.actions:
+        _apply_action(new_spec, action, rng)
+    _sanitize_topology(new_spec)
+    _TEMPLATE_RECENT[selected.name] = selected
+    return selected.name, new_spec
+
+
+def apply_template_mutation_named(
+    spec: ArchitectureSpec,
+    rng: random.Random,
+    template_name: str,
+) -> ArchitectureSpec:
+    """Apply a specific template and return only the mutated spec."""
+    _, mutated = apply_template_mutation_named_with_name(spec, rng, template_name)
+    return mutated
 
 
 def apply_template_mutation(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
@@ -299,6 +343,30 @@ def _apply_action(spec: ArchitectureSpec, action: ActionMap, rng: random.Random)
         _tune_attn(spec, dict(action["tune_attn"]), rng)
     elif "tune_router" in action:
         _tune_router(spec, dict(action["tune_router"]), rng)
+
+
+def _sanitize_topology(spec: ArchitectureSpec) -> None:
+    n_blocks = len(spec.model.blocks)
+    if n_blocks <= 0:
+        return
+    for rec in spec.model.recurrences:
+        start = int(max(0, min(n_blocks - 1, int(rec.start))))
+        end = int(max(start + 1, min(n_blocks, int(rec.end))))
+        rec.start = start
+        rec.end = end
+    max_idx = max(0, n_blocks - 1)
+    for block in spec.model.blocks:
+        for extra in block.extras:
+            if not isinstance(extra, CustomModuleConfig):
+                continue
+            params = getattr(extra, "params", None)
+            if not isinstance(params, dict):
+                continue
+            if str(params.get("type", "")).lower() != "feedback":
+                continue
+            src = params.get("source_block")
+            if isinstance(src, (int, float)):
+                params["source_block"] = int(max(0, min(max_idx, int(src))))
 
 
 def _select_block_index(spec: ArchitectureSpec, selector: str, rng: random.Random) -> int | None:
@@ -447,6 +515,10 @@ def _insert_block(spec: ArchitectureSpec, params: TemplateAction, rng: random.Ra
     new_block = _build_block(template_name, spec, rng)
     if new_block is None:
         return
+    if not getattr(new_block, "origin_id", None):
+        new_block.origin_id = _new_origin_id(rng)
+    if getattr(new_block, "parent_origin", None) is None:
+        new_block.parent_origin = None
     if position == "start":
         blocks.insert(0, new_block)
     elif position == "end":
@@ -508,7 +580,14 @@ def _build_block(name: str, spec: ArchitectureSpec, rng: random.Random) -> Block
                 gating_weight=rng.uniform(0.2, 0.4),
             )
         )
-    return BlockConfig(attn=attn, ffn=ffn, ssm=ssm, extras=extras)
+    return BlockConfig(
+        origin_id=_new_origin_id(rng),
+        parent_origin=None,
+        attn=attn,
+        ffn=ffn,
+        ssm=ssm,
+        extras=extras,
+    )
 
 
 def _replace_ffn(spec: ArchitectureSpec, params: TemplateAction, rng: random.Random) -> None:

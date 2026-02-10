@@ -1,4 +1,5 @@
-SHELL := /bin/zsh
+# Keep recipes portable across macOS + Ubuntu CI (GitHub runners don't include /bin/zsh by default).
+SHELL := /bin/sh
 PYTHON ?= python3
 VENV := .venv
 VENV_BIN := $(VENV)/bin
@@ -9,6 +10,7 @@ TYPECHECK := $(VENV_BIN)/mypy
 PYTEST := $(VENV_BIN)/pytest
 BANDIT := $(VENV_BIN)/bandit
 DETECT_SECRETS := $(VENV_BIN)/detect-secrets
+DETECT_SECRETS_HOOK := $(VENV_BIN)/detect-secrets-hook
 PIP_AUDIT := $(VENV_BIN)/pip-audit
 APP := $(VENV_BIN)/python -m transformer_evolution_llm
 AGENT_MODE ?= baseline
@@ -37,7 +39,8 @@ type:
 
 security:
 	$(BANDIT) -q -r src
-	$(DETECT_SECRETS) scan --baseline .secrets.baseline
+	# Scan tracked files against the baseline without mutating it.
+	git ls-files -z | xargs -0 $(DETECT_SECRETS_HOOK) --baseline .secrets.baseline
 
 check: format-check lint type security
 

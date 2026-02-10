@@ -123,6 +123,8 @@ def test_spawn_candidate_crossover(monkeypatch, tiny_spec, tmp_path):
     runner.pool = [parent_candidate, parent_candidate_2]
     child = runner._spawn_candidate()
     assert child.seed_state_path is not None
+    assert child.crossover_report is not None
+    assert child.mutation_trace == ["xover::aligned"]
 
 
 def test_spawn_candidate_resamples_noop_mutations(monkeypatch, tiny_spec):
@@ -137,20 +139,24 @@ def test_spawn_candidate_resamples_noop_mutations(monkeypatch, tiny_spec):
 
     calls = {"n": 0}
 
-    def fake_mutate(spec, rng, weights, steps=1, validate=True):
+    def fake_mutate_with_trace(spec, rng, weights, steps=1, validate=True):
         calls["n"] += 1
         if calls["n"] == 1:
             # First attempt is a no-op clone.
-            return ("noop", spec.model_copy(deep=True))
+            return ("noop", spec.model_copy(deep=True), ["noop"])
         # Second attempt changes the spec.
         updated = spec.model_copy(deep=True)
         updated.train.lr = float(updated.train.lr) * 1.01
-        return ("lr_jitter", updated)
+        return ("lr_jitter", updated, ["lr_jitter"])
 
-    monkeypatch.setattr("transformer_evolution_llm.orchestrator.mutate", fake_mutate)
+    monkeypatch.setattr(
+        "transformer_evolution_llm.orchestrator.mutate_with_trace",
+        fake_mutate_with_trace,
+    )
     child = runner._spawn_candidate()
     assert calls["n"] >= 2
     assert float(child.spec.train.lr) != float(parent_candidate.spec.train.lr)
+    assert child.mutation_trace == ["lr_jitter"]
 
 
 def test_live_runner_single_rung_uses_full_steps(monkeypatch, tiny_spec, tmp_path):

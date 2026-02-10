@@ -13,6 +13,7 @@ from transformer_evolution_llm.dsl import (
     CustomModuleConfig,
     DenseFFNConfig,
     DepthRouterConfig,
+    GateStep,
     HierarchyConfig,
     HierarchyLevelConfig,
     HyperConnectionsConfig,
@@ -118,4 +119,14 @@ def test_evolution_population_must_be_positive(tiny_spec: ArchitectureSpec) -> N
     spec = tiny_spec.model_copy(deep=True)
     spec.evolution.population = 0
     with pytest.raises(ValueError, match="greater than or equal to 1"):
+        ArchitectureSpec.model_validate(spec.model_dump(mode="python"))
+
+
+def test_gate_schedule_must_be_sorted(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.evolution.gate_schedule = [
+        GateStep(generation=5, thresholds={"min_layers": 4.0}),
+        GateStep(generation=2, thresholds={"min_layers": 2.0}),
+    ]
+    with pytest.raises(ValueError, match="gate_schedule must be sorted"):
         ArchitectureSpec.model_validate(spec.model_dump(mode="python"))

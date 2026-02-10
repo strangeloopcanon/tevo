@@ -5,6 +5,26 @@ An evolutionary architecture-search loop for Transformer-like language models.
 
 Architectures are defined in typed YAML (Pydantic). The loop mutates/crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. To keep the search practical, children can inherit weights from parents and crossover merges checkpoints when possible.
 
+## Punchline (Emergent Behavioral Motifs)
+
+Purely behavioral selection (loss + memory/speed + novelty/entropy) repeatedly discovers *embedding-conditioned FFNs* (FFNs that read token embeddings instead of the residual stream). This trait was not an explicit objective.
+
+Example (Modal A10G, 64 generations, vanilla 4-layer seed; short-budget proxies):
+- best `ppl_code`: `1331 -> 791`
+- `long_recall`: `0.0 -> 1.175`
+- `kv_bytes_per_token`: `8192 -> 7168`
+
+Motif: early embedding-conditioned FFNs + mixed `MHA/GQA` attention + lightweight memory extras.
+
+Repro:
+```bash
+TEVO_MODAL_GPU=A10G modal run scripts/modal_run_live.py \
+  --config-path configs/exp_behavioral_memory_modal_v1.yaml \
+  --generations 64 --steps 160 --eval-batches 4 --seed 0 \
+  --download --local-out-dir runs/modal \
+  --cleanup-old-checkpoints --prune-checkpoints-to-frontier --lineage
+```
+
 ## Why This Exists
 
 This repo is a sandbox for answering questions like: “under a fixed training recipe and constraints, what kinds of architectural motifs survive?”
@@ -18,19 +38,22 @@ The goal is to use laptop-scale surrogates (~65–100M params) as a fast feedbac
 ## Key Features
 
 - **Typed DSL**: Architectures are defined in YAML/JSON using a strict Pydantic-based schema (`src/transformer_evolution_llm/dsl.py`), ensuring all generated candidates are valid by construction.
-- **Weight Inheritance + Checkpoint-Aware Crossover**: Children can inherit parent weights; crossover attempts to merge state dicts so you don’t always restart from scratch.
-- **Multi-Objective Optimization**: Maintains a Pareto frontier over metrics like perplexity, throughput, RAM proxy, and structural complexity.
-- **Rich Mutation Primitives**: Includes structural mutations (add/remove blocks, split layers), component swaps (Attention ↔ MoE ↔ SSM), and hyperparameter tuning.
+- **Embedding-Conditioned FFNs (optional)**: FFNs can read from the residual stream or directly from token embeddings; blocks can optionally include a secondary FFN branch to split capacity.
+- **Aligned Crossover + Checkpoint Merge Reports**: Crossover aligns blocks by structural similarity and lineage IDs (`origin_id`/`parent_origin`), then merges checkpoints using that alignment with per-child transfer reports.
+- **Archive Novelty + Multi-Objective Optimization**: Maintains a Pareto frontier and can score novelty via archive kNN sparseness (with parent-relative novelty kept as a diagnostic metric).
+- **Rich Mutation Primitives (Grow + Shrink)**: Includes additive and simplifying operators (for example `remove_block_span`, `moe_to_dense`, `strip_extras`, `remove_recurrence`, `simplify_attention`) plus component/hyperparameter mutations.
+- **Extensible Mutation Registry**: Built-ins, template mutations (`tpl::...`) and runtime plugin mutations can all be registered for autonomous selection and adaptive weighting.
+- **Progressive Complexity Schedules**: Optional `gate_schedule` supports generation-based threshold ramps; MAP-Elites can optionally include complexity bands in archive keys.
 - **Template Learning (experimental)**: Optionally adjusts and persists mutation templates based on which template mutations improve objectives (`evolution.template_learning`, `evolution.template_learning_save_path`).
 - **Graph Module Primitive (experimental)**: A built-in `graph_module` component that can be inserted as a custom extra so search can explore small operator graphs, not just fixed blocks.
-- **Audit Lineage**: Every discovery comes with a full JSON lineage and visualization tools, explaining exactly *how* a specific architecture was derived.
+- **Audit Lineage**: Every discovery comes with a full lineage payload (`nodes`, mutation traces, crossover reports, novelty archive snapshot) plus visualization tools.
 - **NanoGPT-style benchmark path (implemented)**: A repeatable speedrun-style metric (`tokens/time to target`) for comparing training efficiency inside this repo (see `docs/nanogpt_benchmark.md`).
 
 ## What You Get From A Run
 
 A run writes a small set of artifacts under `runs/<run_id>/`:
 - `frontier.json`: the non-dominated candidates (each has a full `spec` + `metrics` + `id`).
-- `lineage.json` / `frontier_lineage.json`: parent links and mutation/crossover history.
+- `lineage.json` / `frontier_lineage.json`: lineage payload with `nodes` (parent links, mutation traces, crossover reports) and novelty archive state.
 - `frontier.manifest.json`: the run recipe + environment snapshot.
 - `checkpoints/` (optional): model checkpoints (often pruned to frontier-only).
 
@@ -42,6 +65,19 @@ See “Run Folder: What’s What” below for the full list.
 - **Short-budget proxies:** most metrics come from short surrogate training. Expect the frontier to move when you increase data, steps, or change objectives.
 - **Not a leaderboard:** the NanoGPT-style benchmark is for repeatable *within-repo* comparisons. The micro-benchmark numbers in this README used a tiny packed OpenWebText subset; regenerate a larger cache before drawing conclusions.
 - **Not interpretability tooling:** this repo can discover motifs; it does not (yet) provide mechanistic explanations for why a motif works.
+
+## Search Regimes
+
+So what: the same engine can be run in a "constrained optimization" posture or a more "exploration-heavy" posture purely via config.
+
+- **Constrained optimization (default posture):**
+  - Fixed `rung0_thresholds`, stronger quality/efficiency objectives, and selection tuned for stable gains.
+  - Best when you want reproducible improvements around a known baseline family.
+- **Exploration-heavy posture (config-driven):**
+  - Enable `gate_schedule`, novelty-heavy objectives, MAP-Elites complexity banding, and a broader mutation mix.
+  - Best when you want multiple structurally distinct families and gradual complexification pressure.
+
+In both regimes, the search space is bounded by the DSL + registered mutations.
 
 <details>
 <summary>Extending the search space (adding a new primitive)</summary>
@@ -376,6 +412,37 @@ evolution:
     throughput: max
 ```
 
+### Profile D: Progressive Complexity Exploration
+
+Use when you want minimal-to-complex pressure, novelty niches, and broader structural exploration in one run.
+
+```yaml
+evolution:
+  rung0_thresholds:
+    max_params: 160000000
+    max_kv_bytes_per_token: 50000
+    min_throughput_proxy: 0.8
+    min_layers: 2
+  gate_schedule:
+    - generation: 0
+      thresholds: { min_layers: 2 }
+    - generation: 15
+      thresholds: { min_layers: 4, min_moe_blocks: 1 }
+    - generation: 30
+      thresholds: { min_layers: 8, min_moe_blocks: 2 }
+  parent_selection: map_elites
+  map_elites_complexity_band: true
+  complexity_band_width: 4.0
+  topk_keep: 0.8
+  crossover_prob: 0.35
+  adaptive_mutation: true
+  register_template_entries: true
+  objectives:
+    ppl_code: min
+    novelty: max
+    graph_entropy: max
+```
+
 ### Parent Selection Cheat Sheet
 
 | Strategy | When to use | Trade-off |
@@ -548,16 +615,14 @@ The current phase runs on laptop-scale surrogates (~65–100M parameters). The n
 2. **Speedrun-style eval (implemented)**: Measure time/tokens-to-target under a NanoGPT-like recipe, so architectures are judged on training efficiency. Next: scale the packed-token cache and calibrate targets so this metric has useful dynamic range (see `docs/nanogpt_benchmark.md`).
 3. **Multi-GPU evolution** with ZeRO-1 or FSDP for larger populations.
 
-### Architectures of Interest
+### Component Coverage
 
-The DSL includes knobs inspired by recent architecture work:
+The DSL includes optional components that often matter for the quality/speed/memory frontier:
 
-| Architecture | Key Ideas | DSL Components |
-|--------------|-----------|----------------|
-| [**Titans**](https://arxiv.org/abs/2501.00663) (Google) | Neural long-term memory, attention-as-memory | `retro`, `assoc_memory`, `memory_tokens` |
-| [**DeepSeek MoE**](https://arxiv.org/abs/2401.06066) | Fine-grained experts, shared expert routing | `moe` FFN, `router` configs, `shared` experts |
-| [**Mamba/SSM hybrids**](https://arxiv.org/abs/2312.00752) | State-space models mixed with attention | `ssm` blocks, `toggle_ssm` mutations |
-| [**MLA (Multi-head Latent Attention)**](https://arxiv.org/abs/2405.04434) | Latent KV compression | `MLA` attention kind, `kv_policy` |
+- Memory-augmented extras (`retro`, `assoc_memory`, `memory_tokens`)
+- Routed FFNs (`moe` FFN, router configs, optional shared experts)
+- Hybrid sequence modules (`ssm` blocks and related mutations)
+- KV compression policies (`kv_policy` and compatible attention kinds)
 
 Evolution can recombine these ingredients under different constraints/objectives.
 

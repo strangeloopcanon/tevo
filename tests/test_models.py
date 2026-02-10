@@ -129,3 +129,72 @@ def test_evolution_model_forward_with_hyper_connections() -> None:
     out = model(x)
     assert out.shape == (2, cfg.data.seq_len, 64)
     assert torch.isfinite(out).all()
+
+
+def test_embedding_conditioned_ffn_forward() -> None:
+    cfg = ArchitectureSpec(
+        model={
+            "name": "embed-ffn-test",
+            "emb": {"dim": 32, "vocab": 64},
+            "blocks": [
+                {
+                    "attn": {"kind": "MHA", "heads": 2, "head_dim": 16},
+                    "ffn": {
+                        "type": "dense",
+                        "input_source": "embedding",
+                        "hidden": 64,
+                        "activation": "swiglu",
+                    },
+                }
+            ],
+            "head": {"vocab": 64, "tie_embeddings": True},
+        },
+        train={"lr": 1e-3, "warmup": 1, "clip": 1.0, "grad_ckpt": False},
+        data={
+            "tokenizer": "gpt2",
+            "seq_len": 8,
+            "batch_size": 2,
+            "workers": 0,
+            "shards": [{"name": "ag_news", "split": "train", "weight": 1.0}],
+        },
+    )
+    model = EvolutionModel(cfg.model)
+    x = torch.randint(0, 64, (2, cfg.data.seq_len))
+    out = model(x)
+    assert out.shape == (2, cfg.data.seq_len, 64)
+    assert torch.isfinite(out).all()
+
+
+def test_embedding_ffn_branch_forward() -> None:
+    cfg = ArchitectureSpec(
+        model={
+            "name": "embed-ffn-branch-test",
+            "emb": {"dim": 32, "vocab": 64},
+            "blocks": [
+                {
+                    "attn": {"kind": "MHA", "heads": 2, "head_dim": 16},
+                    "ffn": {"type": "dense", "hidden": 64},
+                    "ffn_memory": {
+                        "type": "dense",
+                        "input_source": "embedding",
+                        "hidden": 64,
+                        "activation": "swiglu",
+                    },
+                }
+            ],
+            "head": {"vocab": 64, "tie_embeddings": True},
+        },
+        train={"lr": 1e-3, "warmup": 1, "clip": 1.0, "grad_ckpt": False},
+        data={
+            "tokenizer": "gpt2",
+            "seq_len": 8,
+            "batch_size": 2,
+            "workers": 0,
+            "shards": [{"name": "ag_news", "split": "train", "weight": 1.0}],
+        },
+    )
+    model = EvolutionModel(cfg.model)
+    x = torch.randint(0, 64, (2, cfg.data.seq_len))
+    out = model(x)
+    assert out.shape == (2, cfg.data.seq_len, 64)
+    assert torch.isfinite(out).all()

@@ -563,7 +563,10 @@ class FullWeightTrainer:
         speedrun_end_eval_loss = math.log(max(float(perplexity), 1e-12))
         long_recall_proxy = _estimate_long_recall(spec)
         passkey_metrics = self._passkey_probe(model, spec)
-        long_recall = float(passkey_metrics.get("passkey_acc", long_recall_proxy))
+        # Long-recall score: use the probe if it beats the structural proxy.
+        # This avoids collapsing the signal to 0.0 early when the probe hasn't learned yet.
+        passkey_acc = float(passkey_metrics.get("passkey_acc", 0.0) or 0.0)
+        long_recall = max(float(long_recall_proxy), passkey_acc)
         checkpoint_path = self.checkpoint_dir / f"{candidate.ident}.pt"
         state = self._checkpoint_state(model)
         torch.save(state, checkpoint_path)

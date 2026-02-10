@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -108,6 +110,7 @@ def run_live(
     cleanup_old_checkpoints: bool,
     prune_checkpoints_to_frontier: bool,
     lineage: bool,
+    mutation_weight: str = "",
 ) -> dict[str, str]:
     run_name = run_id or f"modal_{int(time.time())}"
     runs_root = Path("/runs")
@@ -125,6 +128,7 @@ def run_live(
 
     cmd = [
         "python",
+        "-u",
         "/repo/scripts/run_live.py",
         str(cfg_path),
         "--device",
@@ -142,6 +146,12 @@ def run_live(
         "--checkpoint-dir",
         str(checkpoint_dir),
     ]
+    if mutation_weight:
+        for item in str(mutation_weight).split(","):
+            item = str(item).strip()
+            if not item:
+                continue
+            cmd.extend(["--mutation-weight", item])
     if cleanup_old_checkpoints:
         cmd.append("--cleanup-old-checkpoints")
     else:
@@ -151,17 +161,87 @@ def run_live(
     if lineage:
         cmd.extend(["--lineage-out", str(lineage_path)])
 
-    result = subprocess.run(cmd, check=False)
+    started = {
+        "timestamp_unix_s": time.time(),
+        "cmd": cmd,
+        "config_path": str(cfg_path),
+        "generations": int(generations),
+        "steps": int(steps),
+        "eval_batches": int(eval_batches),
+        "seed": int(seed),
+        "gpu": str(GPU),
+        "timeout_s": int(TIMEOUT_S),
+        "checkpoint_dir": str(checkpoint_dir),
+        "out": str(out_path),
+        "lineage_out": str(lineage_path if lineage else default_lineage_path),
+        "cleanup_old_checkpoints": bool(cleanup_old_checkpoints),
+        "prune_checkpoints_to_frontier": bool(prune_checkpoints_to_frontier),
+        "register_template_entries": True,
+        "mutation_weight": str(mutation_weight),
+    }
+    try:
+        (run_root / "run_live.started.json").write_text(json.dumps(started, indent=2))
+    except Exception:
+        pass
+    try:
+        RUNS_VOL.commit()
+    except Exception:
+        pass
+
+    log_path = run_root / "run_live.stdout.log"
+    returncode = 1
+    proc: subprocess.Popen[str] | None = None
+    stop = threading.Event()
+
+    def _commit_loop() -> None:
+        # Best-effort: persist logs and intermediate artifacts periodically so
+        # abrupt termination still leaves evidence behind.
+        while not stop.wait(60.0):
+            try:
+                RUNS_VOL.commit()
+            except Exception:
+                continue
+
+    committer = threading.Thread(target=_commit_loop, daemon=True)
+    committer.start()
+    try:
+        with log_path.open("w", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                try:
+                    log_handle.write(line)
+                    log_handle.flush()
+                except Exception:
+                    pass
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            returncode = int(proc.wait())
+    finally:
+        stop.set()
+        try:
+            committer.join(timeout=2.0)
+        except Exception:
+            pass
     try:
         meta = {
-            "returncode": result.returncode,
+            "returncode": returncode,
             "cmd": cmd,
             "timestamp_unix_s": time.time(),
         }
         (run_root / "run_live.subprocess.json").write_text(json.dumps(meta, indent=2))
-        if result.returncode != 0:
+        if returncode != 0:
             (run_root / "run_live.error.txt").write_text(
-                f"subprocess failed (returncode={result.returncode})\n"
+                f"subprocess failed (returncode={returncode})\n"
             )
     except Exception:
         pass
@@ -177,7 +257,7 @@ def run_live(
         "state": f"{run_name}/frontier.state.json",
         "lineage": f"{run_name}/{resolved_lineage.name}",
         "manifest": f"{run_name}/frontier.manifest.json",
-        "returncode": str(result.returncode),
+        "returncode": str(returncode),
     }
 
 
@@ -194,6 +274,7 @@ def main(
     cleanup_old_checkpoints: bool = True,
     prune_checkpoints_to_frontier: bool = False,
     lineage: bool = False,
+    mutation_weight: str = "",
 ) -> None:
     result = run_live.remote(
         config_path=config_path,
@@ -205,6 +286,7 @@ def main(
         cleanup_old_checkpoints=cleanup_old_checkpoints,
         prune_checkpoints_to_frontier=prune_checkpoints_to_frontier,
         lineage=lineage,
+        mutation_weight=str(mutation_weight),
     )
     print(result)
 

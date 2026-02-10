@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import random
 from collections.abc import Callable
 from typing import Any, Literal
@@ -28,10 +29,120 @@ from .dsl import (
     SoftmaxConfig,
     SSMConfig,
 )
-from .template_mutation import apply_template_mutation_with_name
+from .template_mutation import (
+    apply_template_mutation_named_with_name,
+    apply_template_mutation_with_name,
+    template_names,
+)
 
 MutationResult = ArchitectureSpec | tuple[str, ArchitectureSpec]
 MutationFn = Callable[[ArchitectureSpec, random.Random], MutationResult]
+
+TEMPLATE_REGISTRY_PREFIX = "tpl::"
+
+
+class MutationRegistry:
+    """Runtime mutation registry used by the evolution loop."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, MutationFn] = {}
+
+    def register(self, name: str, fn: MutationFn) -> None:
+        self._entries[str(name)] = fn
+
+    def get(self, name: str) -> MutationFn | None:
+        return self._entries.get(name)
+
+    def names(self) -> list[str]:
+        return sorted(self._entries)
+
+    def has(self, name: str) -> bool:
+        return name in self._entries
+
+    def as_dict(self) -> dict[str, MutationFn]:
+        return self._entries
+
+
+_RUNTIME_REGISTRY = MutationRegistry()
+# Backward compatibility for existing imports/tests.
+REGISTRY: dict[str, MutationFn] = _RUNTIME_REGISTRY.as_dict()
+
+
+def runtime_registry() -> MutationRegistry:
+    """Return the global runtime mutation registry."""
+    return _RUNTIME_REGISTRY
+
+
+def mutation_names() -> list[str]:
+    """Return registered mutation names."""
+    return _RUNTIME_REGISTRY.names()
+
+
+def register_mutation(name: str, fn: MutationFn) -> None:
+    """Register a mutation in the global runtime registry."""
+    _RUNTIME_REGISTRY.register(name, fn)
+
+
+def _sanitize_template_name(name: str) -> str:
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_" for ch in str(name))
+    return safe or "unnamed"
+
+
+def template_registry_name(template_name: str) -> str:
+    """Convert a template name to a registry key."""
+    return f"{TEMPLATE_REGISTRY_PREFIX}{_sanitize_template_name(template_name)}"
+
+
+def register_template_mutations() -> list[str]:
+    """Ensure persisted templates are exposed as first-class registry entries."""
+    added: list[str] = []
+    for name in template_names():
+        key = template_registry_name(name)
+        if _RUNTIME_REGISTRY.has(key):
+            continue
+
+        def _make(template_name: str, registry_name: str) -> MutationFn:
+            def _runner(spec: ArchitectureSpec, rng: random.Random) -> tuple[str, ArchitectureSpec]:
+                applied_name, mutated = apply_template_mutation_named_with_name(
+                    spec, rng, template_name
+                )
+                if applied_name == "none":
+                    return registry_name, spec
+                return registry_name, mutated
+
+            return _runner
+
+        register_mutation(key, _make(name, key))
+        added.append(key)
+    return added
+
+
+def load_mutation_plugins(module_names: list[str] | None) -> list[str]:
+    """Load runtime mutation plugins from importable modules.
+
+    Plugin module options:
+    - ``register_mutations(register_mutation)``
+    - ``register(register_mutation)``
+    """
+    loaded: list[str] = []
+    for module_name in module_names or []:
+        name = str(module_name).strip()
+        if not name:
+            continue
+        module = importlib.import_module(name)
+        registrar = getattr(module, "register_mutations", None)
+        if callable(registrar):
+            registrar(register_mutation)
+            loaded.append(name)
+            continue
+        registrar = getattr(module, "register", None)
+        if callable(registrar):
+            registrar(register_mutation)
+            loaded.append(name)
+            continue
+        msg = f"Mutation plugin {name} is missing register_mutations/register callable"
+        raise ValueError(msg)
+    return loaded
 
 
 class MutationError(Exception):
@@ -97,6 +208,42 @@ def clone_spec(spec: ArchitectureSpec) -> ArchitectureSpec:
     return spec.model_copy(deep=True)
 
 
+def fresh_origin_id(rng: random.Random) -> str:
+    """Generate a compact deterministic-origin token."""
+    return f"o{rng.getrandbits(48):012x}"
+
+
+def _clamp_feedback_sources(spec: ArchitectureSpec) -> None:
+    max_idx = max(0, len(spec.model.blocks) - 1)
+    for block in spec.model.blocks:
+        for extra in block.extras:
+            if not isinstance(extra, CustomModuleConfig):
+                continue
+            params = getattr(extra, "params", None)
+            if not isinstance(params, dict):
+                continue
+            if str(params.get("type", "")).lower() != "feedback":
+                continue
+            src = params.get("source_block")
+            if isinstance(src, (int, float)):
+                params["source_block"] = int(max(0, min(max_idx, int(src))))
+
+
+def sanitize_topology(spec: ArchitectureSpec) -> ArchitectureSpec:
+    """Clamp topology-dependent indices after structural edits."""
+    n_blocks = len(spec.model.blocks)
+    if n_blocks <= 0:
+        return spec
+
+    for rec in spec.model.recurrences:
+        start = int(max(0, min(n_blocks - 1, int(rec.start))))
+        end = int(max(start + 1, min(n_blocks, int(rec.end))))
+        rec.start = start
+        rec.end = end
+    _clamp_feedback_sources(spec)
+    return spec
+
+
 def dense_to_moe(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     child = clone_spec(spec)
     idx = rng.randrange(len(child.model.blocks))
@@ -111,6 +258,7 @@ def dense_to_moe(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
     # Evolution can later scale experts up via tune_experts.
     n_experts = int(rng.choice([8, 12, 16]))
     block.ffn = MoEFFNConfig(
+        input_source=str(getattr(dense, "input_source", "residual") or "residual"),
         hidden=dense.hidden,
         n_experts=n_experts,
         k=2,
@@ -323,8 +471,8 @@ def insert_graph_module(spec: ArchitectureSpec, rng: random.Random) -> Architect
 
 def template_mutation(spec: ArchitectureSpec, rng: random.Random) -> tuple[str, ArchitectureSpec]:
     template_name, mutated = apply_template_mutation_with_name(spec, rng)
-    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in template_name)
-    return f"tpl_{safe}", mutated
+    safe = _sanitize_template_name(template_name)
+    return template_registry_name(safe), mutated
 
 
 def insert_assoc_memory(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
@@ -938,7 +1086,7 @@ def add_recurrence(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSp
         test_recurrences=[1, 2, 4, 8, 16],
     )
     child.model.recurrences.append(rec)
-    return child
+    return sanitize_topology(child)
 
 
 def tune_recurrence(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
@@ -1048,6 +1196,78 @@ def tune_ffn_width_activation(spec: ArchitectureSpec, rng: random.Random) -> Arc
         new_hidden = max(256, min(int(hidden * scale), 8192))
         block.ffn.hidden = new_hidden
     block.ffn.activation = rng.choice(["swiglu", "gelu", "silu", "relu", "relu_squared"])
+    return child
+
+
+def toggle_ffn_input_source(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Toggle whether a block's FFN reads from the residual stream or token embeddings."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.ffn is not None]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    ffn = block.ffn
+    if ffn is None:
+        return child
+    current = str(getattr(ffn, "input_source", "residual") or "residual")
+    ffn.input_source = "embedding" if current != "embedding" else "residual"
+    return child
+
+
+def add_embedding_ffn_branch(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Add a secondary FFN branch that can read from token embeddings."""
+    child = clone_spec(spec)
+    blocks = [
+        b
+        for b in child.model.blocks
+        if b.ffn is not None and getattr(b, "ffn_memory", None) is None
+    ]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    d_model = int(child.model.emb.dim)
+    hidden = int(rng.choice([2 * d_model, 4 * d_model]))
+    activation = "swiglu"
+    if isinstance(block.ffn, DenseFFNConfig):
+        activation = str(getattr(block.ffn, "activation", activation) or activation)
+    block.ffn_memory = DenseFFNConfig(
+        input_source="embedding",
+        hidden=max(256, hidden),
+        activation=activation,
+        dropout=0.0,
+    )
+    return child
+
+
+def remove_embedding_ffn_branch(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Remove an optional secondary embedding-conditioned FFN branch."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if getattr(b, "ffn_memory", None) is not None]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    block.ffn_memory = None
+    return child
+
+
+def tune_embedding_ffn_branch(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Adjust the embedding-conditioned FFN branch size/activation if present."""
+    child = clone_spec(spec)
+    blocks = [
+        b for b in child.model.blocks if isinstance(getattr(b, "ffn_memory", None), DenseFFNConfig)
+    ]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    ffn = getattr(block, "ffn_memory", None)
+    if not isinstance(ffn, DenseFFNConfig):
+        return child
+    hidden = int(ffn.hidden)
+    if hidden > 0:
+        scale = rng.uniform(0.75, 1.5)
+        new_hidden = max(256, min(int(hidden * scale), 8192))
+        ffn.hidden = new_hidden
+    ffn.activation = rng.choice(["swiglu", "gelu", "silu", "relu", "relu_squared"])
     return child
 
 
@@ -1165,9 +1385,15 @@ def duplicate_block_span(spec: ArchitectureSpec, rng: random.Random) -> Architec
     start = rng.randrange(len(blocks))
     span_len = rng.choice([1, 2, 3])
     end = min(len(blocks), start + span_len)
-    duplicated = [copy.deepcopy(b) for b in blocks[start:end]]
+    duplicated: list[Any] = []
+    for src in blocks[start:end]:
+        dup = copy.deepcopy(src)
+        parent_origin = getattr(src, "origin_id", None)
+        dup.parent_origin = str(parent_origin) if parent_origin is not None else None
+        dup.origin_id = fresh_origin_id(rng)
+        duplicated.append(dup)
     blocks.extend(duplicated)
-    return child
+    return sanitize_topology(child)
 
 
 def shuffle_block_span(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
@@ -1183,6 +1409,83 @@ def shuffle_block_span(spec: ArchitectureSpec, rng: random.Random) -> Architectu
     span = blocks[start : start + span_len]
     rng.shuffle(span)
     blocks[start : start + span_len] = span
+    return sanitize_topology(child)
+
+
+def remove_block_span(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Remove a short contiguous block span while preserving at least one block."""
+    child = clone_spec(spec)
+    blocks = child.model.blocks
+    if len(blocks) <= 1:
+        return child
+    max_remove = max(1, min(2, len(blocks) - 1))
+    span_len = int(rng.choice(list(range(1, max_remove + 1))))
+    start = rng.randrange(0, len(blocks) - span_len + 1)
+    del blocks[start : start + span_len]
+    return sanitize_topology(child)
+
+
+def moe_to_dense(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Convert one MoE block back to dense FFN."""
+    child = clone_spec(spec)
+    moe_blocks = [b for b in child.model.blocks if isinstance(b.ffn, MoEFFNConfig)]
+    if not moe_blocks:
+        return child
+    block = rng.choice(moe_blocks)
+    if not isinstance(block.ffn, MoEFFNConfig):
+        return child
+    hidden = int(block.ffn.hidden)
+    block.ffn = DenseFFNConfig(
+        input_source=str(getattr(block.ffn, "input_source", "residual") or "residual"),
+        hidden=hidden,
+        activation=rng.choice(["swiglu", "gelu", "silu", "relu", "relu_squared"]),
+        dropout=0.0,
+    )
+    return child
+
+
+def strip_extras(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Remove one optional extra module from a random block."""
+    child = clone_spec(spec)
+    candidates = [block for block in child.model.blocks if block.extras]
+    if not candidates:
+        return child
+    block = rng.choice(candidates)
+    if not block.extras:
+        return child
+    idx = rng.randrange(len(block.extras))
+    del block.extras[idx]
+    return sanitize_topology(child)
+
+
+def remove_recurrence(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Remove one recurrence loop if present."""
+    child = clone_spec(spec)
+    if not child.model.recurrences:
+        return child
+    idx = rng.randrange(len(child.model.recurrences))
+    del child.model.recurrences[idx]
+    return sanitize_topology(child)
+
+
+def simplify_attention(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Downgrade a complex attention variant toward plain MHA."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.attn is not None]
+    if not blocks:
+        return child
+    block = rng.choice(blocks)
+    if block.attn is None:
+        return child
+    block.attn.kind = "MHA"
+    block.attn.kv_groups = 1
+    block.attn.kv_latent_dim = None
+    block.attn.selector = "none"
+    block.attn.selector_topk = None
+    block.attn.selector_heads = None
+    block.attn.selector_dim = None
+    block.attn.selector_rope = "none"
+    block.attn.selector_detach = False
     return child
 
 
@@ -1287,17 +1590,22 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
     return current
 
 
-REGISTRY: dict[str, MutationFn] = {
+BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "duplicate_block_span": duplicate_block_span,
     "shuffle_block_span": shuffle_block_span,
+    "remove_block_span": remove_block_span,
     "add_additional_recurrence": add_additional_recurrence,
+    "remove_recurrence": remove_recurrence,
     "add_extra_combo": add_extra_combo,
     "tune_attn_gating": tune_attn_gating,
     "dense_to_moe": dense_to_moe,
+    "moe_to_dense": moe_to_dense,
     "mutate_topk": mutate_topk,
     "shift_moe": shift_moe,
+    "strip_extras": strip_extras,
     "tune_router": tune_router,
     "make_gqa": make_gqa,
+    "simplify_attention": simplify_attention,
     "toggle_precision": toggle_precision,
     "toggle_optimizer": toggle_optimizer,
     "tune_optimizer": tune_optimizer,
@@ -1333,6 +1641,10 @@ REGISTRY: dict[str, MutationFn] = {
     "tune_attn_shape": tune_attn_shape,
     "tune_attn_sparsity": tune_attn_sparsity,
     "tune_ffn_width_activation": tune_ffn_width_activation,
+    "toggle_ffn_input_source": toggle_ffn_input_source,
+    "add_embedding_ffn_branch": add_embedding_ffn_branch,
+    "remove_embedding_ffn_branch": remove_embedding_ffn_branch,
+    "tune_embedding_ffn_branch": tune_embedding_ffn_branch,
     "tune_router_coeffs": tune_router_coeffs,
     "tune_retro": tune_retro,
     "toggle_qk_norm": toggle_qk_norm,
@@ -1346,13 +1658,21 @@ REGISTRY: dict[str, MutationFn] = {
 }
 
 
-def mutate(
+def register_builtin_mutations() -> None:
+    """Register built-in mutation functions exactly once."""
+    for name, fn in BUILTIN_MUTATIONS.items():
+        if _RUNTIME_REGISTRY.has(name):
+            continue
+        register_mutation(name, fn)
+
+
+def mutate_with_trace(
     spec: ArchitectureSpec,
     rng: random.Random | None = None,
     weights: dict[str, float] | None = None,
     steps: int = 1,
     validate: bool = True,
-) -> tuple[str, ArchitectureSpec]:
+) -> tuple[str, ArchitectureSpec, list[str]]:
     """Apply one or more registered mutations. If weights provided, sample by weight.
 
     Args:
@@ -1364,13 +1684,16 @@ def mutate(
             MutationError with a diff if validation fails.
 
     Returns:
-        A tuple of (mutation_label, mutated_spec).
+        A tuple of (mutation_label, mutated_spec, mutation_trace).
 
     Raises:
         MutationError: If validate=True and a mutation produces an invalid spec.
     """
     rng = rng or random.Random()  # noqa: S311  # nosec B311 - deterministic enough for search
-    names = list(REGISTRY)
+    names = mutation_names()
+    if not names:
+        msg = "No registered mutations found."
+        raise RuntimeError(msg)
 
     def _pick() -> str:
         if weights:
@@ -1381,19 +1704,27 @@ def mutate(
                 return rng.choices(names, weights=probs, k=1)[0]
         return rng.choice(names)
 
-    applied: list[str] = []
+    applied_labels: list[str] = []
+    applied_keys: list[str] = []
     current = spec
     for _ in range(max(1, steps)):
-        name = _pick()
+        key = _pick()
         before = current
-        result = REGISTRY[name](current, rng)
+        fn = _RUNTIME_REGISTRY.get(key)
+        if fn is None:
+            continue
+        result = fn(current, rng)
         if isinstance(result, tuple) and len(result) == 2:
             label, mutated = result
-            applied.append(str(label))
+            applied_labels.append(str(label))
         else:
             mutated = result
-            label = name
-            applied.append(name)
+            label = key
+            applied_labels.append(key)
+        label_s = str(label)
+        trace_key = label_s if label_s.startswith(TEMPLATE_REGISTRY_PREFIX) else key
+        applied_keys.append(trace_key)
+        mutated = sanitize_topology(mutated)
 
         # Validate the mutated spec if requested
         if validate:
@@ -1407,5 +1738,30 @@ def mutate(
         else:
             current = mutated
 
-    label = "+".join(applied) if len(applied) > 1 else applied[0]
-    return label, current
+    if not applied_labels:
+        msg = "No mutations could be applied."
+        raise RuntimeError(msg)
+    label = "+".join(applied_labels) if len(applied_labels) > 1 else applied_labels[0]
+    return label, current, applied_keys
+
+
+def mutate(
+    spec: ArchitectureSpec,
+    rng: random.Random | None = None,
+    weights: dict[str, float] | None = None,
+    steps: int = 1,
+    validate: bool = True,
+) -> tuple[str, ArchitectureSpec]:
+    """Backward-compatible wrapper that drops mutation trace."""
+    label, mutated, _trace = mutate_with_trace(
+        spec=spec,
+        rng=rng,
+        weights=weights,
+        steps=steps,
+        validate=validate,
+    )
+    return label, mutated
+
+
+register_builtin_mutations()
+register_template_mutations()

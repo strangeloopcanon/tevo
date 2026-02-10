@@ -1,0 +1,196 @@
+model:
+  name: exp-behavioral-memory-modal-v1
+  emb:
+    dim: 512
+    vocab: 50257
+    rope: null
+    dropout: 0.0
+  blocks:
+    - name: block-0
+      attn:
+        kind: MHA
+        heads: 8
+        head_dim: 64
+        rope: yarn
+        rope_theta: null
+        sw: null
+        kv_groups: 1
+        dropout: 0.0
+      ffn:
+        type: dense
+        input_source: residual
+        hidden: 2048
+        activation: swiglu
+        dropout: 0.0
+      extras: []
+    - name: block-1
+      attn:
+        kind: MHA
+        heads: 8
+        head_dim: 64
+        rope: yarn
+        rope_theta: null
+        sw: null
+        kv_groups: 1
+        dropout: 0.0
+      ffn:
+        type: dense
+        input_source: residual
+        hidden: 2048
+        activation: swiglu
+        dropout: 0.0
+      extras: []
+    - name: block-2
+      attn:
+        kind: MHA
+        heads: 8
+        head_dim: 64
+        rope: yarn
+        rope_theta: null
+        sw: null
+        kv_groups: 1
+        dropout: 0.0
+      ffn:
+        type: dense
+        input_source: residual
+        hidden: 2048
+        activation: swiglu
+        dropout: 0.0
+      extras: []
+    - name: block-3
+      attn:
+        kind: MHA
+        heads: 8
+        head_dim: 64
+        rope: yarn
+        rope_theta: null
+        sw: null
+        kv_groups: 1
+        dropout: 0.0
+      ffn:
+        type: dense
+        input_source: residual
+        hidden: 2048
+        activation: swiglu
+        dropout: 0.0
+      extras: []
+  head:
+    tie_embeddings: true
+    vocab: 50257
+
+train:
+  lr: 0.0008
+  warmup: 500
+  clip: 1.0
+  bf16: true
+  grad_checkpoint: true
+  max_tokens: 300000
+  weight_decay: 0.02
+  seed: 4242
+  instability_threshold: 500.0
+  no_improve_patience: 40
+  improvement_tolerance: 0.001
+  ppl_stop_threshold: null
+  # Lightweight long-context probe (selection uses loss + proxy; acc may stay 0 at short budgets)
+  passkey_eval_steps: 8
+  passkey_eval_batches: 4
+  passkey_eval_seq_len: 1024
+  passkey_eval_min_distance: 768
+  passkey_eval_batch_size: 1
+  passkey_eval_lr: 0.001
+  passkey_eval_vocab_limit: 256
+  init_checkpoint: null
+  optimizer:
+    name: adamw
+    lr: null
+    betas: null
+    eps: null
+    weight_decay: null
+
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  packed: true
+  packed_train_path: runs/packed/openwebtext_10m/train.bin
+  packed_val_path: runs/packed/openwebtext_10m/val.bin
+  packed_dtype: uint16
+  seq_len: 1024
+  batch_size: 1
+  workers: 0
+  shards: []
+  eval_tokens: 65536
+  healing_shards: []
+  healing_tokens: null
+
+evolution:
+  rung0_thresholds:
+    gate_entropy_min: 0.0
+    gate_entropy_max: 4.0
+    min_layers: 2.0
+  gate_schedule:
+    - generation: 0
+      thresholds:
+        min_layers: 2.0
+    - generation: 32
+      thresholds:
+        min_layers: 4.0
+    - generation: 64
+      thresholds:
+        min_layers: 6.0
+  rung1_tokens: 150000
+  rung2_tokens: 300000
+  population: 24
+  topk_keep: 0.6
+  crossover_prob: 0.4
+  parent_selection: map_elites
+  archive_max_elites: 96
+  map_elites_complexity_band: true
+  complexity_band_width: 3.0
+  adaptive_mutation: true
+  adaptive_mutation_eta: 0.1
+  adaptive_mutation_min_weight: 0.05
+  adaptive_mutation_max_weight: 5.0
+  weight_inheritance: parent
+  register_template_entries: true
+  novelty_archive_k: 15
+  novelty_archive_max: 500
+  pareto_objectives:
+    - ppl_code
+    - passkey_loss
+    - long_recall
+    - kv_bytes_per_token
+    - throughput
+    - ram
+    - novelty
+    - graph_entropy
+  objectives:
+    ppl_code: min
+    passkey_loss: min
+    long_recall: max
+    kv_bytes_per_token: min
+    throughput: max
+    ram: min
+    novelty: max
+    graph_entropy: max
+    instability: min
+  promotion_prob: 0.5
+  promotion_min_layers: 4
+  promotion_min_moe_blocks: 0
+  promotion_steps_multiplier: 1.5
+  promotion_tokens_multiplier: 1.5
+  promotion_min_router_entropy: 0.0
+  promotion_min_recurrence_gain: 0.0
+  promotion_max_instability: null
+  structural_elite_k: 4
+  structural_elite_weights:
+    layers: 1.0
+    moe_blocks: 1.0
+    selector_blocks: 1.0
+
+priors:
+  tokens_per_param: 4.0
+  window_scale: 6.0
+  rope_theta_default: 10000.0
+  prior_weight: 0.0
+  compute_penalty_weight: 0.0

@@ -1,9 +1,10 @@
 """Render a lineage JSON into a Mermaid graph (.mmd).
 
 Input JSON shape (as produced by EvolutionRunner.save_lineage):
-[
-  {"id": "child", "parents": ["parentA", "parentB"], ...}, ...
-]
+- legacy list payload:
+  [{"id": "child", "parents": ["parentA", "parentB"], ...}, ...]
+- current object payload:
+  {"nodes": [...], "novelty_archive": [...], ...}
 
 Usage:
   python scripts/render_lineage.py --lineage runs/frontier_phi_creative_unbiased_lineage_from_log.json \
@@ -28,7 +29,13 @@ def main(
     out: Path = typer.Option(...),
     title: Optional[str] = typer.Option(None),
 ) -> None:
-    nodes = json.loads(lineage.read_text())
+    payload = json.loads(lineage.read_text())
+    if isinstance(payload, dict):
+        nodes = payload.get("nodes", [])
+    else:
+        nodes = payload
+    if not isinstance(nodes, list):
+        nodes = []
     lines: list[str] = []
     lines.append("graph LR")
     if title:
@@ -56,4 +63,3 @@ def main(
 
 if __name__ == "__main__":
     app()
-

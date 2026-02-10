@@ -267,6 +267,15 @@ def _estimate_long_recall(spec: ArchitectureSpec) -> float:
         if getattr(extra, "type", None)
         in {"retro", "assoc_memory", "memory_tokens", "chunk_memory", "lookup_memory"}
     )
+    embed_ffn_blocks = 0
+    for block in spec.model.blocks:
+        ffns = [block.ffn, getattr(block, "ffn_memory", None)]
+        for ffn in ffns:
+            if ffn is None:
+                continue
+            if str(getattr(ffn, "input_source", "residual") or "residual") == "embedding":
+                embed_ffn_blocks += 1
+                break
     ssm_blocks = sum(1 for block in spec.model.blocks if block.ssm is not None)
     rec_spans = len(spec.model.recurrences)
     extra_types = {
@@ -274,6 +283,6 @@ def _estimate_long_recall(spec: ArchitectureSpec) -> float:
         for block in spec.model.blocks
         for extra in block.extras
     }
-    density = (memory_blocks + 0.5 * ssm_blocks + 0.5 * rec_spans) / layers
+    density = (memory_blocks + 0.5 * ssm_blocks + 0.5 * rec_spans + 0.5 * embed_ffn_blocks) / layers
     diversity_bonus = 0.1 * len(extra_types)
     return float(min(2.0, density + diversity_bonus))

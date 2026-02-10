@@ -44,6 +44,28 @@ def estimate_params(spec: ArchitectureSpec) -> float:
     vocab = int(vocab_value)
     d_model = int(spec.model.emb.dim)
     params = float(d_model * vocab)  # embeddings
+
+    def _ffn_params(ffn: DenseFFNConfig | MoEFFNConfig | None) -> float:
+        if isinstance(ffn, DenseFFNConfig):
+            hidden = int(ffn.hidden)
+            act = str(getattr(ffn, "activation", "silu") or "silu").lower()
+            if act == "swiglu":
+                return float(3 * d_model * hidden)
+            return float(2 * d_model * hidden)
+        if isinstance(ffn, MoEFFNConfig):
+            hidden = int(ffn.hidden)
+            n_experts = int(ffn.n_experts)
+            total = float(d_model * n_experts)  # router
+            total += float(n_experts * (3 * d_model * hidden))  # experts (swiglu)
+            shared = max(
+                int(getattr(ffn, "shared", 0) or 0),
+                1 if getattr(ffn, "shared_expert", False) else 0,
+            )
+            if shared > 0:
+                total += float(3 * d_model * hidden)  # single shared expert module
+            return total
+        return 0.0
+
     for block in spec.model.blocks:
         if block.attn:
             heads = int(block.attn.heads)
@@ -65,24 +87,8 @@ def estimate_params(spec: ArchitectureSpec) -> float:
                 params += d_model * qkv_out  # qkv
                 params += q_out * d_model  # out_proj
 
-        if isinstance(block.ffn, DenseFFNConfig):
-            hidden = int(block.ffn.hidden)
-            act = str(getattr(block.ffn, "activation", "silu") or "silu").lower()
-            if act == "swiglu":
-                params += 3 * d_model * hidden
-            else:
-                params += 2 * d_model * hidden
-        elif isinstance(block.ffn, MoEFFNConfig):
-            hidden = int(block.ffn.hidden)
-            n_experts = int(block.ffn.n_experts)
-            params += float(d_model * n_experts)  # router
-            params += float(n_experts * (3 * d_model * hidden))  # experts (swiglu)
-            shared = max(
-                int(getattr(block.ffn, "shared", 0) or 0),
-                1 if getattr(block.ffn, "shared_expert", False) else 0,
-            )
-            if shared > 0:
-                params += float(3 * d_model * hidden)  # single shared expert module
+        params += _ffn_params(block.ffn)
+        params += _ffn_params(getattr(block, "ffn_memory", None))
 
         if block.ssm:
             inner = max(1, int(getattr(block.ssm, "d_state", d_model) or d_model))

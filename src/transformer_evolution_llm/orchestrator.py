@@ -19,13 +19,23 @@ from rich.console import Console
 from rich.table import Table
 
 from .candidates import Candidate, ObjectiveDirection, ParetoFrontier
-from .crossover import merge_checkpoints, splice_blocks
+from .crossover import (
+    ParentKey,
+    aligned_splice_blocks,
+    merge_checkpoints_with_report,
+)
 from .data import DataModule
 from .dsl import ArchitectureSpec, CompositeMetricConfig, EvolutionConfig
 from .evaluation import StaticChecker, estimate_params
-from .mutations import REGISTRY as MUTATION_REGISTRY
-from .mutations import mutate
+from .mutations import (
+    load_mutation_plugins,
+    mutate_with_trace,
+    mutation_names,
+    register_template_mutations,
+)
 from .scoring import (
+    archive_novelty,
+    behavioral_descriptor,
     compute_composite,
     default_composites,
     default_objectives,
@@ -51,8 +61,21 @@ class EvolutionRunner:
     """Coordinates mutation, evaluation, and frontier tracking."""
 
     @staticmethod
+    def _strip_lineage_metadata(payload: Any) -> Any:
+        if isinstance(payload, dict):
+            return {
+                key: EvolutionRunner._strip_lineage_metadata(value)
+                for key, value in payload.items()
+                if key not in {"origin_id", "parent_origin"}
+            }
+        if isinstance(payload, list):
+            return [EvolutionRunner._strip_lineage_metadata(value) for value in payload]
+        return payload
+
+    @staticmethod
     def _spec_fingerprint(spec: ArchitectureSpec) -> str:
         payload = spec.model_dump(mode="json")
+        payload = EvolutionRunner._strip_lineage_metadata(payload)
         blob = json_dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return sha256(blob.encode("utf-8")).hexdigest()
 
@@ -110,6 +133,9 @@ class EvolutionRunner:
             * (score_weight_overrides.get(k, 1.0) if score_weight_overrides else 1.0)
             for k, v in self.objective_dir.items()
         }
+        load_mutation_plugins(list(getattr(self.cfg, "mutation_plugins", []) or []))
+        if bool(getattr(self.cfg, "register_template_entries", True)):
+            register_template_mutations()
         self.mutation_weights: dict[str, float] | None = None
         self.mutation_steps: int = int(getattr(self.cfg, "mutation_steps", 1) or 1)
         self._adaptive_mutation = bool(getattr(self.cfg, "adaptive_mutation", False))
@@ -122,6 +148,14 @@ class EvolutionRunner:
         )
         self._mutation_success: dict[str, float] = {}
         self._mutation_counts: dict[str, int] = {}
+        self._novelty_archive: list[list[float]] = []
+        self._novelty_k = int(getattr(self.cfg, "novelty_archive_k", 15) or 15)
+        self._novelty_archive_max = int(getattr(self.cfg, "novelty_archive_max", 500) or 500)
+        self._generation_idx = 0
+        self._active_rung0_thresholds: dict[str, float] = dict(
+            getattr(self.cfg, "rung0_thresholds", {}) or {}
+        )
+        self._origin_counter = 0
         self.archive: dict[str, Candidate] = {}
         self.archive_max_elites = int(getattr(self.cfg, "archive_max_elites", 0) or 0)
         if (
@@ -135,6 +169,7 @@ class EvolutionRunner:
             "layers": 1.0,
             "moe_blocks": 3.0,
             "selector_blocks": 2.0,
+            "embedding_ffn_blocks": 2.0,
         }
         cfg_elite_weights = getattr(self.cfg, "structural_elite_weights", None)
         if isinstance(cfg_elite_weights, dict):
@@ -147,7 +182,7 @@ class EvolutionRunner:
             )
         self.frontier = ParetoFrontier(self.objective_dir)
         self.rng = random.Random(seed)  # noqa: S311  # nosec B311 - seeded per run
-        thresholds = getattr(self.cfg, "rung0_thresholds", {}) or {}
+        thresholds = self._active_thresholds()
 
         def _threshold(key: str, default: float) -> float:
             raw = thresholds.get(key)
@@ -229,6 +264,8 @@ class EvolutionRunner:
             )
         else:
             configure_template_learning(enabled=False)
+        self._assign_missing_origin_ids(self.base_spec)
+        self._set_generation(0)
 
     def _remember_spec(self, spec: ArchitectureSpec) -> None:
         self._seen_spec_fingerprints.add(self._spec_fingerprint(spec))
@@ -237,6 +274,77 @@ class EvolutionRunner:
         self._seen_spec_fingerprints = {
             self._spec_fingerprint(c.spec) for c in self.pool + self._history
         }
+
+    def _new_origin_id(self) -> str:
+        self._origin_counter += 1
+        return f"o{self._origin_counter:08d}"
+
+    def _assign_missing_origin_ids(self, spec: ArchitectureSpec) -> None:
+        for block in spec.model.blocks:
+            if getattr(block, "origin_id", None):
+                continue
+            block.origin_id = self._new_origin_id()
+            if getattr(block, "parent_origin", None) is None:
+                block.parent_origin = None
+
+    def _resolve_thresholds_for_generation(self, generation: int) -> dict[str, float]:
+        thresholds = dict(getattr(self.cfg, "rung0_thresholds", {}) or {})
+        schedule_entries: list[tuple[int, dict[str, Any]]] = []
+        for step in getattr(self.cfg, "gate_schedule", []) or []:
+            if isinstance(step, dict):
+                raw_generation = step.get("generation", 0)
+                raw_thresholds = step.get("thresholds", {})
+            else:
+                raw_generation = getattr(step, "generation", 0)
+                raw_thresholds = getattr(step, "thresholds", {})
+            try:
+                resolved_generation = int(raw_generation)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(raw_thresholds, dict):
+                continue
+            schedule_entries.append((resolved_generation, raw_thresholds))
+
+        for step_generation, step_thresholds in sorted(schedule_entries, key=lambda item: item[0]):
+            if step_generation > int(generation):
+                break
+            for key, value in step_thresholds.items():
+                try:
+                    thresholds[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        return thresholds
+
+    def _set_generation(self, generation: int) -> None:
+        self._generation_idx = int(max(0, generation))
+        self._active_rung0_thresholds = self._resolve_thresholds_for_generation(
+            self._generation_idx
+        )
+        if self.checker is None:
+            return
+        max_params = float(self._active_rung0_thresholds.get("max_params", self.checker.max_params))
+        max_kv = float(
+            self._active_rung0_thresholds.get("max_kv_bytes_per_token", self.checker.max_kv_bytes)
+        )
+        min_tp = float(
+            self._active_rung0_thresholds.get("min_throughput_proxy", self.checker.min_throughput)
+        )
+        self.checker.max_params = max_params
+        self.checker.max_kv_bytes = max_kv
+        self.checker.min_throughput = min_tp
+
+    def _active_thresholds(self) -> dict[str, float]:
+        return dict(self._active_rung0_thresholds)
+
+    def _update_novelty_archive(self, descriptor: list[float]) -> None:
+        if not descriptor:
+            return
+        max_size = max(1, int(self._novelty_archive_max))
+        if len(self._novelty_archive) < max_size:
+            self._novelty_archive.append(list(descriptor))
+            return
+        idx = self.rng.randrange(max_size)
+        self._novelty_archive[idx] = list(descriptor)
 
     def _cleanup_seed_state(self, candidate: Candidate) -> None:
         """Remove intermediate crossover seed checkpoints when no longer needed."""
@@ -267,7 +375,7 @@ class EvolutionRunner:
                 return False
             if stop_code in (1.0, 2.0):  # high_grad / low_entropy
                 return False
-        thresholds = getattr(self.cfg, "rung0_thresholds", {}) or {}
+        thresholds = self._active_thresholds()
         for key, limit in thresholds.items():
             if not isinstance(key, str) or not key.startswith("max_"):
                 continue
@@ -307,10 +415,13 @@ class EvolutionRunner:
 
     def run(self, generations: int) -> list[Candidate]:
         survivors: list[Candidate] = []
+        start_generation = self._generation_idx if (self.pool or self._history) else 0
+        self._set_generation(start_generation)
         if not self.pool:
             base_candidate = Candidate(
                 ident=self._new_id("seed"), spec=self.base_spec.model_copy(deep=True)
             )
+            self._assign_missing_origin_ids(base_candidate.spec)
             if self._init_checkpoint is not None:
                 base_candidate.seed_state_path = self._init_checkpoint
             self._parents[base_candidate.ident] = []
@@ -334,7 +445,9 @@ class EvolutionRunner:
             self.pool.append(base_candidate)
             self._history.append(base_candidate)
             self._remember_spec(base_candidate.spec)
-        for _ in range(generations):
+        for generation_offset in range(generations):
+            generation_idx = int(start_generation + generation_offset)
+            self._set_generation(generation_idx)
             try:
                 candidate = self._spawn_candidate()
             except Exception as exc:
@@ -376,6 +489,7 @@ class EvolutionRunner:
                 self._garbage_collect_checkpoints()
             except Exception as exc:
                 console.print(f"[red]Checkpoint GC failed:[/] {exc}")
+            self._generation_idx = generation_idx + 1
         try:
             flush_template_learning()
         except Exception as exc:
@@ -392,6 +506,8 @@ class EvolutionRunner:
         selector_count: float = 0.0
         # Memory proxies: count blocks with retro extras and number of recurrences
         memory_blocks: float = 0.0
+        embedding_ffn_blocks: float = 0.0
+        flex_ffn_blocks: float = 0.0
         ssm_blocks: float = 0.0
         mla_blocks: float = 0.0
         linear_blocks: float = 0.0
@@ -418,6 +534,17 @@ class EvolutionRunner:
                     qk_norm_blocks += 1.0
             if block.ssm is not None:
                 ssm_blocks += 1.0
+            embed_ffn = False
+            ffns = [block.ffn, getattr(block, "ffn_memory", None)]
+            for ffn in ffns:
+                if ffn is None:
+                    continue
+                if str(getattr(ffn, "input_source", "residual") or "residual") == "embedding":
+                    embed_ffn = True
+            if embed_ffn:
+                embedding_ffn_blocks += 1.0
+            if getattr(block, "ffn_memory", None) is not None:
+                flex_ffn_blocks += 1.0
             # Count memory-bearing blocks via retro extras
             for extra in block.extras:
                 extra_type = getattr(extra, "type", type(extra).__name__).lower()
@@ -429,33 +556,45 @@ class EvolutionRunner:
             selector_topk_sum / selector_count if selector_count > 0 else 0.0
         )
         candidate.metrics["memory_blocks"] = memory_blocks
+        candidate.metrics["embedding_ffn_blocks"] = embedding_ffn_blocks
+        candidate.metrics["flex_ffn_blocks"] = flex_ffn_blocks
         candidate.metrics["ssm_blocks"] = ssm_blocks
         candidate.metrics["mla_blocks"] = mla_blocks
         candidate.metrics["linear_blocks"] = linear_blocks
         candidate.metrics["sparsity_blocks"] = sparsity_blocks
         candidate.metrics["qk_norm_blocks"] = qk_norm_blocks
         candidate.metrics["recurrences"] = float(len(candidate.spec.model.recurrences))
-        # novelty vs parent or base
+        # novelty diagnostics and archive-based novelty objective
         ref = None
         if candidate.parent:
             parent = next((c for c in self.pool if c.ident == candidate.parent), None)
             ref = parent.spec if parent else self.base_spec
         else:
             ref = self.base_spec
-        candidate.metrics["novelty"] = float(self._structural_distance(ref, candidate.spec))
+        parent_novelty = float(self._structural_distance(ref, candidate.spec))
+        descriptor = behavioral_descriptor(candidate.spec)
+        candidate.metrics["parent_novelty"] = parent_novelty
+        candidate.metrics["novelty"] = archive_novelty(
+            descriptor,
+            self._novelty_archive,
+            k=max(1, int(self._novelty_k)),
+        )
+        self._update_novelty_archive(descriptor)
         # Enforce rung0 thresholds even in live mode to block trivial models
-        thresholds = getattr(self.cfg, "rung0_thresholds", {}) or {}
+        thresholds = self._active_thresholds()
         min_layers = float(thresholds.get("min_layers", 0.0) or 0.0)
         min_moe = float(thresholds.get("min_moe_blocks", 0.0) or 0.0)
         min_selector = float(thresholds.get("min_selector_blocks", 0.0) or 0.0)
         min_memory = float(thresholds.get("min_memory_blocks", 0.0) or 0.0)
         min_recurrences = float(thresholds.get("min_recurrences", 0.0) or 0.0)
+        min_embed_ffn = float(thresholds.get("min_embedding_ffn_blocks", 0.0) or 0.0)
         if (
             candidate.metrics["layers"] < min_layers
             or candidate.metrics["moe_blocks"] < min_moe
             or candidate.metrics["selector_blocks"] < min_selector
             or candidate.metrics["memory_blocks"] < min_memory
             or candidate.metrics["recurrences"] < min_recurrences
+            or candidate.metrics["embedding_ffn_blocks"] < min_embed_ffn
         ):
             candidate.status = "failed"
             self._cleanup_seed_state(candidate)
@@ -895,6 +1034,7 @@ class EvolutionRunner:
         )
         selector_blocks = int(candidate.metrics.get("selector_blocks") or 0)
         memory_blocks = int(candidate.metrics.get("memory_blocks") or 0)
+        embedding_ffn_blocks = int(candidate.metrics.get("embedding_ffn_blocks") or 0)
         recurrences = int(candidate.metrics.get("recurrences") or 0)
         mla_blocks = int(candidate.metrics.get("mla_blocks") or 0)
         ssm_blocks = int(candidate.metrics.get("ssm_blocks") or 0)
@@ -907,6 +1047,7 @@ class EvolutionRunner:
             f"_E{min(moe_blocks, 16)}"
             f"_S{min(selector_blocks, 16)}"
             f"_M{min(memory_blocks, 16)}"
+            f"_F{min(embedding_ffn_blocks, 16)}"
             f"_R{min(recurrences, 8)}"
             f"_A{min(mla_blocks, 16)}"
             f"_X{min(ssm_blocks, 16)}"
@@ -914,6 +1055,19 @@ class EvolutionRunner:
             f"_Q{min(qk_norm_blocks, 16)}"
             f"_N{min(linear_blocks, 16)}"
         )
+        if bool(getattr(self.cfg, "map_elites_complexity_band", False)):
+            width = float(getattr(self.cfg, "complexity_band_width", 4.0) or 4.0)
+            width = max(1.0, width)
+            extras_total = sum(len(block.extras) for block in candidate.spec.model.blocks)
+            complexity = (
+                float(layers)
+                + 1.5 * float(moe_blocks)
+                + 1.0 * float(memory_blocks)
+                + 0.75 * float(recurrences)
+                + 0.5 * float(extras_total)
+            )
+            band = int(max(0, math.floor(complexity / width)))
+            key = f"{key}_C{band}"
         existing = self.archive.get(key)
         if existing is None or candidate.score(self.score_weights) > existing.score(
             self.score_weights
@@ -968,12 +1122,16 @@ class EvolutionRunner:
         normalized_delta = delta / baseline
         reward = 0.5 + 0.5 * math.tanh(normalized_delta)
 
-        label = candidate.ident.rsplit("-", 2)[0]
-        names = [name for name in label.split("+") if name in MUTATION_REGISTRY]
+        registry_names = set(mutation_names())
+        names = [name for name in candidate.mutation_trace if name in registry_names]
+        if not names:
+            # Backward compatibility with older saved states.
+            label = candidate.ident.rsplit("-", 2)[0]
+            names = [name for name in label.split("+") if name in registry_names]
         if not names:
             return
         if self.mutation_weights is None:
-            self.mutation_weights = dict.fromkeys(MUTATION_REGISTRY, 1.0)
+            self.mutation_weights = dict.fromkeys(registry_names, 1.0)
 
         # Track improvement deltas per mutation for analysis
         if not hasattr(self, "_mutation_deltas"):
@@ -1007,13 +1165,20 @@ class EvolutionRunner:
         if parent is None:
             return
         delta = float(candidate.score(self.score_weights) - parent.score(self.score_weights))
-        label = candidate.ident.rsplit("-", 2)[0]
-        for segment in label.split("+"):
-            if not segment.startswith("tpl_"):
-                continue
-            template_name = segment[4:]
+        segments = list(candidate.mutation_trace)
+        if not segments:
+            label = candidate.ident.rsplit("-", 2)[0]
+            segments = label.split("+")
+        for segment in segments:
+            template_name: str | None = None
+            if segment.startswith("tpl::"):
+                template_name = segment.split("::", 1)[1]
+            elif segment.startswith("tpl_"):
+                template_name = segment[4:]
             if template_name and template_name != "none":
                 record_template_result(template_name, delta)
+        if bool(getattr(self.cfg, "register_template_entries", True)):
+            register_template_mutations()
 
     def _trim_pool(self) -> None:
         if len(self.pool) <= self.cfg.population:
@@ -1113,13 +1278,27 @@ class EvolutionRunner:
                     break
                 parent_a, parent_b = self.rng.sample(parent_pool, 2)
                 spec: ArchitectureSpec | None = None
+                crossover_report: dict[str, Any] = {}
+                prefer_parent: ParentKey = (
+                    "a"
+                    if parent_a.score(self.score_weights) >= parent_b.score(self.score_weights)
+                    else "b"
+                )
                 try:
-                    blocks, cut_a, cut_b = splice_blocks(parent_a.spec, parent_b.spec, self.rng)
-                    spec_data = parent_a.spec.model_dump(mode="python")
+                    plan = aligned_splice_blocks(
+                        parent_a.spec,
+                        parent_b.spec,
+                        self.rng,
+                        preferred_parent=prefer_parent,
+                    )
+                    base_spec = parent_a.spec if prefer_parent == "a" else parent_b.spec
+                    spec_data = base_spec.model_dump(mode="python")
                     spec_data["model"]["blocks"] = [
-                        block.model_dump(mode="python") for block in blocks
+                        block.model_dump(mode="python") for block in plan.blocks
                     ]
                     spec = ArchitectureSpec(**spec_data)
+                    self._assign_missing_origin_ids(spec)
+                    crossover_report = dict(plan.report)
                 except Exception:
                     spec = None
                 if spec is None:
@@ -1130,22 +1309,24 @@ class EvolutionRunner:
                 seed_path: Path | None = None
                 if self.weight_inheritance == "parent":
                     seed_path = self.checkpoint_dir / f"{child_id}_seed.pt"
-                    merge_checkpoints(
+                    merged_path, merge_report = merge_checkpoints_with_report(
                         child_spec=spec,
-                        cut_a=cut_a,
-                        cut_b=cut_b,
-                        parent_a_blocks=len(parent_a.spec.model.blocks),
-                        parent_b_blocks=len(parent_b.spec.model.blocks),
                         parent_a_ckpt=parent_a.checkpoint,
                         parent_b_ckpt=parent_b.checkpoint,
                         out_path=seed_path,
+                        source_map=plan.source_map,
+                        preferred_parent=prefer_parent,
                     )
+                    seed_path = merged_path
+                    crossover_report["checkpoint_merge"] = merge_report
                 self._parents[child_id] = [parent_a.ident, parent_b.ident]
                 return Candidate(
                     ident=child_id,
                     spec=spec,
                     parent=None,
                     seed_state_path=seed_path,
+                    mutation_trace=["xover::aligned"],
+                    crossover_report=crossover_report,
                 )
             console.print(
                 "[yellow]Warning:[/] crossover only produced already-seen specs; "
@@ -1157,11 +1338,11 @@ class EvolutionRunner:
         if mutation_weights is None:
             mutation_weights = self.mutation_weights
         parent_fp = self._spec_fingerprint(parent.spec)
-        last: tuple[str, ArchitectureSpec] | None = None
+        last: tuple[str, ArchitectureSpec, list[str]] | None = None
         for _ in range(max_attempts):
-            result: tuple[str, ArchitectureSpec] | None = None
+            result: tuple[str, ArchitectureSpec, list[str]] | None = None
             try:
-                result = mutate(
+                result = mutate_with_trace(
                     parent.spec,
                     self.rng,
                     mutation_weights,
@@ -1171,8 +1352,9 @@ class EvolutionRunner:
                 result = None
             if result is None:
                 continue
-            name, spec = result
-            last = (name, spec)
+            name, spec, trace = result
+            self._assign_missing_origin_ids(spec)
+            last = (name, spec, trace)
             spec_fp = self._spec_fingerprint(spec)
             if spec_fp == parent_fp or spec_fp in seen:
                 continue
@@ -1181,13 +1363,14 @@ class EvolutionRunner:
                 spec=spec,
                 parent=parent.ident,
                 parent_checkpoint=parent.checkpoint,
+                mutation_trace=trace,
             )
             self._parents[child.ident] = [parent.ident]
             return child
         if last is None:
             msg = "mutation produced no candidates"
             raise RuntimeError(msg)
-        name, spec = last
+        name, spec, trace = last
         console.print(
             "[yellow]Warning:[/] mutation only produced already-seen/no-op specs; "
             f"using last sample ({name})."
@@ -1197,6 +1380,7 @@ class EvolutionRunner:
             spec=spec,
             parent=parent.ident,
             parent_checkpoint=parent.checkpoint,
+            mutation_trace=trace,
         )
         self._parents[child.ident] = [parent.ident]
         return child
@@ -1217,7 +1401,7 @@ class EvolutionRunner:
         metrics = parent.metrics
 
         # Start with uniform weights
-        weights = dict.fromkeys(MUTATION_REGISTRY, 1.0)
+        weights = dict.fromkeys(mutation_names(), 1.0)
 
         # Analyze architecture state
         n_layers = spec.model.n_layers
@@ -1229,45 +1413,66 @@ class EvolutionRunner:
 
         # Context 1: Shallow stack -> prioritize depth mutations
         if n_layers < 6:
-            weights["duplicate_block_span"] = 3.0
-            weights["add_recurrence"] = 2.0
-            weights["add_additional_recurrence"] = 2.0
+            if "duplicate_block_span" in weights:
+                weights["duplicate_block_span"] = 3.0
+            if "add_recurrence" in weights:
+                weights["add_recurrence"] = 2.0
+            if "add_additional_recurrence" in weights:
+                weights["add_additional_recurrence"] = 2.0
 
         # Context 2: Many MoE blocks but low router entropy -> prioritize router tuning
         if moe_blocks >= 2 and router_entropy < 0.8:
-            weights["tune_router"] = 3.0
-            weights["tune_router_coeffs"] = 3.0
-            weights["tune_experts"] = 2.0
+            for key, value in (
+                ("tune_router", 3.0),
+                ("tune_router_coeffs", 3.0),
+                ("tune_experts", 2.0),
+            ):
+                if key in weights:
+                    weights[key] = value
 
         # Context 3: No memory modules -> prioritize memory insertion
         if memory_blocks == 0:
-            weights["insert_retro_module"] = 3.0
-            weights["insert_assoc_memory"] = 2.5
-            weights["insert_memory_tokens"] = 2.0
-            weights["insert_chunk_memory"] = 2.0
-            weights["insert_lookup_memory"] = 2.0
+            for key, value in (
+                ("insert_retro_module", 3.0),
+                ("insert_assoc_memory", 2.5),
+                ("insert_memory_tokens", 2.0),
+                ("insert_chunk_memory", 2.0),
+                ("insert_lookup_memory", 2.0),
+            ):
+                if key in weights:
+                    weights[key] = value
 
         # Context 4: No selectors -> prioritize selector mutations
         if selector_blocks == 0 and n_layers >= 4:
-            weights["toggle_selector"] = 2.5
+            if "toggle_selector" in weights:
+                weights["toggle_selector"] = 2.5
 
         # Context 5: No SSM blocks -> consider adding
         if ssm_blocks == 0 and n_layers >= 4:
-            weights["toggle_ssm"] = 1.5
+            if "toggle_ssm" in weights:
+                weights["toggle_ssm"] = 1.5
 
         # Context 6: High instability -> prioritize stability mutations
         instability = float(metrics.get("instability", 0.0))
         if instability > 2.0:
-            weights["toggle_qk_norm"] = 2.5
-            weights["insert_layer_scale"] = 2.0
-            weights["tune_layer_scale"] = 2.0
+            for key, value in (
+                ("toggle_qk_norm", 2.5),
+                ("insert_layer_scale", 2.0),
+                ("tune_layer_scale", 2.0),
+            ):
+                if key in weights:
+                    weights[key] = value
 
         # Context 7: Poor long-recall -> prioritize memory/recurrence
         long_recall = float(metrics.get("long_recall", 0.5))
         if long_recall < 0.5:
-            weights["insert_retro_module"] = 2.0
-            weights["add_recurrence"] = 2.0
-            weights["insert_chunk_memory"] = 2.0
+            for key, value in (
+                ("insert_retro_module", 2.0),
+                ("add_recurrence", 2.0),
+                ("insert_chunk_memory", 2.0),
+            ):
+                if key in weights:
+                    weights[key] = value
 
         # Merge with existing adaptive weights if present
         if self.mutation_weights:
@@ -1339,10 +1544,14 @@ class EvolutionRunner:
             "archive": {k: v.ident for k, v in self.archive.items()},
             "mutation_success": self._mutation_success,
             "mutation_counts": self._mutation_counts,
+            "novelty_archive": self._novelty_archive,
             "structural_elite": {
                 "k": self.structural_elite_k,
                 "weights": self.structural_elite_weights,
             },
+            "generation_idx": self._generation_idx,
+            "active_rung0_thresholds": self._active_rung0_thresholds,
+            "origin_counter": self._origin_counter,
         }
         path.write_text(json.dumps(state, indent=2))
         console.print(f"State saved to {path}")
@@ -1402,7 +1611,13 @@ class EvolutionRunner:
             seed=seed_val,
             score_weight_overrides=resolved_overrides,
         )
-        runner.mutation_weights = data.get("mutation_weights")
+        mutation_weights = data.get("mutation_weights")
+        if isinstance(mutation_weights, dict):
+            runner.mutation_weights = {
+                str(key): float(value)
+                for key, value in mutation_weights.items()
+                if isinstance(value, (int, float))
+            }
         if "mutation_steps" in data:
             try:
                 runner.mutation_steps = int(data["mutation_steps"])
@@ -1463,6 +1678,32 @@ class EvolutionRunner:
             runner._mutation_counts = {
                 str(k): int(v) for k, v in mutation_counts.items() if isinstance(v, (int, float))
             }
+        novelty_archive = data.get("novelty_archive")
+        if isinstance(novelty_archive, list):
+            parsed_archive: list[list[float]] = []
+            for descriptor in novelty_archive:
+                if not isinstance(descriptor, list):
+                    continue
+                parsed_archive.append(
+                    [float(value) for value in descriptor if isinstance(value, (int, float))]
+                )
+            runner._novelty_archive = parsed_archive
+        generation_idx = data.get("generation_idx")
+        if isinstance(generation_idx, (int, float)):
+            runner._generation_idx = int(generation_idx)
+        active_thresholds = data.get("active_rung0_thresholds")
+        if isinstance(active_thresholds, dict):
+            runner._active_rung0_thresholds = {
+                str(key): float(value)
+                for key, value in active_thresholds.items()
+                if isinstance(value, (int, float))
+            }
+        origin_counter = data.get("origin_counter")
+        if isinstance(origin_counter, (int, float)):
+            runner._origin_counter = int(origin_counter)
+        for cand in runner.pool + runner._history:
+            runner._assign_missing_origin_ids(cand.spec)
+        runner._set_generation(runner._generation_idx)
         runner._rebuild_seen_specs()
         # Restore RNG
         rng_state = data.get("rng_state")
@@ -1479,7 +1720,8 @@ class EvolutionRunner:
 
     def _new_id(self, prefix: str) -> str:
         self.counter += 1
-        return f"{prefix}-{self.counter}-{uuid.uuid4().hex[:4]}"
+        safe = "".join(ch if (ch.isalnum() or ch in {"-", "_", "+"}) else "_" for ch in prefix)
+        return f"{safe}-{self.counter}-{uuid.uuid4().hex[:4]}"
 
     def _remove_candidate_artifacts(self, candidate: Candidate) -> None:
         for file_path in (candidate.checkpoint, candidate.seed_state_path):
@@ -1507,7 +1749,14 @@ class EvolutionRunner:
                 "rung": cand.rung,
                 "metrics": cand.metrics,
                 "spec": cand.spec.model_dump(mode="python"),
+                "mutation_trace": cand.mutation_trace,
+                "crossover_report": cand.crossover_report,
             }
             nodes.append(node)
-        path.write_text(json.dumps(nodes, indent=2))
+        payload = {
+            "nodes": nodes,
+            "novelty_archive": self._novelty_archive,
+            "generation_idx": self._generation_idx,
+        }
+        path.write_text(json.dumps(payload, indent=2))
         console.print(f"Lineage saved to {path}")

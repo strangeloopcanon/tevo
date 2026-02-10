@@ -1,6 +1,8 @@
 from pathlib import Path
 
 from transformer_evolution_llm.api import save_spec
+from transformer_evolution_llm.candidates import Candidate
+from transformer_evolution_llm.dsl import CustomModuleConfig
 from transformer_evolution_llm.orchestrator import EvolutionRunner
 
 
@@ -88,3 +90,78 @@ def test_checkpoint_gc_keeps_init_checkpoint(tmp_path: Path, tiny_spec):
 
     assert init_ckpt.exists()
     assert not orphan_ckpt.exists()
+
+
+def test_gate_schedule_overrides_thresholds(tiny_spec):
+    spec = tiny_spec.model_copy(deep=True)
+    spec.evolution.rung0_thresholds = {"min_layers": 1.0}
+    spec.evolution.gate_schedule = [
+        {"generation": 0, "thresholds": {"min_layers": 1.0}},
+        {"generation": 2, "thresholds": {"min_layers": 3.0}},
+    ]
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    runner._set_generation(0)
+    assert runner._active_thresholds()["min_layers"] == 1.0
+    runner._set_generation(2)
+    assert runner._active_thresholds()["min_layers"] == 3.0
+
+
+def test_novelty_archive_updates_metrics(tiny_spec):
+    runner = EvolutionRunner(
+        base_spec=tiny_spec,
+        evolution_cfg=tiny_spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    cand1 = Candidate(ident="cand-1", spec=tiny_spec.model_copy(deep=True))
+    runner._evaluate_candidate(cand1)
+    assert "novelty" in cand1.metrics
+    assert "parent_novelty" in cand1.metrics
+    assert runner._novelty_archive
+
+
+def test_lineage_payload_contains_nodes_and_archive(tmp_path: Path, tiny_spec):
+    runner = EvolutionRunner(
+        base_spec=tiny_spec,
+        evolution_cfg=tiny_spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    runner.run(generations=1)
+    out = tmp_path / "lineage.json"
+    runner.save_lineage(out)
+    import ujson as json
+
+    payload = json.loads(out.read_text())
+    assert isinstance(payload, dict)
+    assert isinstance(payload.get("nodes"), list)
+    assert isinstance(payload.get("novelty_archive"), list)
+
+
+def test_map_elites_complexity_banding_splits_archive_keys(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.evolution.parent_selection = "map_elites"
+    spec.evolution.map_elites_complexity_band = True
+    spec.evolution.complexity_band_width = 1.0
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    base = tiny_spec.model_copy(deep=True)
+    richer = tiny_spec.model_copy(deep=True)
+    richer.model.blocks[0].extras.extend(
+        [CustomModuleConfig(type="custom", name=f"cm{i}") for i in range(6)]
+    )
+    cand_a = Candidate(ident="cand-a", spec=base, metrics={"ppl_code": 100.0, "throughput": 1.0})
+    cand_b = Candidate(ident="cand-b", spec=richer, metrics={"ppl_code": 99.0, "throughput": 1.0})
+    runner._update_archive(cand_a)
+    runner._update_archive(cand_b)
+    assert len(runner.archive) >= 2
+    assert all("_C" in key for key in runner.archive)

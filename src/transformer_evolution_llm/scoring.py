@@ -47,6 +47,18 @@ def structural_distance(a: ArchitectureSpec, b: ArchitectureSpec) -> float:
         tb = getattr(bb.ffn, "type", None) if bb.ffn else None
         if ta != tb:
             diff += 1.0
+        sa = getattr(ba.ffn, "input_source", "residual") if ba.ffn else None
+        sb = getattr(bb.ffn, "input_source", "residual") if bb.ffn else None
+        if sa != sb:
+            diff += 0.5
+        tma = getattr(getattr(ba, "ffn_memory", None), "type", None)
+        tmb = getattr(getattr(bb, "ffn_memory", None), "type", None)
+        if tma != tmb:
+            diff += 0.75
+        sma = getattr(getattr(ba, "ffn_memory", None), "input_source", "residual")
+        smb = getattr(getattr(bb, "ffn_memory", None), "input_source", "residual")
+        if sma != smb:
+            diff += 0.25
         if bool(ba.ssm) != bool(bb.ssm):
             diff += 1.0
         if len(ba.extras) != len(bb.extras):
@@ -140,7 +152,12 @@ def graph_entropy(spec: ArchitectureSpec) -> float:
             if block.attn.gating_pos and block.attn.gating_pos != "none":
                 tokens.append(f"gate:{block.attn.gating_pos}-{block.attn.gating_op or 'dense'}")
         if block.ffn:
-            tokens.append(f"ffn:{getattr(block.ffn, 'type', 'dense')}")
+            src = getattr(block.ffn, "input_source", "residual") or "residual"
+            tokens.append(f"ffn:{getattr(block.ffn, 'type', 'dense')}:{src}")
+        ffn_memory = getattr(block, "ffn_memory", None)
+        if ffn_memory:
+            src = getattr(ffn_memory, "input_source", "residual") or "residual"
+            tokens.append(f"ffn_mem:{getattr(ffn_memory, 'type', 'dense')}:{src}")
         if block.ssm:
             tokens.append(f"ssm:{block.ssm.kind}")
         for extra in block.extras:
@@ -156,6 +173,106 @@ def graph_entropy(spec: ArchitectureSpec) -> float:
     diversity = len(counts)
     depth_bonus = math.log1p(spec.model.n_layers)
     return float(entropy + 0.05 * diversity + 0.1 * depth_bonus)
+
+
+def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
+    """Encode architecture structure as a fixed-size novelty descriptor."""
+    layers = max(1, int(spec.model.n_layers))
+    moe_blocks = 0
+    embed_ffn_blocks = 0
+    ssm_blocks = 0
+    selector_blocks = 0
+    linear_blocks = 0
+    mla_blocks = 0
+    sparse_blocks = 0
+    qk_norm_blocks = 0
+    extras_total = 0
+    head_dim_sum = 0.0
+    kv_groups_sum = 0.0
+    attn_blocks = 0
+
+    for block in spec.model.blocks:
+        ffns = [block.ffn, getattr(block, "ffn_memory", None)]
+        has_embed_ffn = False
+        for ffn in ffns:
+            if ffn is None:
+                continue
+            if getattr(ffn, "type", "dense") == "moe":
+                moe_blocks += 1
+            if str(getattr(ffn, "input_source", "residual") or "residual") == "embedding":
+                has_embed_ffn = True
+        if has_embed_ffn:
+            embed_ffn_blocks += 1
+        if block.ssm is not None:
+            ssm_blocks += 1
+        extras_total += len(block.extras)
+        attn = block.attn
+        if attn is None:
+            continue
+        attn_blocks += 1
+        kind = str(getattr(attn, "kind", "MHA") or "MHA").upper()
+        if kind == "LINEAR":
+            linear_blocks += 1
+        if kind == "MLA":
+            mla_blocks += 1
+        if str(getattr(attn, "selector", "none") or "none") != "none":
+            selector_blocks += 1
+        if getattr(attn, "qk_norm_max", None) is not None:
+            qk_norm_blocks += 1
+        pattern = resolve_attention_pattern(attn)
+        if pattern.sparsity != "none":
+            sparse_blocks += 1
+        head_dim_sum += float(getattr(attn, "head_dim", 0) or 0)
+        kv_groups_sum += float(getattr(attn, "kv_groups", 1) or 1)
+
+    recurrences = len(spec.model.recurrences)
+    attn_den = float(max(1, attn_blocks))
+    layers_f = float(layers)
+    descriptor = [
+        layers_f,
+        float(moe_blocks) / layers_f,
+        float(embed_ffn_blocks) / layers_f,
+        float(ssm_blocks) / layers_f,
+        float(selector_blocks) / layers_f,
+        float(linear_blocks) / layers_f,
+        float(mla_blocks) / layers_f,
+        float(sparse_blocks) / layers_f,
+        float(extras_total) / layers_f,
+        float(recurrences) / layers_f,
+        head_dim_sum / attn_den,
+        kv_groups_sum / attn_den,
+        graph_entropy(spec),
+    ]
+    return descriptor
+
+
+def archive_novelty(
+    descriptor: list[float],
+    archive: list[list[float]],
+    *,
+    k: int = 15,
+) -> float:
+    """Compute novelty as average distance to k nearest archive descriptors."""
+    if not archive:
+        return 0.0
+    if not descriptor:
+        return 0.0
+    k_eff = max(1, min(int(k), len(archive)))
+    distances: list[float] = []
+    for item in archive:
+        dim = min(len(descriptor), len(item))
+        if dim <= 0:
+            continue
+        total = 0.0
+        for idx in range(dim):
+            delta = float(descriptor[idx]) - float(item[idx])
+            total += delta * delta
+        distances.append(math.sqrt(total))
+    if not distances:
+        return 0.0
+    distances.sort()
+    nearest = distances[:k_eff]
+    return float(sum(nearest) / len(nearest))
 
 
 def compute_composite(comp: CompositeMetricConfig, metrics: dict[str, float]) -> float | None:

@@ -350,6 +350,10 @@ class EvolutionBlock(nn.Module):
     def __init__(self, dim: int, cfg: BlockConfig, norm_type: str = "layernorm"):
         super().__init__()
         self.attn = MultiHeadSelfAttention(cfg.attn, dim) if cfg.attn else None
+        self._ffn_input_source = str(getattr(cfg.ffn, "input_source", "residual") or "residual")
+        self._ffn_memory_input_source = str(
+            getattr(cfg.ffn_memory, "input_source", "residual") or "residual"
+        )
         if cfg.ffn is None:
             self.ffn: DenseFFN | MoELayer | None = None
         elif cfg.ffn.type == "moe":
@@ -363,6 +367,20 @@ class EvolutionBlock(nn.Module):
                 cfg.ffn.hidden,
                 getattr(cfg.ffn, "activation", "silu"),
                 dropout=float(getattr(cfg.ffn, "dropout", 0.0) or 0.0),
+            )
+        if cfg.ffn_memory is None:
+            self.ffn_memory: DenseFFN | MoELayer | None = None
+        elif cfg.ffn_memory.type == "moe":
+            if not isinstance(cfg.ffn_memory, MoEFFNConfig):
+                msg = "MoE block requires MoEFFNConfig."
+                raise TypeError(msg)
+            self.ffn_memory = MoELayer(dim, cfg.ffn_memory)
+        else:
+            self.ffn_memory = DenseFFN(
+                dim,
+                cfg.ffn_memory.hidden,
+                getattr(cfg.ffn_memory, "activation", "silu"),
+                dropout=float(getattr(cfg.ffn_memory, "dropout", 0.0) or 0.0),
             )
         self.ssm = SSMLayer(cfg.ssm, dim) if cfg.ssm else None
         self.norm = _norm_layer(norm_type, dim)
@@ -467,12 +485,14 @@ class EvolutionBlock(nn.Module):
                 return buf.to(dtype=x.dtype, device=x.device)
         return x.new_tensor(1.0)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.delta(x)
+    def forward(self, x: Tensor, x0: Tensor | None = None) -> Tensor:
+        return x + self.delta(x, x0=x0)
 
-    def delta(self, x: Tensor) -> Tensor:
+    def delta(self, x: Tensor, *, x0: Tensor | None = None) -> Tensor:
         """Return the block's residual update (x_out - x_in)."""
         x_in = x
+        x0_in = x if x0 is None else x0
+        x0_norm = self.norm(x0_in)
         if self.router is None:
             if self.attn:
                 out = self.attn(self.norm(x))
@@ -482,10 +502,17 @@ class EvolutionBlock(nn.Module):
                 out = self.ssm(self.norm(x))
                 out = out * self._layer_scale("ssm", out)
                 x = x + out * self._gate_scale("ssm", out)
+            out_ffn: Tensor | None = None
             if self.ffn:
-                out = self.ffn(self.norm(x))
-                out = out * self._layer_scale("ffn", out)
-                x = x + out * self._gate_scale("ffn", out)
+                ffn_in = x0_norm if self._ffn_input_source == "embedding" else self.norm(x)
+                out_ffn = self.ffn(ffn_in)
+            if self.ffn_memory:
+                ffn_in = x0_norm if self._ffn_memory_input_source == "embedding" else self.norm(x)
+                out_mem = self.ffn_memory(ffn_in)
+                out_ffn = out_mem if out_ffn is None else out_ffn + out_mem
+            if out_ffn is not None:
+                out_ffn = out_ffn * self._layer_scale("ffn", out_ffn)
+                x = x + out_ffn * self._gate_scale("ffn", out_ffn)
             for memory_module in self.memory_extras:
                 out = memory_module(self.norm(x))
                 out = out * self._layer_scale("memory", out)
@@ -503,8 +530,16 @@ class EvolutionBlock(nn.Module):
                 out = self.attn(x_norm)
             elif target == "ssm" and self.ssm is not None:
                 out = self.ssm(x_norm)
-            elif target == "ffn" and self.ffn is not None:
-                out = self.ffn(x_norm)
+            elif target == "ffn" and (self.ffn is not None or self.ffn_memory is not None):
+                out_ffn = None
+                if self.ffn is not None:
+                    ffn_in = x0_norm if self._ffn_input_source == "embedding" else x_norm
+                    out_ffn = self.ffn(ffn_in)
+                if self.ffn_memory is not None:
+                    ffn_in = x0_norm if self._ffn_memory_input_source == "embedding" else x_norm
+                    out_mem = self.ffn_memory(ffn_in)
+                    out_ffn = out_mem if out_ffn is None else out_ffn + out_mem
+                out = out_ffn
             elif target == "memory" and len(self.memory_extras) > 0:
                 out = sum(mem(x_norm) for mem in self.memory_extras)
             if out is None:
@@ -633,11 +668,14 @@ class EvolutionModel(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         x = self.embed(input_ids)
         x = cast(Tensor, self.emb_dropout(x))
+        x0 = x
         if self.hyper is not None and self.hyper.enabled():
             streams = self.hyper.init_streams(x)
             if not self._recurrence_order:
                 for idx, block in enumerate(self.blocks):
-                    streams = self._run_hyper_block(idx, cast(EvolutionBlock, block), streams)
+                    streams = self._run_hyper_block(
+                        idx, cast(EvolutionBlock, block), streams, x0=x0
+                    )
             else:
                 idx = 0
                 order_pos = 0
@@ -647,12 +685,12 @@ class EvolutionModel(nn.Module):
                         and idx == self._recurrence_order[order_pos][1].start
                     ):
                         spec_idx, rec_cfg = self._recurrence_order[order_pos]
-                        streams = self._run_recurrence_hyper(spec_idx, rec_cfg, streams)
+                        streams = self._run_recurrence_hyper(spec_idx, rec_cfg, streams, x0=x0)
                         idx = rec_cfg.end
                         order_pos += 1
                         continue
                     streams = self._run_hyper_block(
-                        idx, cast(EvolutionBlock, self.blocks[idx]), streams
+                        idx, cast(EvolutionBlock, self.blocks[idx]), streams, x0=x0
                     )
                     idx += 1
             x = self.hyper.readout(streams)
@@ -660,7 +698,7 @@ class EvolutionModel(nn.Module):
             return cast(Tensor, self.lm_head(x))
         if not self._recurrence_order:
             for block in self.blocks:
-                x = self._run_block(block, x)
+                x = self._run_block(block, x, x0=x0)
         else:
             idx = 0
             order_pos = 0
@@ -670,11 +708,11 @@ class EvolutionModel(nn.Module):
                     and idx == self._recurrence_order[order_pos][1].start
                 ):
                     spec_idx, rec_cfg = self._recurrence_order[order_pos]
-                    x = self._run_recurrence(spec_idx, rec_cfg, x)
+                    x = self._run_recurrence(spec_idx, rec_cfg, x, x0=x0)
                     idx = rec_cfg.end
                     order_pos += 1
                     continue
-                x = self._run_block(self.blocks[idx], x)
+                x = self._run_block(self.blocks[idx], x, x0=x0)
                 idx += 1
         x = self.norm(x)
         return cast(Tensor, self.lm_head(x))
@@ -682,38 +720,42 @@ class EvolutionModel(nn.Module):
     def set_grad_checkpointing(self, enabled: bool) -> None:
         self._grad_checkpointing = bool(enabled)
 
-    def _run_block(self, block: nn.Module, x: Tensor) -> Tensor:
+    def _run_block(self, block: nn.Module, x: Tensor, *, x0: Tensor) -> Tensor:
         if self._grad_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
 
             try:
-                return cast(Tensor, checkpoint(block, x, use_reentrant=False))
+                return cast(Tensor, checkpoint(block, x, x0, use_reentrant=False))
             except TypeError:
                 # Older torch versions do not support use_reentrant.
-                return cast(Tensor, checkpoint(block, x))
-        return cast(Tensor, block(x))
+                return cast(Tensor, checkpoint(block, x, x0))
+        return cast(Tensor, block(x, x0))
 
-    def _run_hyper_block(self, layer_idx: int, block: EvolutionBlock, streams: Tensor) -> Tensor:
+    def _run_hyper_block(
+        self, layer_idx: int, block: EvolutionBlock, streams: Tensor, *, x0: Tensor
+    ) -> Tensor:
         if self.hyper is None:
             raise RuntimeError("hyper block requested without hyper configuration")
         if self._grad_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
 
             def _fn(state: Tensor) -> Tensor:
-                return self._hyper_step(layer_idx, block, state)
+                return self._hyper_step(layer_idx, block, state, x0=x0)
 
             try:
                 return cast(Tensor, checkpoint(_fn, streams, use_reentrant=False))
             except TypeError:
                 return cast(Tensor, checkpoint(_fn, streams))
-        return self._hyper_step(layer_idx, block, streams)
+        return self._hyper_step(layer_idx, block, streams, x0=x0)
 
-    def _hyper_step(self, layer_idx: int, block: EvolutionBlock, streams: Tensor) -> Tensor:
+    def _hyper_step(
+        self, layer_idx: int, block: EvolutionBlock, streams: Tensor, *, x0: Tensor
+    ) -> Tensor:
         if self.hyper is None:
             raise RuntimeError("hyper step requested without hyper configuration")
         pre = self.hyper._pre(layer_idx, ref=streams)
         x_pre = cast(Tensor, (streams * pre.view(1, 1, -1, 1)).sum(dim=2))
-        delta = block.delta(x_pre)
+        delta = block.delta(x_pre, x0=x0)
         post = self.hyper._post(layer_idx, ref=streams)
         update = delta.unsqueeze(2) * post.view(1, 1, -1, 1) * float(self.hyper.update_scale)
         res = self.hyper._res(layer_idx, ref=streams)
@@ -729,6 +771,8 @@ class EvolutionModel(nn.Module):
         spec_idx: int,
         rec_cfg: RecurrenceConfig,
         prelude_output: Tensor,
+        *,
+        x0: Tensor,
     ) -> Tensor:
         # Determine current loop count
         end_idx = min(rec_cfg.end, len(self.blocks))
@@ -741,7 +785,7 @@ class EvolutionModel(nn.Module):
         for _ in range(current_steps):
             h = state
             for block_idx in range(start_idx, end_idx):
-                h = self._run_block(self.blocks[block_idx], h)
+                h = self._run_block(self.blocks[block_idx], h, x0=x0)
             adapter_input = torch.cat([prelude_output, h], dim=-1) if rec_cfg.concat_prelude else h
             state = adapter(adapter_input, h)
         return state
@@ -751,6 +795,8 @@ class EvolutionModel(nn.Module):
         spec_idx: int,
         rec_cfg: RecurrenceConfig,
         prelude_output: Tensor,
+        *,
+        x0: Tensor,
     ) -> Tensor:
         if self.hyper is None or not self.hyper.enabled():
             raise RuntimeError("hyper recurrence requested without hyper configuration")
@@ -768,7 +814,7 @@ class EvolutionModel(nn.Module):
             h = state
             for block_idx in range(start_idx, end_idx):
                 h = self._run_hyper_block(
-                    block_idx, cast(EvolutionBlock, self.blocks[block_idx]), h
+                    block_idx, cast(EvolutionBlock, self.blocks[block_idx]), h, x0=x0
                 )
             h_flat = h.reshape(b, t, flat_dim)
             adapter_input = (

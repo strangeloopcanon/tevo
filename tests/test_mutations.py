@@ -5,20 +5,35 @@ from transformer_evolution_llm.dsl import (
     CustomModuleConfig,
     LookupMemoryConfig,
     MoEFFNConfig,
+    RecurrenceConfig,
     RetroConfig,
 )
 from transformer_evolution_llm.mutations import (
     add_additional_recurrence,
+    add_embedding_ffn_branch,
     dense_to_moe,
     insert_custom_module,
     insert_lookup_memory,
     insert_retro_module,
     make_gqa,
+    moe_to_dense,
     mutate_topk,
+    mutate_with_trace,
+    mutation_names,
+    register_mutation,
+    remove_block_span,
+    remove_embedding_ffn_branch,
+    remove_recurrence,
+    sanitize_topology,
+    simplify_attention,
+    strip_extras,
+    template_registry_name,
+    toggle_ffn_input_source,
     toggle_gated_mix,
     toggle_hyper_connections,
     toggle_optimizer,
     tune_clip,
+    tune_embedding_ffn_branch,
     tune_lookup_memory,
     tune_optimizer,
     tune_warmup,
@@ -137,3 +152,100 @@ def test_add_additional_recurrence_keeps_train_le_max(tiny_spec: ArchitectureSpe
         assert child.model.recurrences, "expected recurrence to be added"
         rec = child.model.recurrences[-1]
         assert rec.train_recurrence <= rec.max_train_recurrence
+
+
+def test_remove_block_span_preserves_at_least_one_block(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks = [spec.model.blocks[0].model_copy(deep=True) for _ in range(3)]
+    child = remove_block_span(spec, rng=random.Random(13))  # noqa: S311
+    assert len(child.model.blocks) >= 1
+    assert len(child.model.blocks) < len(spec.model.blocks)
+
+
+def test_moe_to_dense_reduces_moe_count(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    for _ in range(2):
+        spec = dense_to_moe(spec, rng=random.Random(14))  # noqa: S311
+    before = spec.model.moe_block_count()
+    child = moe_to_dense(spec, rng=random.Random(15))  # noqa: S311
+    assert child.model.moe_block_count() <= before
+
+
+def test_strip_extras_removes_one_extra(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec = insert_custom_module(spec, rng=random.Random(16))  # noqa: S311
+    before = len(spec.model.blocks[0].extras)
+    child = strip_extras(spec, rng=random.Random(17))  # noqa: S311
+    assert len(child.model.blocks[0].extras) <= before
+
+
+def test_remove_recurrence_removes_entries(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks = [spec.model.blocks[0], spec.model.blocks[0].model_copy(deep=True)]
+    spec = add_additional_recurrence(spec, rng=random.Random(18))  # noqa: S311
+    child = remove_recurrence(spec, rng=random.Random(19))  # noqa: S311
+    assert len(child.model.recurrences) <= len(spec.model.recurrences)
+
+
+def test_simplify_attention_sets_mha(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks[0].attn.kind = "MLA"
+    child = simplify_attention(spec, rng=random.Random(20))  # noqa: S311
+    assert child.model.blocks[0].attn.kind == "MHA"
+
+
+def test_sanitize_topology_clamps_indices(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks = [spec.model.blocks[0], spec.model.blocks[0].model_copy(deep=True)]
+    spec.model.recurrences = [RecurrenceConfig(start=0, end=2)]
+    spec.model.recurrences[0].end = 99
+    sanitize_topology(spec)
+    assert spec.model.recurrences[0].end <= len(spec.model.blocks)
+
+
+def test_mutate_with_trace_reports_selected_keys(tiny_spec: ArchitectureSpec) -> None:
+    key = "unit_test_identity_mutation"
+
+    def _identity(spec: ArchitectureSpec, _rng: random.Random):
+        return spec.model_copy(deep=True)
+
+    register_mutation(key, _identity)
+    label, _mutated, trace = mutate_with_trace(
+        tiny_spec,
+        rng=random.Random(21),  # noqa: S311
+        weights={name: (1.0 if name == key else 0.0) for name in mutation_names()},
+        steps=1,
+    )
+    assert key in label
+    assert trace == [key]
+
+
+def test_template_entries_registered() -> None:
+    assert any(name.startswith("tpl::") for name in mutation_names())
+    assert template_registry_name("example-template") == "tpl::example-template"
+
+
+def test_toggle_ffn_input_source_changes_field(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks[0].ffn.input_source = "residual"
+    child = toggle_ffn_input_source(spec, rng=random.Random(22))  # noqa: S311
+    assert child.model.blocks[0].ffn is not None
+    assert child.model.blocks[0].ffn.input_source in {"residual", "embedding"}
+    assert child.model.blocks[0].ffn.input_source != "residual"
+
+
+def test_add_and_remove_embedding_ffn_branch(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    assert getattr(spec.model.blocks[0], "ffn_memory", None) is None
+    child = add_embedding_ffn_branch(spec, rng=random.Random(23))  # noqa: S311
+    assert getattr(child.model.blocks[0], "ffn_memory", None) is not None
+    removed = remove_embedding_ffn_branch(child, rng=random.Random(24))  # noqa: S311
+    assert getattr(removed.model.blocks[0], "ffn_memory", None) is None
+
+
+def test_tune_embedding_ffn_branch_keeps_valid(tiny_spec: ArchitectureSpec) -> None:
+    spec = add_embedding_ffn_branch(tiny_spec, rng=random.Random(25))  # noqa: S311
+    tuned = tune_embedding_ffn_branch(spec, rng=random.Random(26))  # noqa: S311
+    branch = getattr(tuned.model.blocks[0], "ffn_memory", None)
+    assert branch is not None
+    assert branch.hidden > 0

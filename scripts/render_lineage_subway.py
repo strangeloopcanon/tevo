@@ -14,6 +14,8 @@ app = typer.Typer(help="Render lineage JSON into a generation-grouped Mermaid di
 
 def _load_nodes(path: Path) -> list[dict]:
     data = json.loads(path.read_text())
+    if isinstance(data, dict):
+        data = data.get("nodes", [])
     if not isinstance(data, list):
         raise typer.BadParameter("Lineage JSON must be a list of nodes.")
     return data
@@ -101,4 +103,3 @@ def main(
 
 if __name__ == "__main__":
     app()
-

@@ -16,7 +16,7 @@ The DSL defines what can exist; the evolution config defines what is *likely* to
 - The mutation registry includes operators that touch those structures.
 - The evaluation loop surfaces metrics that reward those structures.
 
-## 2. Hard structural gates are non‑negotiable
+## 2. Hard gates are the floor; schedules are the ramp
 
 Without structural gates we consistently observed collapse to trivial architectures:
 
@@ -40,7 +40,9 @@ Candidates that violate these thresholds are rejected before training.
 - Reject candidates with too few sparse/mixture components.
 - Reject candidates that lack the memory/recurrence you want to explore.
 
-This does **not** hard‑code a specific blueprint; it simply says “anything below this complexity is not part of this experiment.”
+For progressive runs, use `gate_schedule` to increase those floors by generation (for example, `min_layers: 2 -> 4 -> 8`). This keeps early search broad, then gradually shifts pressure toward richer structures.
+
+This does **not** hard‑code a specific blueprint; it says “anything below this complexity band is not part of this phase of the experiment.”
 
 ## 3. Seeds matter: start in the right basin
 
@@ -86,9 +88,11 @@ Evolution only explores what mutations let it explore. We broadened the mutation
 
 - **Depth / structure**
   - `duplicate_block_span`, `shuffle_block_span` – depth and ordering changes.
+  - `remove_block_span` – contiguous shrink edits to counter one-way growth pressure.
   - `graph_jitter` – small neutral structural edits to increase entropy.
 - **MoE / experts**
   - `dense_to_moe`, `mutate_topk`, `shift_moe`.
+  - `moe_to_dense` – inverse simplification path from MoE back to dense FFN.
   - `tune_experts` – jitter expert counts and top‑k.
   - `tune_router`, `tune_router_coeffs` – router type, temperature, and load‑balance coefficients.
 - **Attention**
@@ -98,22 +102,26 @@ Evolution only explores what mutations let it explore. We broadened the mutation
   - `tune_attn_sparsity` – sparsity mode and local/global window sizes.
   - `toggle_selector` – enable/disable selectors and retune top‑k/heads.
   - `toggle_qk_norm` – enable/disable QK norm clamping.
+  - `simplify_attention` – convert specialized attention kinds back to `MHA`.
 - **FFN / MLP**
   - `tune_ffn_width_activation` – jitter hidden size and activation type.
 - **Memory / recurrence**
   - `insert_retro_module`, `tune_retro` – retro memory size, stride, and gating.
   - `add_recurrence`, `add_additional_recurrence`, `tune_recurrence` – recurrence spans and settings.
+  - `remove_recurrence` – remove recurrence paths when they stop paying off.
 - **Misc**
-  - `insert_custom_module`, `toggle_gated_mix`, `toggle_ssm`, `tune_kv`, etc.
+  - `insert_custom_module`, `toggle_gated_mix`, `toggle_ssm`, `tune_kv`, `strip_extras`, etc.
 
 We also introduced:
 
 - **Weighted mutation selection** – `--mutation-weight name=weight` lets us favour particular mutation types.
 - **Multi‑step mutation** – `--mutation-steps N` chains N mutations per child, so each candidate can undergo a compound transformation.
+- **Dynamic mutation registration** – template mutations are registered as individual `tpl::...` entries (and plugins can register new entries), so adaptive weighting can learn at per-mutation granularity.
 
 **Pattern:** For any target regime:
 
 - Include mutations that directly move the levers you care about.
+- Include both grow and shrink operators so search can recover from over-complexification.
 - Up‑weight those mutations so they occur frequently.
 - Allow multi‑step mutations so richer edits can occur in one generation.
 
@@ -124,16 +132,31 @@ Even with gates and a rich mutation set, it is easy for the pool to collapse to 
 - **Structural elites**:
   - Maintain a small set of candidates chosen purely by structural score (e.g., weighted combination of layers, MoE blocks, selector blocks).
   - These elites are protected from trimming even if they are slower or slightly worse on short‑term perplexity.
-- **Novelty and graph entropy objectives**:
-  - Reward candidates that are structurally distinct (e.g., different block types, sparsity patterns, memory placements).
+- **Archive novelty and graph entropy objectives**:
+  - Reward candidates by kNN sparseness against a novelty archive, not only parent-relative distance.
+  - This captures “different from what has been seen globally,” not just “different from my parent.”
   - Encourage multiple lineages instead of a single scaffold with minor hyperparameter tweaks.
+- **Complexity banding (optional MAP-Elites keying)**:
+  - Add a coarse complexity band to archive keys to prevent early simple models from crowding out nascent complex candidates.
 
 **Pattern:** To avoid premature convergence:
 
 - Keep a few structurally rich candidates alive regardless of short‑term metrics.
 - Reward structural novelty and entropy alongside quality/efficiency.
 
-## 7. What the strict deep runs validated
+## 7. Crossover quality depends on alignment
+
+Naive positional crossover is easy but fragile: index-based splicing often mixes non-homologous blocks and limits checkpoint transfer utility.
+
+The current approach aligns blocks using structural similarity plus lineage IDs (`origin_id`, `parent_origin`), then:
+
+- Inherits aligned/disjoint blocks with fitter-parent bias.
+- Transfers checkpoint tensors using explicit source maps instead of pure positional index.
+- Emits per-child crossover reports (`matched`, `disjoint`, transfer/dropped tensor counts) into lineage artifacts.
+
+**Pattern:** If crossover is a core operator, treat block identity and alignment as first-class data; otherwise crossover becomes mostly random restart pressure.
+
+## 8. What the strict deep runs validated
 
 In the strict deep experiments, we combined:
 
@@ -152,7 +175,7 @@ The resulting frontier consistently contained:
 
 This is a qualitatively different outcome from the initial shallow runs and aligns with the “multi‑branch + sparse + expert” regime we intended to explore.
 
-## 8. General recipe for targeting a new family of architectures
+## 9. General recipe for targeting a new family of architectures
 
 Given the above, a useful mental checklist for future experiments is:
 
@@ -180,4 +203,3 @@ Given the above, a useful mental checklist for future experiments is:
    - Use structural elites and novelty/entropy objectives to keep multiple structurally distinct lineages alive.
 
 Following this recipe, the search is not “magical,” but it becomes a controlled way to *probe a particular architectural family* under realistic resource constraints. The small surrogate then acts as a fast‑feedback environment for discovering promising motifs to scale up. 
-
