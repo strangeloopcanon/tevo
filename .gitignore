@@ -10,6 +10,7 @@ htmlcov/
 .ruff_cache/
 .codex/
 .benchmarks/
+.tmp/
 .venv/
 *.egg-info/
 .beads/*.jsonl
@@ -22,7 +23,6 @@ seeds/
 .beads/
 .env
 .env.*
-.secrets.baseline
 paper_2511_07384.pdf
 paper_2511_07384.txt
 debrief.md
