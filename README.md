@@ -5,16 +5,16 @@ An evolutionary architecture-search loop for Transformer-like language models.
 
 Architectures are defined in typed YAML (Pydantic). The loop mutates/crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. To keep the search practical, children can inherit weights from parents and crossover merges checkpoints when possible.
 
-## Punchline (Clean Behavioral Run)
+## Punchline (Emergent Behavioral Motifs)
 
-When selection is purely behavioral (quality + memory/speed + novelty/entropy), the frontier still repeatedly discovers *embedding-conditioned FFNs* (FFNs that read token embeddings instead of the residual stream). This trait was not an explicit objective.
+Purely behavioral selection (loss + memory/speed + novelty/entropy) repeatedly discovers *embedding-conditioned FFNs* (FFNs that read token embeddings instead of the residual stream). This trait was not an explicit objective.
 
 Example (Modal A10G, 64 generations, vanilla 4-layer seed; short-budget proxies):
 - best `ppl_code`: `1331 -> 791`
 - `long_recall`: `0.0 -> 1.175`
 - `kv_bytes_per_token`: `8192 -> 7168`
 
-Motif: early embedding-conditioned FFNs + mixed `MHA/GQA` attention + small memory extras.
+Motif: early embedding-conditioned FFNs + mixed `MHA/GQA` attention + lightweight memory extras.
 
 Repro:
 ```bash
