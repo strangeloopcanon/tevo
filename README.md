@@ -45,18 +45,18 @@ See “Run Folder: What’s What” below for the full list.
 - **Not a leaderboard:** the NanoGPT-style benchmark is for repeatable *within-repo* comparisons. The micro-benchmark numbers in this README used a tiny packed OpenWebText subset; regenerate a larger cache before drawing conclusions.
 - **Not interpretability tooling:** this repo can discover motifs; it does not (yet) provide mechanistic explanations for why a motif works.
 
-## Practical NAS vs NEAT-Lineage Modes
+## Search Regimes
 
-So what: this repo supports both "practical constrained NAS" and "more open-ended lineage pressure" without maintaining separate code paths.
+So what: the same engine can be run in a "constrained optimization" posture or a more "exploration-heavy" posture purely via config.
 
-- **Practical constrained NAS (default posture):**
+- **Constrained optimization (default posture):**
   - Fixed `rung0_thresholds`, stronger quality/efficiency objectives, and selection tuned for stable gains.
   - Best when you want reproducible improvements around a known baseline family.
-- **NEAT-lineage exploration posture (config-driven):**
-  - Enable `gate_schedule`, novelty-heavy objectives, MAP-Elites complexity banding, and broader mutation mix.
-  - Best when you want multiple structurally distinct lineages and gradual complexification pressure.
+- **Exploration-heavy posture (config-driven):**
+  - Enable `gate_schedule`, novelty-heavy objectives, MAP-Elites complexity banding, and a broader mutation mix.
+  - Best when you want multiple structurally distinct families and gradual complexification pressure.
 
-In both modes, the search space is still bounded by the DSL + registered mutations.
+In both regimes, the search space is bounded by the DSL + registered mutations.
 
 <details>
 <summary>Extending the search space (adding a new primitive)</summary>
@@ -391,7 +391,7 @@ evolution:
     throughput: max
 ```
 
-### Profile D: Progressive NEAT-Lineage Exploration
+### Profile D: Progressive Complexity Exploration
 
 Use when you want minimal-to-complex pressure, novelty niches, and broader structural exploration in one run.
 
@@ -594,16 +594,14 @@ The current phase runs on laptop-scale surrogates (~65–100M parameters). The n
 2. **Speedrun-style eval (implemented)**: Measure time/tokens-to-target under a NanoGPT-like recipe, so architectures are judged on training efficiency. Next: scale the packed-token cache and calibrate targets so this metric has useful dynamic range (see `docs/nanogpt_benchmark.md`).
 3. **Multi-GPU evolution** with ZeRO-1 or FSDP for larger populations.
 
-### Architectures of Interest
+### Component Coverage
 
-The DSL includes knobs inspired by recent architecture work:
+The DSL includes optional components that often matter for the quality/speed/memory frontier:
 
-| Architecture | Key Ideas | DSL Components |
-|--------------|-----------|----------------|
-| [**Titans**](https://arxiv.org/abs/2501.00663) (Google) | Neural long-term memory, attention-as-memory | `retro`, `assoc_memory`, `memory_tokens` |
-| [**DeepSeek MoE**](https://arxiv.org/abs/2401.06066) | Fine-grained experts, shared expert routing | `moe` FFN, `router` configs, `shared` experts |
-| [**Mamba/SSM hybrids**](https://arxiv.org/abs/2312.00752) | State-space models mixed with attention | `ssm` blocks, `toggle_ssm` mutations |
-| [**MLA (Multi-head Latent Attention)**](https://arxiv.org/abs/2405.04434) | Latent KV compression | `MLA` attention kind, `kv_policy` |
+- Memory-augmented extras (`retro`, `assoc_memory`, `memory_tokens`)
+- Routed FFNs (`moe` FFN, router configs, optional shared experts)
+- Hybrid sequence modules (`ssm` blocks and related mutations)
+- KV compression policies (`kv_policy` and compatible attention kinds)
 
 Evolution can recombine these ingredients under different constraints/objectives.
 

@@ -1,5 +1,5 @@
 model:
-  name: exp-titan-like-memory-modal-test-v1
+  name: exp-memory-extras-modal-test-v1
   emb:
     dim: 512
     vocab: 50257
@@ -660,7 +660,7 @@ evolution:
   template_learning_max_weight: 5.0
   template_learning_max_templates: 128
   template_learning_save_every: 20
-  template_learning_save_path: runs/template_learning/exp_titan_like_memory_modal_test_v1_templates.json
+  template_learning_save_path: runs/template_learning/exp_memory_extras_modal_test_v1_templates.json
   template_learning_promote_min_delta: 0.0
 priors:
   tokens_per_param: 4.0
