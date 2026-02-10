@@ -5,6 +5,26 @@ An evolutionary architecture-search loop for Transformer-like language models.
 
 Architectures are defined in typed YAML (Pydantic). The loop mutates/crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. To keep the search practical, children can inherit weights from parents and crossover merges checkpoints when possible.
 
+## Punchline (Clean Behavioral Run)
+
+When selection is purely behavioral (quality + memory/speed + novelty/entropy), the frontier still repeatedly discovers *embedding-conditioned FFNs* (FFNs that read token embeddings instead of the residual stream). This trait was not an explicit objective.
+
+Example (Modal A10G, 64 generations, vanilla 4-layer seed; short-budget proxies):
+- best `ppl_code`: `1331 -> 791`
+- `long_recall`: `0.0 -> 1.175`
+- `kv_bytes_per_token`: `8192 -> 7168`
+
+Motif: early embedding-conditioned FFNs + mixed `MHA/GQA` attention + small memory extras.
+
+Repro:
+```bash
+TEVO_MODAL_GPU=A10G modal run scripts/modal_run_live.py \
+  --config-path configs/exp_behavioral_memory_modal_v1.yaml \
+  --generations 64 --steps 160 --eval-batches 4 --seed 0 \
+  --download --local-out-dir runs/modal \
+  --cleanup-old-checkpoints --prune-checkpoints-to-frontier --lineage
+```
+
 ## Why This Exists
 
 This repo is a sandbox for answering questions like: “under a fixed training recipe and constraints, what kinds of architectural motifs survive?”
