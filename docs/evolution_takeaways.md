@@ -1,8 +1,33 @@
 # Evolutionary Architecture Takeaways
 
-This document summarizes what we have learned so far from multiple evolutionary sweeps over the small surrogate model. It is intentionally architecture‑agnostic and focuses on *how to set up evolution* so that specific families of architectures can emerge, rather than hard‑coding them.
+This document summarizes what we have learned so far from multiple evolutionary sweeps over the small surrogate model. It is intentionally architecture-agnostic and focuses on *how to set up evolution* so that specific families of architectures can emerge, rather than hard-coding them.
 
-## 1. Evolution is only as good as its search space
+## Scientific Goals & Findings
+
+### What we set out to learn
+
+- Can we evolve genuinely new LLM blueprints -- beyond familiar transformer tweaks -- using only ~100M parameter surrogates?
+- Do hybrids (retro memory + sparse attention + MoE/SSM toggles) outperform single tricks when tokens are scarce?
+- Is a fully-auditable lineage enough to explain breakthroughs?
+
+### What we're seeing so far
+
+- **Explicit memory is stable**: When long-context probes are used, survivors almost always carry memory primitives (retro + token/chunk/assoc variants).
+- **Selection pressure dominates**: Different selection strategies (`map_elites` vs. lexicase) maintain different niches.
+- **Convergent Evolution**: The system reliably rediscovers known distinct classes of building blocks (explicit memory, routing/gating, depth reuse) without being explicitly told to look for them.
+- **Speedrun objectives expose "recipe correctness"**: In a 256-candidate NanoGPT anytime-speedrun sweep on Modal A10G (`modal_speedrun_owt10m_v10_anytime_full9`), the top frontier point reduced `speedrun_end_eval_loss` from `7.72 -> 6.61` (so `ppl_eval~2251 -> ~745`) and `speedrun_loss_auc` from `7.68 -> 7.03`, with a small throughput drop (~2.4%). The winner is still a 12-layer MHA baseline, but evolution added lightweight extras (`memory_tokens`, LayerScale, gating) and AdamW tweaks; the final large jump was switching CUDA precision to bf16 (our fp16 path uses autocast without a GradScaler).
+
+### So what (what this implies)
+
+- These runs are an *architecture microscope*: at ~65-85M params and a few hundred steps, the loop finds convergent motifs (memory, routing/gating, depth reuse) without being told to chase any named target.
+- The frontier is a function of constraints: rung0 gates (params/KV/throughput + optional minima) decide what survives long enough to train; objective weights decide what gets rewarded.
+- When a motif appears in lineage but not the frontier, it's usually filtered by instability (NaNs) or rung0 gates before it can pay off; relaxing gates or increasing rung budgets changes the reachable regime.
+
+---
+
+## Operational Lessons
+
+### 1. Evolution is only as good as its search space
 
 The DSL defines what can exist; the evolution config defines what is *likely* to appear. In practice:
 
@@ -16,7 +41,7 @@ The DSL defines what can exist; the evolution config defines what is *likely* to
 - The mutation registry includes operators that touch those structures.
 - The evaluation loop surfaces metrics that reward those structures.
 
-## 2. Hard gates are the floor; schedules are the ramp
+### 2. Hard gates are the floor; schedules are the ramp
 
 Without structural gates we consistently observed collapse to trivial architectures:
 
@@ -44,7 +69,7 @@ For progressive runs, use `gate_schedule` to increase those floors by generation
 
 This does **not** hard‑code a specific blueprint; it says “anything below this complexity band is not part of this phase of the experiment.”
 
-## 3. Seeds matter: start in the right basin
+### 3. Seeds matter: start in the right basin
 
 Even with gates, starting from a trivial seed asks evolution to climb a huge hill under a tiny budget. We saw this when initial seeds had only a handful of layers and experts: complex variants appeared but were quickly out‑selected.
 
@@ -59,7 +84,7 @@ A much better pattern is:
 
 This is analogous to starting from a good baseline model: evolution then explores variations *within* a rich regime instead of having to discover that regime from scratch.
 
-## 4. Budget and score weights decide what “good” means
+### 4. Budget and score weights decide what “good” means
 
 We experimented with different score weights and budgets. The results were clear:
 
@@ -82,7 +107,7 @@ Key knobs:
 - Down‑weight or temporarily ignore others (e.g. throughput early on).
 - Ensure the budget is large enough that complex candidates can improve these metrics.
 
-## 5. Mutation mix is a policy, not a constant
+### 5. Mutation mix is a policy, not a constant
 
 Evolution only explores what mutations let it explore. We broadened the mutation space to include:
 
@@ -125,7 +150,7 @@ We also introduced:
 - Up‑weight those mutations so they occur frequently.
 - Allow multi‑step mutations so richer edits can occur in one generation.
 
-## 6. Preserve structural diversity (structural elites + novelty)
+### 6. Preserve structural diversity (structural elites + novelty)
 
 Even with gates and a rich mutation set, it is easy for the pool to collapse to a narrow set of patterns. We mitigated this via:
 
@@ -144,7 +169,7 @@ Even with gates and a rich mutation set, it is easy for the pool to collapse to 
 - Keep a few structurally rich candidates alive regardless of short‑term metrics.
 - Reward structural novelty and entropy alongside quality/efficiency.
 
-## 7. Crossover quality depends on alignment
+### 7. Crossover quality depends on alignment
 
 Naive positional crossover is easy but fragile: index-based splicing often mixes non-homologous blocks and limits checkpoint transfer utility.
 
@@ -156,7 +181,7 @@ The current approach aligns blocks using structural similarity plus lineage IDs 
 
 **Pattern:** If crossover is a core operator, treat block identity and alignment as first-class data; otherwise crossover becomes mostly random restart pressure.
 
-## 8. What the strict deep runs validated
+### 8. What the strict deep runs validated
 
 In the strict deep experiments, we combined:
 
@@ -175,7 +200,7 @@ The resulting frontier consistently contained:
 
 This is a qualitatively different outcome from the initial shallow runs and aligns with the “multi‑branch + sparse + expert” regime we intended to explore.
 
-## 9. General recipe for targeting a new family of architectures
+### 9. General recipe for targeting a new family of architectures
 
 Given the above, a useful mental checklist for future experiments is:
 
