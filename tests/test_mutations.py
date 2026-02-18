@@ -16,6 +16,8 @@ from transformer_evolution_llm.mutations import (
     insert_lookup_memory,
     insert_retro_module,
     make_gqa,
+    mix_method_recipe,
+    mix_optimizer_recipe,
     moe_to_dense,
     mutate_topk,
     mutate_with_trace,
@@ -24,18 +26,26 @@ from transformer_evolution_llm.mutations import (
     remove_block_span,
     remove_embedding_ffn_branch,
     remove_recurrence,
+    resample_optimizer_base,
     sanitize_topology,
     simplify_attention,
     strip_extras,
     template_registry_name,
     toggle_ffn_input_source,
     toggle_gated_mix,
+    toggle_gradient_transform_mode,
     toggle_hyper_connections,
-    toggle_optimizer,
+    toggle_update_filter_mode,
     tune_clip,
     tune_embedding_ffn_branch,
+    tune_gradient_transform_eps,
+    tune_gradient_transform_ns_steps,
     tune_lookup_memory,
     tune_optimizer,
+    tune_update_filter_block_size,
+    tune_update_filter_granularity,
+    tune_update_filter_momentum_blend,
+    tune_update_filter_ratio,
     tune_warmup,
 )
 
@@ -105,18 +115,17 @@ def test_tune_lookup_memory_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> N
     assert 0 < mem.topk <= mem.entries
 
 
-def test_toggle_optimizer_flips_name(tiny_spec: ArchitectureSpec) -> None:
+def test_resample_optimizer_base_changes_name(tiny_spec: ArchitectureSpec) -> None:
     rng = random.Random(9)  # noqa: S311 - deterministic unit tests
-    first = toggle_optimizer(tiny_spec, rng=rng)
-    assert first.train.optimizer.name == "lion"
-    second = toggle_optimizer(first, rng=rng)
-    assert second.train.optimizer.name == "adamw"
+    first = resample_optimizer_base(tiny_spec, rng=rng)
+    assert first.train.optimizer.name in {"adamw", "lion", "muon"}
+    assert first.train.optimizer.name != tiny_spec.train.optimizer.name
 
 
 def test_tune_optimizer_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
     rng = random.Random(10)  # noqa: S311 - deterministic unit tests
     child = tune_optimizer(tiny_spec, rng=rng)
-    assert child.train.optimizer.name in {"adamw", "lion"}
+    assert child.train.optimizer.name in {"adamw", "lion", "muon"}
     if child.train.optimizer.lr is not None:
         assert child.train.optimizer.lr > 0.0
         assert child.train.optimizer.lr <= 5e-3
@@ -129,6 +138,71 @@ def test_tune_optimizer_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
         beta1, beta2 = child.train.optimizer.betas
         assert 0.0 <= beta1 < 1.0
         assert 0.0 <= beta2 < 1.0
+    if child.train.optimizer.name == "muon":
+        momentum = child.train.optimizer.muon_momentum
+        assert momentum is None or (0.5 <= momentum <= 0.999)
+        assert child.train.optimizer.muon_ns_steps >= 1
+
+
+def test_gradient_transform_mutations_keep_bounds(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(1010)  # noqa: S311 - deterministic unit tests
+    child = toggle_gradient_transform_mode(tiny_spec, rng=rng)
+    child = tune_gradient_transform_ns_steps(child, rng=rng)
+    child = tune_gradient_transform_eps(child, rng=rng)
+    transform = child.train.optimizer.gradient_transform
+    assert transform.mode in {
+        "identity",
+        "sign",
+        "normalize",
+        "orthogonalize_2d",
+        "sign_orthogonalize_2d",
+    }
+    assert transform.ns_steps >= 1
+    assert transform.eps > 0.0
+
+
+def test_mix_optimizer_recipe_changes_recipe_dimensions(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(1011)  # noqa: S311 - deterministic unit tests
+    child = mix_optimizer_recipe(tiny_spec, rng=rng)
+    before = tiny_spec.train.optimizer
+    after = child.train.optimizer
+    changed = (
+        before.name != after.name
+        or before.lr != after.lr
+        or before.weight_decay != after.weight_decay
+        or before.gradient_transform.mode != after.gradient_transform.mode
+        or before.update_filter.mode != after.update_filter.mode
+        or before.update_filter.keep_ratio != after.update_filter.keep_ratio
+    )
+    assert changed
+
+
+def test_mix_method_recipe_changes_method_dimensions(tiny_spec: ArchitectureSpec) -> None:
+    changed_any = False
+    for seed in range(20):
+        child = mix_method_recipe(tiny_spec, rng=random.Random(2000 + seed))  # noqa: S311
+        before = tiny_spec
+        after = child
+        method_changed = (
+            before.train.optimizer.name != after.train.optimizer.name
+            or before.train.optimizer.gradient_transform.mode
+            != after.train.optimizer.gradient_transform.mode
+            or before.train.optimizer.update_filter.mode != after.train.optimizer.update_filter.mode
+            or len(before.model.recurrences) != len(after.model.recurrences)
+            or any(
+                (b0.attn is not None and b1.attn is not None and b0.attn.kind != b1.attn.kind)
+                for b0, b1 in zip(before.model.blocks, after.model.blocks, strict=False)
+            )
+            or any(
+                len(b0.extras) != len(b1.extras)
+                for b0, b1 in zip(before.model.blocks, after.model.blocks, strict=False)
+            )
+            or before.model.moe_block_count() != after.model.moe_block_count()
+        )
+        if method_changed:
+            changed_any = True
+            break
+    assert changed_any
 
 
 def test_tune_warmup_changes_value(tiny_spec: ArchitectureSpec) -> None:
@@ -218,6 +292,32 @@ def test_mutate_with_trace_reports_selected_keys(tiny_spec: ArchitectureSpec) ->
     )
     assert key in label
     assert trace == [key]
+
+
+def test_mutate_with_trace_honors_allowlist(tiny_spec: ArchitectureSpec) -> None:
+    label, _mutated, trace = mutate_with_trace(
+        tiny_spec,
+        rng=random.Random(210),  # noqa: S311
+        allowed_names=["mix_optimizer_recipe"],
+        steps=3,
+    )
+    assert label == "mix_optimizer_recipe+mix_optimizer_recipe+mix_optimizer_recipe"
+    assert trace == ["mix_optimizer_recipe", "mix_optimizer_recipe", "mix_optimizer_recipe"]
+
+
+def test_update_filter_mutations_keep_bounds(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(211)  # noqa: S311
+    child = toggle_update_filter_mode(tiny_spec, rng=rng)
+    assert child.train.optimizer.update_filter.mode in {"none", "bernoulli", "topk"}
+    child = tune_update_filter_ratio(child, rng=rng)
+    child = tune_update_filter_granularity(child, rng=rng)
+    child = tune_update_filter_momentum_blend(child, rng=rng)
+    child = tune_update_filter_block_size(child, rng=rng)
+    filt = child.train.optimizer.update_filter
+    assert 0.0 < filt.keep_ratio <= 1.0
+    assert filt.granularity in {"element", "block"}
+    assert 0.0 <= filt.momentum_blend <= 1.0
+    assert filt.block_size >= 1
 
 
 def test_template_entries_registered() -> None:

@@ -42,7 +42,21 @@ def test_graph_entropy_uses_resolved_sparsity_pattern(tiny_spec: ArchitectureSpe
 def test_behavioral_descriptor_fixed_shape(tiny_spec: ArchitectureSpec) -> None:
     descriptor = behavioral_descriptor(tiny_spec)
     assert isinstance(descriptor, list)
-    assert len(descriptor) == 13
+    assert len(descriptor) == 21
+
+
+def test_behavioral_descriptor_changes_with_optimizer_filter(tiny_spec: ArchitectureSpec) -> None:
+    baseline = tiny_spec.model_copy(deep=True)
+    variant = tiny_spec.model_copy(deep=True)
+    variant.train.optimizer.name = "muon"
+    variant.train.optimizer.gradient_transform.mode = "sign_orthogonalize_2d"
+    variant.train.optimizer.gradient_transform.ns_steps = 7
+    variant.train.optimizer.gradient_transform.eps = 1e-6
+    variant.train.optimizer.update_filter.mode = "topk"
+    variant.train.optimizer.update_filter.keep_ratio = 0.5
+    variant.train.optimizer.update_filter.granularity = "block"
+    variant.train.optimizer.update_filter.momentum_blend = 0.75
+    assert behavioral_descriptor(baseline) != behavioral_descriptor(variant)
 
 
 def test_archive_novelty_decreases_for_similar_points() -> None:

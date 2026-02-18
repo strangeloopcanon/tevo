@@ -76,3 +76,26 @@ def test_ablation_moe_to_dense_replaces_moe_ffn() -> None:
     mutated = apply_ablation(spec, "moe_to_dense")
     ffn = mutated.model.blocks[0].ffn
     assert getattr(ffn, "type", "") == "dense"
+
+
+def test_ablation_mask_off_sets_filter_mode_none() -> None:
+    spec = _base_spec()
+    spec.train.optimizer.update_filter.mode = "topk"
+    mutated = apply_ablation(spec, "mask_off")
+    assert mutated.train.optimizer.update_filter.mode == "none"
+
+
+def test_ablation_mask_ratio_one_sets_keep_ratio_to_one() -> None:
+    spec = _base_spec()
+    spec.train.optimizer.update_filter.keep_ratio = 0.4
+    mutated = apply_ablation(spec, "mask_ratio_one")
+    assert mutated.train.optimizer.update_filter.keep_ratio == 1.0
+
+
+def test_ablation_optimizer_to_adamw_forces_family() -> None:
+    spec = _base_spec()
+    spec.train.optimizer.name = "muon"
+    spec.train.optimizer.muon_momentum = 0.9
+    mutated = apply_ablation(spec, "optimizer_to_adamw")
+    assert mutated.train.optimizer.name == "adamw"
+    assert mutated.train.optimizer.muon_momentum is None

@@ -843,6 +843,35 @@ class OptimizerConfig(BaseModel):
     muon_momentum: float | None = Field(default=None, ge=0.0, le=1.0)
     muon_nesterov: bool = True
     muon_ns_steps: int = Field(default=5, ge=1)
+    gradient_transform: GradientTransformConfig = Field(
+        default_factory=lambda: GradientTransformConfig()
+    )
+    update_filter: UpdateFilterConfig = Field(default_factory=lambda: UpdateFilterConfig())
+
+
+class UpdateFilterConfig(BaseModel):
+    """Generic stochastic update filtering policy for optimizer steps."""
+
+    mode: Literal["none", "bernoulli", "topk"] = "none"
+    keep_ratio: float = Field(default=1.0, gt=0.0, le=1.0)
+    granularity: Literal["element", "block"] = "element"
+    block_size: int = Field(default=128, ge=1)
+    momentum_blend: float = Field(default=0.0, ge=0.0, le=1.0)
+    rescale_kept: bool = True
+
+
+class GradientTransformConfig(BaseModel):
+    """Optional gradient-space transforms applied before optimizer updates."""
+
+    mode: Literal[
+        "identity",
+        "sign",
+        "normalize",
+        "orthogonalize_2d",
+        "sign_orthogonalize_2d",
+    ] = "identity"
+    ns_steps: int = Field(default=5, ge=1)
+    eps: float = Field(default=1e-8, gt=0.0)
 
 
 class DatasetShard(BaseModel):
@@ -1007,6 +1036,17 @@ class EvolutionConfig(BaseModel):
         default_factory=list,
         description="Importable Python modules that register extra mutations at runtime.",
     )
+    mutation_allowlist: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional mutation-name allowlist. If provided, only listed mutations "
+            "can be sampled during mutation steps."
+        ),
+    )
+    mutation_weights: dict[str, float] | None = Field(
+        default=None,
+        description="Optional static per-mutation weights (name -> weight).",
+    )
     novelty_archive_k: int = Field(default=15, ge=1)
     novelty_archive_max: int = Field(default=500, ge=1)
     # Adaptive rung budgets: promote/demote candidates based on improvement rate
@@ -1049,6 +1089,22 @@ class EvolutionConfig(BaseModel):
             raise ValueError("evolution.gate_schedule must be sorted by generation")
         if len(set(generations)) != len(generations):
             raise ValueError("evolution.gate_schedule cannot contain duplicate generations")
+        return self
+
+    @model_validator(mode="after")
+    def validate_mutation_weights(self) -> EvolutionConfig:
+        if self.mutation_weights is None:
+            return self
+        for name, weight in self.mutation_weights.items():
+            key = str(name).strip()
+            if not key:
+                raise ValueError("evolution.mutation_weights cannot contain an empty name")
+            try:
+                value = float(weight)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"evolution.mutation_weights[{name!r}] must be numeric") from exc
+            if value <= 0.0:
+                raise ValueError(f"evolution.mutation_weights[{name!r}] must be > 0, got {value}")
         return self
 
 

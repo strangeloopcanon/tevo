@@ -16,6 +16,9 @@ ABLATIONS = [
     "norm_swap",
     "remove_ssm",
     "moe_to_dense",
+    "mask_off",
+    "mask_ratio_one",
+    "optimizer_to_adamw",
 ]
 
 
@@ -52,6 +55,15 @@ def apply_ablation(spec: ArchitectureSpec, name: str) -> ArchitectureSpec:
             if isinstance(block.ffn, MoEFFNConfig):
                 hidden = block.ffn.hidden or (dim * 4)
                 block.ffn = DenseFFNConfig(hidden=hidden, activation="swiglu")
+    elif name == "mask_off":
+        child.train.optimizer.update_filter.mode = "none"
+    elif name == "mask_ratio_one":
+        child.train.optimizer.update_filter.keep_ratio = 1.0
+    elif name == "optimizer_to_adamw":
+        child.train.optimizer.name = "adamw"
+        child.train.optimizer.muon_momentum = None
+        child.train.optimizer.muon_nesterov = True
+        child.train.optimizer.muon_ns_steps = 5
     else:
         raise ValueError(f"Unknown ablation '{name}'")
     return child
