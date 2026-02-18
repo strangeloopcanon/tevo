@@ -6,7 +6,7 @@ import copy
 import importlib
 import random
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 
@@ -18,6 +18,7 @@ from .dsl import (
     CustomModuleConfig,
     DenseFFNConfig,
     GatedModuleConfig,
+    GradientTransformConfig,
     HyperConnectionsConfig,
     KVPolicyConfig,
     LayerScaleConfig,
@@ -28,6 +29,7 @@ from .dsl import (
     RetroConfig,
     SoftmaxConfig,
     SSMConfig,
+    UpdateFilterConfig,
 )
 from .template_mutation import (
     apply_template_mutation_named_with_name,
@@ -359,13 +361,77 @@ def toggle_precision(spec: ArchitectureSpec, rng: random.Random) -> Architecture
     return child
 
 
-def toggle_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+def resample_optimizer_base(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Resample optimizer base family without directional toggle bias."""
     child = clone_spec(spec)
-    name = str(getattr(child.train.optimizer, "name", "adamw") or "adamw").lower()
-    child.train.optimizer.name = "lion" if name == "adamw" else "adamw"
-    # Reset optimizer-specific moment knobs; keep lr/wd overrides if already set.
-    child.train.optimizer.betas = None
-    child.train.optimizer.eps = None
+    opt = child.train.optimizer
+    current = str(getattr(opt, "name", "adamw") or "adamw").lower()
+    families: list[Literal["adamw", "lion", "muon"]] = ["adamw", "lion", "muon"]
+    choices = [name for name in families if name != current]
+    opt.name = cast(Literal["adamw", "lion", "muon"], rng.choice(choices or families))
+    opt.betas = None
+    opt.eps = None
+    if opt.name != "muon":
+        opt.muon_momentum = None
+        opt.muon_nesterov = True
+        opt.muon_ns_steps = 5
+    return child
+
+
+def _gradient_transform_config(spec: ArchitectureSpec) -> GradientTransformConfig:
+    opt = spec.train.optimizer
+    current = getattr(opt, "gradient_transform", None)
+    if current is None:
+        current = GradientTransformConfig()
+        opt.gradient_transform = current
+    return current
+
+
+def toggle_gradient_transform_mode(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    transform = _gradient_transform_config(child)
+    mode = str(getattr(transform, "mode", "identity") or "identity").lower()
+    transitions: dict[
+        str,
+        Literal["identity", "sign", "normalize", "orthogonalize_2d", "sign_orthogonalize_2d"],
+    ] = {
+        "identity": "sign",
+        "sign": "normalize",
+        "normalize": "orthogonalize_2d",
+        "orthogonalize_2d": "sign_orthogonalize_2d",
+        "sign_orthogonalize_2d": "identity",
+    }
+    transform.mode = transitions.get(mode, "identity")
+    if "orthogonalize" in transform.mode and int(transform.ns_steps) < 2:
+        transform.ns_steps = 2
+    return child
+
+
+def tune_gradient_transform_ns_steps(
+    spec: ArchitectureSpec, rng: random.Random
+) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    transform = _gradient_transform_config(child)
+    mode = str(getattr(transform, "mode", "identity") or "identity").lower()
+    if "orthogonalize" not in mode:
+        transform.mode = cast(
+            Literal["identity", "sign", "normalize", "orthogonalize_2d", "sign_orthogonalize_2d"],
+            rng.choice(["orthogonalize_2d", "sign_orthogonalize_2d"]),
+        )
+    choices = [2, 3, 4, 5, 6, 7, 8]
+    current = int(getattr(transform, "ns_steps", 5) or 5)
+    options = [v for v in choices if v != current]
+    transform.ns_steps = int(rng.choice(options or [current]))
+    return child
+
+
+def tune_gradient_transform_eps(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    transform = _gradient_transform_config(child)
+    choices = [1e-9, 3e-9, 1e-8, 3e-8, 1e-7, 3e-7, 1e-6, 3e-6]
+    current = float(getattr(transform, "eps", 1e-8) or 1e-8)
+    options = [v for v in choices if abs(v - current) > 1e-12]
+    transform.eps = float(rng.choice(options or [current]))
     return child
 
 
@@ -404,10 +470,120 @@ def tune_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSp
             ]
         )
         opt.eps = rng.choice([None, 1e-8, 1e-6, 1e-5])
+        opt.muon_momentum = None
+        opt.muon_nesterov = True
+        opt.muon_ns_steps = 5
+    elif name == "muon":
+        opt.betas = rng.choice([None, (0.9, 0.98), (0.9, 0.99), (0.95, 0.99)])
+        opt.eps = rng.choice([None, 1e-8, 1e-7, 1e-6])
+        current_momentum = float(opt.muon_momentum if opt.muon_momentum is not None else 0.95)
+        momentum_factor = float(rng.choice([0.96, 0.98, 1.0, 1.02, 1.04]))
+        opt.muon_momentum = max(0.5, min(0.999, current_momentum * momentum_factor))
+        if rng.random() < 0.5:
+            opt.muon_nesterov = not bool(opt.muon_nesterov)
+        if rng.random() < 0.5:
+            opt.muon_ns_steps = int(rng.choice([2, 3, 4, 5, 6, 7]))
     else:
         opt.betas = rng.choice([None, (0.9, 0.99), (0.9, 0.98), (0.95, 0.98)])
         opt.eps = None
+        opt.muon_momentum = None
+        opt.muon_nesterov = True
+        opt.muon_ns_steps = 5
 
+    return child
+
+
+def mix_optimizer_recipe(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Compose multiple optimizer-recipe mutations in one step."""
+    current = clone_spec(spec)
+    ops: list[MutationFn] = [
+        resample_optimizer_base,
+        tune_optimizer,
+        toggle_gradient_transform_mode,
+        tune_gradient_transform_ns_steps,
+        tune_gradient_transform_eps,
+        toggle_update_filter_mode,
+        tune_update_filter_ratio,
+        tune_update_filter_granularity,
+        tune_update_filter_momentum_blend,
+        tune_update_filter_block_size,
+    ]
+    steps = rng.randint(2, 5)
+    for op in rng.sample(ops, k=min(steps, len(ops))):
+        result = op(current, rng)
+        if isinstance(result, tuple):
+            current = result[1]
+        else:
+            current = result
+    return current
+
+
+def _update_filter_config(spec: ArchitectureSpec) -> UpdateFilterConfig:
+    opt = spec.train.optimizer
+    current = getattr(opt, "update_filter", None)
+    if current is None:
+        current = UpdateFilterConfig()
+        opt.update_filter = current
+    return current
+
+
+def toggle_update_filter_mode(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    filt = _update_filter_config(child)
+    mode = str(getattr(filt, "mode", "none") or "none").lower()
+    transitions: dict[str, Literal["none", "bernoulli", "topk"]] = {
+        "none": "bernoulli",
+        "bernoulli": "topk",
+        "topk": "none",
+    }
+    filt.mode = transitions.get(mode, "none")
+    if filt.mode != "none" and float(filt.keep_ratio) >= 1.0:
+        filt.keep_ratio = 0.5
+    return child
+
+
+def tune_update_filter_ratio(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    filt = _update_filter_config(child)
+    if str(filt.mode or "none").lower() == "none":
+        filt.mode = cast(Literal["none", "bernoulli", "topk"], rng.choice(["bernoulli", "topk"]))
+    choices = [0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0]
+    current = float(getattr(filt, "keep_ratio", 1.0) or 1.0)
+    options = [v for v in choices if abs(v - current) > 1e-9]
+    filt.keep_ratio = float(rng.choice(options or [current]))
+    return child
+
+
+def tune_update_filter_granularity(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    filt = _update_filter_config(child)
+    filt.granularity = "block" if str(filt.granularity) == "element" else "element"
+    if filt.granularity == "block" and int(filt.block_size) <= 1:
+        filt.block_size = 128
+    return child
+
+
+def tune_update_filter_momentum_blend(
+    spec: ArchitectureSpec, rng: random.Random
+) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    filt = _update_filter_config(child)
+    choices = [0.0, 0.25, 0.5, 0.75, 1.0]
+    current = float(getattr(filt, "momentum_blend", 0.0) or 0.0)
+    options = [v for v in choices if abs(v - current) > 1e-9]
+    filt.momentum_blend = float(rng.choice(options or [current]))
+    return child
+
+
+def tune_update_filter_block_size(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    filt = _update_filter_config(child)
+    choices = [16, 32, 64, 128, 256, 512]
+    current = int(getattr(filt, "block_size", 128) or 128)
+    options = [v for v in choices if v != current]
+    filt.block_size = int(rng.choice(options or [current]))
+    if str(filt.granularity or "element") == "element" and rng.random() < 0.5:
+        filt.granularity = "block"
     return child
 
 
@@ -1590,6 +1766,50 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
     return current
 
 
+def mix_method_recipe(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Compose cross-family method edits to push broader invention."""
+    current = clone_spec(spec)
+    ops: list[MutationFn] = [
+        mix_optimizer_recipe,
+        tune_warmup,
+        tune_clip,
+        toggle_linear_attention,
+        toggle_mla_attention,
+        tune_softmax_policy,
+        toggle_value_glu,
+        toggle_qk_norm,
+        dense_to_moe,
+        mutate_topk,
+        tune_router,
+        shift_moe,
+        make_gqa,
+        add_recurrence,
+        tune_recurrence,
+        insert_assoc_memory,
+        tune_assoc_memory,
+        insert_memory_tokens,
+        tune_memory_tokens,
+        insert_chunk_memory,
+        tune_chunk_memory,
+        insert_lookup_memory,
+        tune_lookup_memory,
+        toggle_branch_router,
+        tune_branch_router,
+        insert_layer_scale,
+        tune_layer_scale,
+        toggle_hyper_connections,
+        tune_hyper_connections,
+    ]
+    steps = rng.randint(3, 7)
+    for op in rng.sample(ops, k=min(steps, len(ops))):
+        result = op(current, rng)
+        if isinstance(result, tuple):
+            current = result[1]
+        else:
+            current = result
+    return sanitize_topology(current)
+
+
 BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "duplicate_block_span": duplicate_block_span,
     "shuffle_block_span": shuffle_block_span,
@@ -1607,8 +1827,18 @@ BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "make_gqa": make_gqa,
     "simplify_attention": simplify_attention,
     "toggle_precision": toggle_precision,
-    "toggle_optimizer": toggle_optimizer,
+    "resample_optimizer_base": resample_optimizer_base,
     "tune_optimizer": tune_optimizer,
+    "toggle_gradient_transform_mode": toggle_gradient_transform_mode,
+    "tune_gradient_transform_ns_steps": tune_gradient_transform_ns_steps,
+    "tune_gradient_transform_eps": tune_gradient_transform_eps,
+    "mix_optimizer_recipe": mix_optimizer_recipe,
+    "mix_method_recipe": mix_method_recipe,
+    "toggle_update_filter_mode": toggle_update_filter_mode,
+    "tune_update_filter_ratio": tune_update_filter_ratio,
+    "tune_update_filter_granularity": tune_update_filter_granularity,
+    "tune_update_filter_momentum_blend": tune_update_filter_momentum_blend,
+    "tune_update_filter_block_size": tune_update_filter_block_size,
     "tune_warmup": tune_warmup,
     "tune_clip": tune_clip,
     "insert_retro_module": insert_retro_module,
@@ -1670,6 +1900,7 @@ def mutate_with_trace(
     spec: ArchitectureSpec,
     rng: random.Random | None = None,
     weights: dict[str, float] | None = None,
+    allowed_names: list[str] | None = None,
     steps: int = 1,
     validate: bool = True,
 ) -> tuple[str, ArchitectureSpec, list[str]]:
@@ -1679,6 +1910,7 @@ def mutate_with_trace(
         spec: The architecture specification to mutate.
         rng: Random number generator for reproducibility.
         weights: Optional mutation weights for weighted sampling.
+        allowed_names: Optional allowlist of mutation names to sample from.
         steps: Number of mutations to chain.
         validate: If True, validate the spec after each mutation and raise
             MutationError with a diff if validation fails.
@@ -1691,8 +1923,13 @@ def mutate_with_trace(
     """
     rng = rng or random.Random()  # noqa: S311  # nosec B311 - deterministic enough for search
     names = mutation_names()
+    if allowed_names:
+        allowed = {str(name).strip() for name in allowed_names if str(name).strip()}
+        names = [name for name in names if name in allowed]
     if not names:
         msg = "No registered mutations found."
+        if allowed_names:
+            msg = "No registered mutations found after allowlist filtering."
         raise RuntimeError(msg)
 
     def _pick() -> str:
@@ -1749,6 +1986,7 @@ def mutate(
     spec: ArchitectureSpec,
     rng: random.Random | None = None,
     weights: dict[str, float] | None = None,
+    allowed_names: list[str] | None = None,
     steps: int = 1,
     validate: bool = True,
 ) -> tuple[str, ArchitectureSpec]:
@@ -1757,6 +1995,7 @@ def mutate(
         spec=spec,
         rng=rng,
         weights=weights,
+        allowed_names=allowed_names,
         steps=steps,
         validate=validate,
     )

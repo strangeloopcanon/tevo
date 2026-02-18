@@ -40,6 +40,10 @@ def test_full_weight_trainer_runs(tmp_path: Path, tiny_spec) -> None:
     assert "stop_reason_code" in metrics
     assert "nan_seen" in metrics
     assert "loss_spike" in metrics
+    assert "opt_mask_keep_observed_avg" in metrics
+    assert "opt_mask_keep_observed_last" in metrics
+    assert "opt_grad_transform_applied_avg" in metrics
+    assert "opt_grad_transform_applied_last" in metrics
     assert ckpt.exists()
 
 

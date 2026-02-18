@@ -26,7 +26,7 @@ from .dsl import ArchitectureSpec
 from .evaluation import estimate_flops_per_token
 from .models import BranchRouter, EvolutionModel, MoELayer, count_parameters
 from .morphology import match_experts_to_parent, sort_moe_experts
-from .optimizers import build_optimizer
+from .optimizers import apply_gradient_transform_, apply_update_filter_, build_optimizer
 from .probes import _estimate_long_recall, run_downstream_probes, run_multi_needle_probes
 from .training_metrics import _average_router_entropy, compute_speedrun_auc, fit_learning_curve
 
@@ -218,6 +218,8 @@ class FullWeightTrainer:
         recent_losses: list[float] = []  # Last N losses for variance calculation
         grad_norms: list[float] = []  # Gradient norms for spike detection
         grad_norm_spikes = 0  # Count of gradient norm spikes
+        update_filter_keep_history: list[float] = []
+        gradient_transform_apply_history: list[float] = []
         # Track improvement rate for adaptive rung budgets
         early_loss: float | None = None
         mid_loss: float | None = None
@@ -396,6 +398,10 @@ class FullWeightTrainer:
                 stop_reason = f"high_grad({grad_norm:.2f})"
                 optimizer.zero_grad()
                 break
+            transform_frac = apply_gradient_transform_(optimizer, spec.train)
+            gradient_transform_apply_history.append(float(transform_frac))
+            keep_frac = apply_update_filter_(optimizer, spec.train)
+            update_filter_keep_history.append(float(keep_frac))
             optimizer.step()
             optimizer.zero_grad()
             try:
@@ -661,6 +667,25 @@ class FullWeightTrainer:
             "stop_reason_code": reason_code,
             "nan_seen": 1.0 if nan_or_inf else 0.0,
             "loss_spike": max(0.0, max_loss_jump),
+            "opt_mask_keep_observed_avg": (
+                float(sum(update_filter_keep_history)) / float(len(update_filter_keep_history))
+                if update_filter_keep_history
+                else 1.0
+            ),
+            "opt_mask_keep_observed_last": (
+                float(update_filter_keep_history[-1]) if update_filter_keep_history else 1.0
+            ),
+            "opt_grad_transform_applied_avg": (
+                float(sum(gradient_transform_apply_history))
+                / float(len(gradient_transform_apply_history))
+                if gradient_transform_apply_history
+                else 0.0
+            ),
+            "opt_grad_transform_applied_last": (
+                float(gradient_transform_apply_history[-1])
+                if gradient_transform_apply_history
+                else 0.0
+            ),
         }
         # Add learning curve metrics
         metrics.update(learning_curve_metrics)

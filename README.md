@@ -782,7 +782,102 @@ optimizer:
   lr: 3.0e-4
   betas: [0.9, 0.99]
 ```
-Evolution can also mutate optimizer choice/hparams via `toggle_optimizer` and `tune_optimizer`.
+Evolution can mutate optimizer recipes compositionally via:
+- `resample_optimizer_base` (base family resampling)
+- `tune_optimizer` (hparam jitter)
+- `toggle_gradient_transform_mode` / `tune_gradient_transform_*`
+- update-filter mutations (`toggle_update_filter_mode`, `tune_update_filter_*`)
+- `mix_optimizer_recipe` (chains multiple recipe edits in one mutation)
+
+### Optimizer Rediscovery Protocol (Optimizer-Only Search)
+
+So what: run a constrained discovery mode where architecture stays fixed and evolution explores compositional optimizer recipes (base family + gradient transforms + update filtering).
+
+- Config: `configs/exp_optimizer_discovery_owt_10m_v1.yaml`
+- Search is enforced by `evolution.mutation_allowlist` (not just weight biasing).
+- Primary objective is compute-to-target (`speedrun_flops_to_target`) with quality guardrails.
+
+Local smoke:
+```bash
+python scripts/run_live.py configs/exp_optimizer_discovery_owt_10m_v1.yaml \
+  --device mps --generations 4 --steps 80 --eval-batches 2 --seed 0 \
+  --out runs/optdisc_smoke_seed0/frontier.json \
+  --lineage-out runs/optdisc_smoke_seed0/frontier_lineage.json
+```
+
+Motif aggregation across runs:
+```bash
+python scripts/report_optimizer_motifs.py \
+  --frontier runs/modal/modal_optdisc_v1_seed0/frontier.json \
+  --frontier runs/modal/modal_optdisc_v1_seed1/frontier.json \
+  --frontier runs/modal/modal_optdisc_v1_seed2/frontier.json \
+  --out runs/modal/optdisc_v1_report.json
+```
+
+### Wide Method Discovery (Cross-Family Invention)
+
+So what: instead of optimizing a single known trick, this mode pushes evolution to compose new methods across optimizer recipe, attention, memory modules, routing, and recurrence.
+
+- Config: `configs/exp_method_discovery_openwebtext_exec_v1.yaml`
+- Core mutation: `mix_method_recipe` (multi-step cross-family composition)
+- Selection balances quality + compute + novelty (`ppl_code`, `speedrun_flops_to_target`, `novelty`, `graph_entropy`, `throughput`, `instability`).
+
+Local smoke:
+```bash
+python scripts/run_live.py configs/exp_method_discovery_openwebtext_exec_v1.yaml \
+  --device mps --generations 2 --steps 24 --eval-batches 1 --seed 7 \
+  --out runs/methoddisc_smoke_seed7/frontier.json \
+  --lineage-out runs/methoddisc_smoke_seed7/frontier_lineage.json
+```
+
+### Method Discovery Proof (Feb 18, 2026)
+
+So what: this repo can run open-ended method search (not a paper copy) and discover multiple improved training-method motifs under one shared setup.
+
+Repro (3 seeds, same config, same budget):
+```bash
+for seed in 0 1 2; do
+  python scripts/run_live.py configs/exp_method_discovery_openwebtext_exec_v1.yaml \
+    --device mps --generations 8 --steps 80 --eval-batches 1 --seed "$seed" \
+    --out "runs/methoddisc_v1_seed${seed}/frontier.json" \
+    --lineage-out "runs/methoddisc_v1_seed${seed}/frontier_lineage.json" \
+    --checkpoint-dir "runs/methoddisc_v1_seed${seed}/checkpoints" \
+    --no-cleanup-old-checkpoints --no-prune-checkpoints-to-frontier
+done
+
+python scripts/report_optimizer_motifs.py \
+  --frontier runs/methoddisc_v1_seed0/frontier.json \
+  --frontier runs/methoddisc_v1_seed1/frontier.json \
+  --frontier runs/methoddisc_v1_seed2/frontier.json \
+  --out runs/methoddisc_v1_3seed_optimizer_motifs.json
+```
+
+Observed outcome (`ppl_code`, lower is better):
+
+| Seed | Baseline | Best candidate | Best `ppl_code` | Delta vs seed |
+|------|----------|----------------|-----------------|---------------|
+| 0 | `seed-1-edf6` (`2610.58`) | `mix_optimizer_recipe-9-b961` | `1814.18` | `-30.51%` |
+| 1 | `seed-1-cc63` (`2632.07`) | `tune_optimizer-7-c9fc` | `2277.05` | `-13.49%` |
+| 2 | `seed-1-da45` (`2617.77`) | `tune_update_filter_ratio-6-5560` | `2290.58` | `-12.50%` |
+
+What emerged:
+- A mask-style motif recurred in seed 1/2: `update_filter.mode=bernoulli`, `keep_ratio=0.5` (strong gain over seed).
+- The best single candidate was a different method family: `gradient_transform=orthogonalize_2d` (seed 0), showing this search can discover beyond one expected trick.
+- `mix_method_recipe` was high-variance in this run (4 failures), which is useful signal for where to add stability guards in future sweeps.
+
+Share-ready summary:
+```text
+We used our own DSL + evolution loop to discover improved training methods in-repo.
+
+On 3 independent seeds (same config, 8 generations, 80 steps), best candidates improved
+`ppl_code` by -30.5%, -13.5%, and -12.5% vs each seed baseline.
+
+Two distinct motifs emerged:
+1) Masked-update optimizer behavior (`bernoulli`, keep_ratio=0.5) repeated across seeds.
+2) A different high-performing family (`orthogonalize_2d` gradient transform) produced the best overall gain.
+
+This is short-budget evidence of discovery ability, not a claim of universal optimality.
+```
 
 ### Scaling tools
 Fit scaling-law priors from existing runs:

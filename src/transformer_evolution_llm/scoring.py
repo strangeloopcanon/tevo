@@ -228,6 +228,28 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
     recurrences = len(spec.model.recurrences)
     attn_den = float(max(1, attn_blocks))
     layers_f = float(layers)
+    opt_cfg = spec.train.optimizer
+    opt_name = str(getattr(opt_cfg, "name", "adamw") or "adamw").lower()
+    opt_family = {"adamw": 0.0, "lion": 1.0, "muon": 2.0}.get(opt_name, -1.0)
+    grad_transform = getattr(opt_cfg, "gradient_transform", None)
+    grad_mode = str(getattr(grad_transform, "mode", "identity") or "identity").lower()
+    grad_mode_value = {
+        "identity": 0.0,
+        "sign": 1.0,
+        "normalize": 2.0,
+        "orthogonalize_2d": 3.0,
+        "sign_orthogonalize_2d": 4.0,
+    }.get(grad_mode, -1.0)
+    grad_ns_steps = float(getattr(grad_transform, "ns_steps", 5) or 5)
+    grad_eps = float(getattr(grad_transform, "eps", 1e-8) or 1e-8)
+    grad_eps_log10 = math.log10(max(1e-12, grad_eps))
+    update_filter = getattr(opt_cfg, "update_filter", None)
+    mode = str(getattr(update_filter, "mode", "none") or "none").lower()
+    granularity = str(getattr(update_filter, "granularity", "element") or "element").lower()
+    mask_mode = {"none": 0.0, "bernoulli": 1.0, "topk": 2.0}.get(mode, -1.0)
+    mask_granularity = {"element": 0.0, "block": 1.0}.get(granularity, -1.0)
+    mask_keep_ratio = float(getattr(update_filter, "keep_ratio", 1.0) or 1.0)
+    mask_momentum_blend = float(getattr(update_filter, "momentum_blend", 0.0) or 0.0)
     descriptor = [
         layers_f,
         float(moe_blocks) / layers_f,
@@ -242,6 +264,14 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
         head_dim_sum / attn_den,
         kv_groups_sum / attn_den,
         graph_entropy(spec),
+        opt_family,
+        grad_mode_value,
+        grad_ns_steps,
+        grad_eps_log10,
+        mask_mode,
+        mask_granularity,
+        mask_keep_ratio,
+        mask_momentum_blend,
     ]
     return descriptor
 

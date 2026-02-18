@@ -130,3 +130,30 @@ def test_gate_schedule_must_be_sorted(tiny_spec: ArchitectureSpec) -> None:
     ]
     with pytest.raises(ValueError, match="gate_schedule must be sorted"):
         ArchitectureSpec.model_validate(spec.model_dump(mode="python"))
+
+
+def test_update_filter_roundtrip(tiny_spec: ArchitectureSpec, tmp_path: Path) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.optimizer.name = "muon"
+    spec.train.optimizer.update_filter.mode = "topk"
+    spec.train.optimizer.update_filter.keep_ratio = 0.4
+    spec.train.optimizer.update_filter.granularity = "block"
+    spec.train.optimizer.update_filter.block_size = 64
+    spec.train.optimizer.update_filter.momentum_blend = 0.5
+
+    spec_path = tmp_path / "opt_filter.yaml"
+    api.save_spec(spec, spec_path)
+    loaded = api.load_spec(spec_path)
+    assert loaded.train.optimizer.name == "muon"
+    assert loaded.train.optimizer.update_filter.mode == "topk"
+    assert loaded.train.optimizer.update_filter.keep_ratio == pytest.approx(0.4)
+    assert loaded.train.optimizer.update_filter.granularity == "block"
+    assert loaded.train.optimizer.update_filter.block_size == 64
+    assert loaded.train.optimizer.update_filter.momentum_blend == pytest.approx(0.5)
+
+
+def test_mutation_weights_must_be_positive(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.evolution.mutation_weights = {"mix_optimizer_recipe": 0.0}
+    with pytest.raises(ValueError, match="must be > 0"):
+        ArchitectureSpec.model_validate(spec.model_dump(mode="python"))

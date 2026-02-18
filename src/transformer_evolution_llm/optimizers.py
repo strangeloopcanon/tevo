@@ -17,6 +17,195 @@ from torch.optim import AdamW, Optimizer
 from .dsl import OptimizerConfig, TrainSchedule
 
 
+def _momentum_proxy_tensor(state: dict[object, object], grad: Tensor) -> Tensor | None:
+    for key in ("momentum_buffer", "exp_avg"):
+        value = state.get(key)
+        if isinstance(value, torch.Tensor) and value.shape == grad.shape:
+            return value
+    return None
+
+
+def _topk_mask(values: Tensor, keep_ratio: float) -> Tensor:
+    flat = values.reshape(-1)
+    numel = int(flat.numel())
+    if numel <= 0 or keep_ratio >= 1.0:
+        return torch.ones_like(values, dtype=torch.bool)
+    k = max(1, min(numel, int(round(float(keep_ratio) * numel))))
+    if k >= numel:
+        return torch.ones_like(values, dtype=torch.bool)
+    keep_idx = torch.topk(flat, k=k, largest=True, sorted=False).indices
+    # Guard against occasional backend index glitches (observed on MPS) where
+    # topk may include `numel` as an index, which is out of bounds.
+    if keep_idx.numel() > 0:
+        keep_idx = keep_idx.to(dtype=torch.long).clamp(0, numel - 1)
+    mask = torch.zeros_like(flat, dtype=torch.bool)
+    mask[keep_idx] = True
+    return mask.reshape_as(values)
+
+
+def _block_mask(values: Tensor, *, mode: str, keep_ratio: float, block_size: int) -> Tensor:
+    flat = values.reshape(-1)
+    numel = int(flat.numel())
+    if numel <= 0:
+        return torch.ones_like(values, dtype=torch.bool)
+    size = max(1, int(block_size))
+    n_blocks = (numel + size - 1) // size
+    if n_blocks <= 1 or keep_ratio >= 1.0:
+        return torch.ones_like(values, dtype=torch.bool)
+    if mode == "bernoulli":
+        block_keep = torch.rand(n_blocks, device=flat.device) < float(keep_ratio)
+    else:
+        block_scores = torch.zeros(n_blocks, dtype=torch.float32, device=flat.device)
+        for idx in range(n_blocks):
+            start = idx * size
+            end = min(start + size, numel)
+            block_scores[idx] = flat[start:end].mean()
+        block_keep = _topk_mask(block_scores, keep_ratio).reshape(-1)
+    expanded = block_keep.repeat_interleave(size)[:numel]
+    return expanded.reshape_as(values)
+
+
+@torch.no_grad()
+def apply_gradient_transform_(optimizer: Optimizer, schedule: TrainSchedule) -> float:
+    """Apply configured gradient transforms in-place before optimizer.step.
+
+    Returns the observed fraction of gradient elements transformed.
+    """
+    cfg: OptimizerConfig = getattr(schedule, "optimizer", OptimizerConfig())
+    transform_cfg = getattr(cfg, "gradient_transform", None)
+    if transform_cfg is None:
+        return 0.0
+
+    mode = str(getattr(transform_cfg, "mode", "identity") or "identity").lower()
+    if mode == "identity":
+        return 0.0
+
+    ns_steps = int(getattr(transform_cfg, "ns_steps", 5) or 5)
+    eps = float(getattr(transform_cfg, "eps", 1e-8) or 1e-8)
+    ns_steps = max(1, ns_steps)
+    eps = max(1e-12, eps)
+
+    total_elements = 0
+    transformed_elements = 0
+
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            grad = param.grad
+            if grad is None:
+                continue
+
+            count = int(grad.numel())
+            if count <= 0:
+                continue
+            total_elements += count
+
+            if mode == "sign":
+                grad.copy_(grad.sign())
+                transformed_elements += count
+                continue
+
+            if mode == "normalize":
+                norm = float(grad.norm().item())
+                if math.isfinite(norm) and norm > 0.0:
+                    grad.div_(norm + eps)
+                transformed_elements += count
+                continue
+
+            if mode == "orthogonalize_2d":
+                if grad.ndim == 2:
+                    transformed = _newton_schulz_orthogonalize(grad, ns_steps=ns_steps, eps=eps)
+                    if torch.isfinite(transformed).all():
+                        grad.copy_(transformed)
+                    transformed_elements += count
+                continue
+
+            if mode == "sign_orthogonalize_2d":
+                if grad.ndim == 2:
+                    transformed = _newton_schulz_orthogonalize(grad, ns_steps=ns_steps, eps=eps)
+                    if torch.isfinite(transformed).all():
+                        grad.copy_(transformed.sign())
+                    else:
+                        grad.copy_(grad.sign())
+                else:
+                    grad.copy_(grad.sign())
+                transformed_elements += count
+                continue
+
+    if total_elements <= 0:
+        return 0.0
+    return float(transformed_elements) / float(total_elements)
+
+
+@torch.no_grad()
+def apply_update_filter_(optimizer: Optimizer, schedule: TrainSchedule) -> float:
+    """Mask gradients before optimizer.step according to the configured policy.
+
+    Returns the observed keep fraction across all gradient elements.
+    """
+    cfg: OptimizerConfig = getattr(schedule, "optimizer", OptimizerConfig())
+    filter_cfg = getattr(cfg, "update_filter", None)
+    if filter_cfg is None:
+        return 1.0
+
+    mode = str(getattr(filter_cfg, "mode", "none") or "none").lower()
+    keep_ratio = float(getattr(filter_cfg, "keep_ratio", 1.0) or 1.0)
+    if mode == "none" or keep_ratio >= 1.0:
+        return 1.0
+
+    granularity = str(getattr(filter_cfg, "granularity", "element") or "element").lower()
+    block_size = int(getattr(filter_cfg, "block_size", 128) or 128)
+    momentum_blend = float(getattr(filter_cfg, "momentum_blend", 0.0) or 0.0)
+    rescale_kept = bool(getattr(filter_cfg, "rescale_kept", True))
+    momentum_blend = max(0.0, min(1.0, momentum_blend))
+    keep_ratio = max(0.0, min(1.0, keep_ratio))
+
+    total_elements = 0
+    kept_elements = 0
+
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_score = grad.detach().abs().to(dtype=torch.float32)
+            if momentum_blend > 0.0:
+                proxy = _momentum_proxy_tensor(optimizer.state[param], grad)
+                if proxy is not None:
+                    proxy_score = proxy.detach().abs().to(dtype=torch.float32)
+                    grad_score = (1.0 - momentum_blend) * grad_score + momentum_blend * proxy_score
+
+            if granularity == "block":
+                mask = _block_mask(
+                    grad_score,
+                    mode=mode,
+                    keep_ratio=keep_ratio,
+                    block_size=block_size,
+                )
+            elif mode == "bernoulli":
+                mask = torch.rand_like(grad_score, dtype=torch.float32) < keep_ratio
+            else:
+                mask = _topk_mask(grad_score, keep_ratio)
+
+            count = int(mask.numel())
+            keep = int(mask.sum().item())
+            total_elements += count
+            kept_elements += keep
+
+            if keep == count:
+                continue
+            if keep <= 0:
+                grad.zero_()
+                continue
+            keep_frac = float(keep) / float(max(1, count))
+            grad.mul_(mask.to(dtype=grad.dtype))
+            if rescale_kept and keep_frac > 0.0:
+                grad.div_(keep_frac)
+
+    if total_elements <= 0:
+        return 1.0
+    return float(kept_elements) / float(total_elements)
+
+
 class Lion(Optimizer):
     """Minimal Lion optimizer (Chen et al., 2023).
 

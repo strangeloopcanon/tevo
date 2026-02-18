@@ -136,7 +136,54 @@ class EvolutionRunner:
         load_mutation_plugins(list(getattr(self.cfg, "mutation_plugins", []) or []))
         if bool(getattr(self.cfg, "register_template_entries", True)):
             register_template_mutations()
+        registry_names = set(mutation_names())
+        raw_allowlist = list(getattr(self.cfg, "mutation_allowlist", []) or [])
+        parsed_allowlist: list[str] = []
+        invalid_allowlist: list[str] = []
+        for raw_name in raw_allowlist:
+            name = str(raw_name).strip()
+            if not name:
+                continue
+            if name in registry_names:
+                parsed_allowlist.append(name)
+            else:
+                invalid_allowlist.append(name)
+        if invalid_allowlist:
+            console.print(
+                "[yellow]Warning:[/] ignoring unknown mutation_allowlist entries: "
+                + ", ".join(sorted(set(invalid_allowlist)))
+            )
+        self._mutation_allowlist: list[str] | None = None
+        if parsed_allowlist:
+            self._mutation_allowlist = sorted(set(parsed_allowlist))
+        elif raw_allowlist:
+            msg = "evolution.mutation_allowlist resolved to an empty registered set."
+            raise ValueError(msg)
+
         self.mutation_weights: dict[str, float] | None = None
+        raw_weights = getattr(self.cfg, "mutation_weights", None)
+        if isinstance(raw_weights, dict):
+            parsed_weights: dict[str, float] = {}
+            invalid_weight_names: list[str] = []
+            for raw_name, raw_value in raw_weights.items():
+                name = str(raw_name).strip()
+                if not name:
+                    continue
+                if name not in registry_names:
+                    invalid_weight_names.append(name)
+                    continue
+                if self._mutation_allowlist is not None and name not in self._mutation_allowlist:
+                    continue
+                parsed_weights[name] = float(raw_value)
+            if invalid_weight_names:
+                console.print(
+                    "[yellow]Warning:[/] ignoring unknown mutation_weights entries: "
+                    + ", ".join(sorted(set(invalid_weight_names)))
+                )
+            if parsed_weights:
+                self.mutation_weights = parsed_weights
+        if self._mutation_allowlist is not None and self.mutation_weights is None:
+            self.mutation_weights = dict.fromkeys(self._mutation_allowlist, 1.0)
         self.mutation_steps: int = int(getattr(self.cfg, "mutation_steps", 1) or 1)
         self._adaptive_mutation = bool(getattr(self.cfg, "adaptive_mutation", False))
         self._adaptive_mutation_eta = float(getattr(self.cfg, "adaptive_mutation_eta", 0.1) or 0.1)
@@ -564,6 +611,42 @@ class EvolutionRunner:
         candidate.metrics["sparsity_blocks"] = sparsity_blocks
         candidate.metrics["qk_norm_blocks"] = qk_norm_blocks
         candidate.metrics["recurrences"] = float(len(candidate.spec.model.recurrences))
+        opt_cfg = candidate.spec.train.optimizer
+        opt_name = str(getattr(opt_cfg, "name", "adamw") or "adamw").lower()
+        opt_family_map = {"adamw": 0.0, "lion": 1.0, "muon": 2.0}
+        candidate.metrics["optimizer_family"] = float(opt_family_map.get(opt_name, -1.0))
+        grad_transform = getattr(opt_cfg, "gradient_transform", None)
+        if grad_transform is not None:
+            grad_mode = str(getattr(grad_transform, "mode", "identity") or "identity").lower()
+            grad_mode_map = {
+                "identity": 0.0,
+                "sign": 1.0,
+                "normalize": 2.0,
+                "orthogonalize_2d": 3.0,
+                "sign_orthogonalize_2d": 4.0,
+            }
+            candidate.metrics["opt_grad_transform_mode"] = float(grad_mode_map.get(grad_mode, -1.0))
+            candidate.metrics["opt_grad_transform_ns_steps"] = float(
+                getattr(grad_transform, "ns_steps", 5) or 5
+            )
+            grad_eps = float(getattr(grad_transform, "eps", 1e-8) or 1e-8)
+            candidate.metrics["opt_grad_transform_eps_log10"] = float(
+                math.log10(max(1e-12, grad_eps))
+            )
+        update_filter = getattr(opt_cfg, "update_filter", None)
+        if update_filter is not None:
+            mode = str(getattr(update_filter, "mode", "none") or "none").lower()
+            gran = str(getattr(update_filter, "granularity", "element") or "element").lower()
+            mode_map = {"none": 0.0, "bernoulli": 1.0, "topk": 2.0}
+            gran_map = {"element": 0.0, "block": 1.0}
+            candidate.metrics["opt_mask_mode"] = float(mode_map.get(mode, -1.0))
+            candidate.metrics["opt_mask_keep_ratio"] = float(
+                getattr(update_filter, "keep_ratio", 1.0) or 1.0
+            )
+            candidate.metrics["opt_mask_granularity"] = float(gran_map.get(gran, -1.0))
+            candidate.metrics["opt_mask_momentum_blend"] = float(
+                getattr(update_filter, "momentum_blend", 0.0) or 0.0
+            )
         # novelty diagnostics and archive-based novelty objective
         ref = None
         if candidate.parent:
@@ -1342,11 +1425,14 @@ class EvolutionRunner:
         for _ in range(max_attempts):
             result: tuple[str, ArchitectureSpec, list[str]] | None = None
             try:
+                mutate_kwargs: dict[str, Any] = {"steps": getattr(self, "mutation_steps", 1)}
+                if self._mutation_allowlist is not None:
+                    mutate_kwargs["allowed_names"] = self._mutation_allowlist
                 result = mutate_with_trace(
                     parent.spec,
                     self.rng,
                     mutation_weights,
-                    steps=getattr(self, "mutation_steps", 1),
+                    **mutate_kwargs,
                 )
             except Exception:
                 result = None
@@ -1401,7 +1487,7 @@ class EvolutionRunner:
         metrics = parent.metrics
 
         # Start with uniform weights
-        weights = dict.fromkeys(mutation_names(), 1.0)
+        weights = dict.fromkeys(self._mutation_allowlist or mutation_names(), 1.0)
 
         # Analyze architecture state
         n_layers = spec.model.n_layers
@@ -1539,6 +1625,7 @@ class EvolutionRunner:
             "parents": self._parents,
             "history": [c.serialize() for c in self._history],
             "mutation_weights": self.mutation_weights,
+            "mutation_allowlist": self._mutation_allowlist,
             "mutation_steps": self.mutation_steps,
             "archive_max_elites": self.archive_max_elites,
             "archive": {k: v.ident for k, v in self.archive.items()},
@@ -1611,13 +1698,24 @@ class EvolutionRunner:
             seed=seed_val,
             score_weight_overrides=resolved_overrides,
         )
+        mutation_allowlist = data.get("mutation_allowlist")
+        if isinstance(mutation_allowlist, list):
+            names = set(mutation_names())
+            resolved = [str(name) for name in mutation_allowlist if str(name) in names]
+            runner._mutation_allowlist = resolved or None
         mutation_weights = data.get("mutation_weights")
         if isinstance(mutation_weights, dict):
-            runner.mutation_weights = {
+            parsed_weights = {
                 str(key): float(value)
                 for key, value in mutation_weights.items()
                 if isinstance(value, (int, float))
             }
+            if runner._mutation_allowlist is not None:
+                allow = set(runner._mutation_allowlist)
+                parsed_weights = {
+                    key: value for key, value in parsed_weights.items() if key in allow
+                }
+            runner.mutation_weights = parsed_weights
         if "mutation_steps" in data:
             try:
                 runner.mutation_steps = int(data["mutation_steps"])

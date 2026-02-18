@@ -165,3 +165,23 @@ def test_map_elites_complexity_banding_splits_archive_keys(tiny_spec) -> None:
     runner._update_archive(cand_b)
     assert len(runner.archive) >= 2
     assert all("_C" in key for key in runner.archive)
+
+
+def test_mutation_allowlist_restricts_sampling(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.evolution.crossover_prob = 0.0
+    spec.evolution.mutation_allowlist = ["mix_optimizer_recipe"]
+    spec.evolution.mutation_weights = {"mix_optimizer_recipe": 2.0}
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    runner.run(generations=2)
+    assert runner.mutation_weights == {"mix_optimizer_recipe": 2.0}
+    assert runner._mutation_allowlist == ["mix_optimizer_recipe"]
+    mutated = [cand for cand in runner._history if cand.parent is not None]
+    assert mutated
+    for cand in mutated:
+        assert cand.mutation_trace == ["mix_optimizer_recipe"]
