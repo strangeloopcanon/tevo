@@ -1,7 +1,7 @@
 # Transformer Evolution LLM
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/strangeloopcanon/transformer-evolution-llm)
 
-So what: this repo is a typed evolutionary search loop for language-model architectures, and it now has a practical bridge into upstream-style `train.py` research loops. TEVO explores motifs in a structured search space, exports them as `TrainRecipe` artifacts, and can project those motifs into upstream `autoresearch`-style CUDA `train.py` without hand-editing the file.
+So what: this repo is a typed evolutionary search loop for language-model architectures with a practical handoff into upstream-style `train.py` research loops. TEVO discovers motifs under cheap proxy budgets, `TrainRecipe` carries the renderer-safe subset of those motifs, and downstream `autoresearch`-style `train.py` acts as the judge of whether they survive a real benchmark.
 
 Current proof-of-concept: a projected TEVO-discovered frontier sibling improved upstream CUDA `autoresearch` from `val_bpb = 1.117953` to `1.113392` on the pinned upstream commit `c12eef778edafc89cd7ce036a7f500ddb5397a65`, while also reducing peak VRAM.
 
@@ -9,11 +9,17 @@ Current proof-of-concept: a projected TEVO-discovered frontier sibling improved 
 
 Architectures are defined in typed YAML (Pydantic). The loop mutates and crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. Children inherit weights from parents and crossover merges checkpoints when possible.
 
-The point is not just to search for good small models. The point is to discover **motifs** under cheap proxy budgets, then test whether those motifs survive in more concrete downstream training code.
+The core split is:
+
+- **TEVO** searches broadly for promising motifs under cheap proxy budgets.
+- **`TrainRecipe`** packages the shared, renderer-safe part of a winning candidate.
+- **`autoresearch`** validates whether that motif still helps inside a real downstream `train.py`.
+
+The point is not just to search for good small models. The point is to discover **motifs** cheaply, transfer them cleanly, and validate them honestly downstream.
 
 ## Current Proof
 
-The repo now supports this loop end to end:
+The repo now supports this search -> transfer -> validation loop end to end:
 
 1. TEVO discovers a candidate under a short-budget benchmark.
 2. The candidate is exported into a backend-neutral `TrainRecipe`.
@@ -51,6 +57,7 @@ This repo is a sandbox for answering: under a fixed training recipe and constrai
 - explore quality / speed / memory trade-offs without hand-authoring dozens of variants
 - keep the search inspectable: every run emits a frontier, lineage, and checkpoints
 - use small or short-budget runs as a fast feedback loop before spending larger GPU budgets downstream
+- separate cheap motif discovery from honest downstream validation instead of treating them as the same benchmark
 
 ## Installation
 
@@ -117,15 +124,25 @@ Each run writes artifacts under `runs/<run_id>/`:
 
 ```mermaid
 flowchart LR
-    subgraph evo [Evolution Loop]
-        SEED[Seed Config] --> MUT[Mutate/Crossover]
-        MUT --> TRAIN[Train Rungs 0-1-2]
+    subgraph evo [TEVO Search]
+        SEED[Typed Seed Config] --> MUT[Mutate/Crossover]
+        MUT --> TRAIN[Train Proxy Budget]
         TRAIN --> EVAL[Evaluate Metrics]
-        EVAL --> SELECT[Pareto Selection]
+        EVAL --> SELECT[Pareto Frontier]
         SELECT --> |Next Gen| MUT
     end
-    SELECT --> FRONTIER[Pareto Frontier]
-    FRONTIER --> EXPORT[Export Winners]
+    SELECT --> EXPORT[Export Winner]
+
+    subgraph bridge [Transfer Bridge]
+        EXPORT --> RECIPE[TrainRecipe]
+        RECIPE --> PROJECT[Project Motif Into Safe Scaffold]
+        PROJECT --> PATCH[Patch Upstream train.py]
+    end
+
+    subgraph judge [Downstream Validation]
+        PATCH --> BENCH[autoresearch Benchmark]
+        BENCH --> RESULT[val_bpb / VRAM Result]
+    end
 ```
 
 | Component | What it does |
@@ -135,6 +152,8 @@ flowchart LR
 | **Mutations** (`mutations.py`) | Genetic operators that modify specs (grow, shrink, toggle) |
 | **Crossover** (`crossover.py`) | Splice two architectures + merge checkpoints |
 | **Evaluation** (`evaluation.py`) | Runged filtering: static analysis, short training, full training |
+| **TrainRecipe Bridge** (`train_recipe.py`) | Export renderer-safe motif knobs and patch downstream `train.py` targets |
+| **Transfer Workflows** (`cuda_transfer.py`, `mlx_transfer.py`) | Stage honest baseline-vs-seeded downstream validation runs |
 </details>
 
 <details>
