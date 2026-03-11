@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "transformer-evolution-llm"
+name = "tevo"
 version = "0.1.0"
-description = "Laptop-friendly evolutionary search for MoE-centric transformer variants."
+description = "TEVO: evolve language-model motifs cheaply, then validate them in downstream train.py loops."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-  { name = "transformer-evolution maintainers" }
+  { name = "TEVO maintainers" }
 ]
 dependencies = [
   "accelerate>=0.33",
