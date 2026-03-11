@@ -18,11 +18,17 @@ htmlcov/
 cache/
 runs/
 results/
+"$CFG"
 
 seeds/
 .beads/
 .env
 .env.*
+uv.lock
 paper_2511_07384.pdf
 paper_2511_07384.txt
 debrief.md
+
+# Local agent context and editor state
+.context/
+.cursor/

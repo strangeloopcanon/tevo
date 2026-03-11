@@ -1,0 +1,15 @@
+{
+  "repo_url": "https://github.com/karpathy/autoresearch.git",
+  "repo_ref": "c12eef778edafc89cd7ce036a7f500ddb5397a65",
+  "prepare_status": "ok",
+  "prepare_log_path": "prepare.log",
+  "results": [
+    {
+      "run_index": 1,
+      "status": "ok",
+      "val_bpb": 1.117953,
+      "peak_memory_gb": 43.95654296875,
+      "log_path": "train_run1.log"
+    }
+  ]
+}

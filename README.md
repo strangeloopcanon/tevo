@@ -1,22 +1,56 @@
 # Transformer Evolution LLM
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/strangeloopcanon/transformer-evolution-llm)
 
-An evolutionary architecture-search loop for Transformer-like language models.
+So what: this repo is a typed evolutionary search loop for language-model architectures, and it now has a practical bridge into upstream-style `train.py` research loops. TEVO explores motifs in a structured search space, exports them as `TrainRecipe` artifacts, and can project those motifs into upstream `autoresearch`-style CUDA `train.py` without hand-editing the file.
 
-Architectures are defined in typed YAML (Pydantic). The loop mutates/crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. Children inherit weights from parents and crossover merges checkpoints when possible.
+Current proof-of-concept: a projected TEVO-discovered frontier sibling improved upstream CUDA `autoresearch` from `val_bpb = 1.117953` to `1.113392` on the pinned upstream commit `c12eef778edafc89cd7ce036a7f500ddb5397a65`, while also reducing peak VRAM.
 
-## Punchline
+## What This Repo Is
 
-Purely behavioral selection (loss + memory/speed + novelty/entropy) repeatedly discovers *embedding-conditioned FFNs* -- FFNs that read token embeddings instead of the residual stream. This trait was not an explicit objective. See [docs/example_frontiers.md](docs/example_frontiers.md) for full metrics and repro commands.
+Architectures are defined in typed YAML (Pydantic). The loop mutates and crosses over these specs, trains each candidate for a short budget, scores it on multiple objectives, and keeps a Pareto frontier. Children inherit weights from parents and crossover merges checkpoints when possible.
+
+The point is not just to search for good small models. The point is to discover **motifs** under cheap proxy budgets, then test whether those motifs survive in more concrete downstream training code.
+
+## Current Proof
+
+The repo now supports this loop end to end:
+
+1. TEVO discovers a candidate under a short-budget benchmark.
+2. The candidate is exported into a backend-neutral `TrainRecipe`.
+3. Oversized recipes are projected into the upstream CUDA `autoresearch` size envelope while preserving the motif.
+4. The projected recipe is rendered into upstream-style `train.py`.
+5. The resulting `train.py` is benchmarked on the real 5-minute CUDA `autoresearch` loop.
+
+The first clean proof of that loop is now in place:
+
+| Probe | Result |
+|-------|--------|
+| Stock upstream CUDA `autoresearch` baseline | `val_bpb = 1.117953` |
+| TEVO motif-transfer probe | `val_bpb = 1.113392` |
+| Delta | `-0.004561` better |
+| Peak VRAM | `43.96 GiB -> 35.89 GiB` |
+
+That is the current shareable story: **TEVO found a motif, the bridge transferred it honestly, and upstream `autoresearch` improved.**
+
+This is a single projected probe on a pinned upstream commit, so treat it as proof that motif transfer works, not as a broad leaderboard claim yet.
+
+The small proof bundle behind that claim lives in [artifacts/motif_transfer_proof](artifacts/motif_transfer_proof/README.md).
+
+## Start Here
+
+- [docs/motif_transfer_demo.md](docs/motif_transfer_demo.md) for the clearest explanation of the current TEVO -> `autoresearch` result
+- [artifacts/motif_transfer_proof](artifacts/motif_transfer_proof/README.md) for the compact artifact bundle behind the current proof
+- [docs/train_recipe_bridge.md](docs/train_recipe_bridge.md) for the bridge design and compatibility rules
+- [docs/cuda_transfer_demo.md](docs/cuda_transfer_demo.md) for the CUDA workflow on Modal
+- [docs/configuration_guide.md](docs/configuration_guide.md) for search configs, objectives, and selection policies
 
 ## Why This Exists
 
-This repo is a sandbox for answering: "under a fixed training recipe and constraints, what kinds of architectural motifs survive?"
+This repo is a sandbox for answering: under a fixed training recipe and constraints, what architectural motifs survive?
 
-- Explore trade-offs (quality vs speed vs memory) without hand-writing dozens of model variants.
-- Make results inspectable: every run emits a frontier plus lineage describing how candidates were produced.
-
-The goal is to use laptop-scale surrogates (~65-100M params) as a fast feedback loop to discover motifs that can then be scaled up.
+- explore quality / speed / memory trade-offs without hand-authoring dozens of variants
+- keep the search inspectable: every run emits a frontier, lineage, and checkpoints
+- use small or short-budget runs as a fast feedback loop before spending larger GPU budgets downstream
 
 ## Installation
 
@@ -78,7 +112,8 @@ Each run writes artifacts under `runs/<run_id>/`:
 | `checkpoints/` | Model checkpoints (often pruned to frontier-only) |
 | `live.log` | Full run log |
 
-## System Architecture
+<details>
+<summary><strong>System Architecture</strong></summary>
 
 ```mermaid
 flowchart LR
@@ -100,8 +135,10 @@ flowchart LR
 | **Mutations** (`mutations.py`) | Genetic operators that modify specs (grow, shrink, toggle) |
 | **Crossover** (`crossover.py`) | Splice two architectures + merge checkpoints |
 | **Evaluation** (`evaluation.py`) | Runged filtering: static analysis, short training, full training |
+</details>
 
-## Project Structure
+<details>
+<summary><strong>Project Structure</strong></summary>
 
 ```
 configs/                          YAML experiment configurations
@@ -121,6 +158,7 @@ src/transformer_evolution_llm/
     crossover.py                  Crossover + checkpoint merge
 tests/                            Pytest suite
 ```
+</details>
 
 ## Scope
 
@@ -128,23 +166,29 @@ tests/                            Pytest suite
 - **Short-budget proxies:** metrics come from short surrogate training. The frontier moves when you increase data, steps, or change objectives.
 - **Not a leaderboard:** the NanoGPT-style benchmark is for repeatable *within-repo* comparisons.
 
-## Documentation
+<details>
+<summary><strong>Full Documentation Index</strong></summary>
 
 | Topic | Document |
 |-------|----------|
 | Configuration, objectives, selection profiles | [docs/configuration_guide.md](docs/configuration_guide.md) |
 | Architecture comparison (GPT-2 vs nanochat vs TEVO), glossary | [docs/architecture_comparison.md](docs/architecture_comparison.md) |
+| Current TEVO -> autoresearch motif-transfer proof | [docs/motif_transfer_demo.md](docs/motif_transfer_demo.md) |
 | Example frontier survivors | [docs/example_frontiers.md](docs/example_frontiers.md) |
 | Findings & operational lessons | [docs/evolution_takeaways.md](docs/evolution_takeaways.md) |
 | Optimizer & method discovery | [docs/optimizer_method_discovery.md](docs/optimizer_method_discovery.md) |
 | Run history & evolution log | [docs/run_history.md](docs/run_history.md) |
 | Running on Modal GPUs | [docs/modal_run.md](docs/modal_run.md) |
+| TrainRecipe bridge to autoresearch / MLX (including CUDA-safe motif projection) | [docs/train_recipe_bridge.md](docs/train_recipe_bridge.md) |
+| First public CUDA transfer workflow | [docs/cuda_transfer_demo.md](docs/cuda_transfer_demo.md) |
+| First public MLX transfer workflow | [docs/mlx_transfer_demo.md](docs/mlx_transfer_demo.md) |
 | GPU scale-up plan (350M-1B) | [docs/gpu_run_plan.md](docs/gpu_run_plan.md) |
 | NanoGPT-style benchmark contract | [docs/nanogpt_benchmark.md](docs/nanogpt_benchmark.md) |
 | Scaling policies | [docs/scale_policy.md](docs/scale_policy.md) |
 | nanochat alignment notes | [docs/nanochat_alignment.md](docs/nanochat_alignment.md) |
 | CLI reference & workflows | [docs/cli_reference.md](docs/cli_reference.md) |
 | Troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
+</details>
 
 ## Roadmap
 

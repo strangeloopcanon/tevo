@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess  # nosec B404 - CLI orchestrates trusted local repo entrypoints.
 from pathlib import Path
 from typing import Annotated
 
@@ -11,11 +14,66 @@ from rich.console import Console
 from rich.table import Table
 
 from . import get_version
-from .api import convert_checkpoints, export_frontier_seed, prune_checkpoints, run_evolution
+from .api import (
+    convert_checkpoints,
+    export_frontier_seed,
+    export_train_recipe,
+    prune_checkpoints,
+    render_train_recipe,
+    run_evolution,
+)
 from .cache_builder import synthesize_cache
+from .cuda_transfer import (
+    build_public_cuda_transfer_report,
+    render_public_cuda_variants,
+    resolve_autoresearch_source_repo,
+    run_public_cuda_transfer_modal_benchmarks,
+)
+from .mlx_transfer import (
+    audit_tevo_regions_from_paths,
+    build_public_transfer_report,
+    cost_conscious_modal_budget,
+    detect_tevo_device,
+    export_public_transfer_recipes,
+    render_continuation_summary_markdown,
+    render_public_transfer_variants,
+    run_public_transfer_benchmarks,
+    stage_public_transfer_continuation,
+    stage_public_transfer_workspaces,
+    summarize_continuation_results,
+    write_winning_seed_diff,
+)
+from .train_recipe import TrainRecipeTarget, load_train_recipe, render_train_recipe_fragment
 
 app = typer.Typer(help="Evolutionary search loop utilities")
 console = Console()
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _modal_repo_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(REPO_ROOT))
+    except ValueError as exc:
+        raise typer.BadParameter(
+            "Modal TEVO runs require --config to live inside this repo so it can be "
+            "mounted into the Modal image."
+        ) from exc
+
+
+def _modal_run_slug(path: Path) -> str:
+    slug = "".join(
+        ch if (ch.isalnum() or ch in {"-", "_"}) else "_"
+        for ch in str(path.resolve().name or "mlx_transfer")
+    )
+    return slug.strip("_") or "mlx_transfer"
+
+
+def _copy_required_artifact(source: Path, dest: Path, *, label: str) -> None:
+    if not source.exists():
+        raise typer.BadParameter(f"Missing {label} artifact at {source}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
 
 
 @app.command()
@@ -90,6 +148,810 @@ def export_seed(
         checkpoint_dir=checkpoint_dir,
     )
     console.print(f"[bold green]Seed config written:[/] {out}")
+
+
+@app.command("train-recipe-export")
+def export_train_recipe_cmd(
+    source: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            readable=True,
+            help="TEVO config path or frontier JSON path.",
+        ),
+    ],
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Output recipe file path (single export) or directory (multi-export)."),
+    ] = None,
+    candidate_id: Annotated[
+        str | None,
+        typer.Option(help="Optional frontier candidate id to export."),
+    ] = None,
+    top_k: Annotated[
+        int,
+        typer.Option(min=1, help="How many compatible frontier recipes to export."),
+    ] = 1,
+    metric: Annotated[
+        str,
+        typer.Option(help="Metric used to shortlist compatible frontier entries."),
+    ] = "ppl_code",
+) -> None:
+    """Export TrainRecipe YAML artifacts from a TEVO spec or frontier."""
+    if out is None:
+        if top_k > 1 or source.suffix == ".json":
+            out = source.parent / f"{source.stem}_train_recipes"
+        else:
+            out = source.with_name(source.stem + ".train_recipe.yaml")
+    written = export_train_recipe(
+        source_path=source,
+        out_path=out,
+        candidate_id=candidate_id,
+        top_k=top_k,
+        metric=metric,
+    )
+    for path in written:
+        console.print(f"[bold green]Train recipe written:[/] {path}")
+
+
+@app.command("train-recipe-render")
+def render_train_recipe_cmd(
+    recipe: Annotated[
+        Path,
+        typer.Argument(..., exists=True, readable=True, help="Path to a TrainRecipe YAML/JSON."),
+    ],
+    backend: Annotated[
+        TrainRecipeTarget,
+        typer.Option(help="Which downstream train.py flavor to render for."),
+    ],
+    train_py: Annotated[
+        Path | None,
+        typer.Option(help="Existing downstream train.py to patch in-place (or via --out)."),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Optional output path for the rendered file or fragment."),
+    ] = None,
+) -> None:
+    """Render a TrainRecipe into a downstream train.py or emit the TEVO-owned zones."""
+    loaded_recipe = load_train_recipe(recipe)
+    if train_py is None:
+        fragment = render_train_recipe_fragment(loaded_recipe, backend)
+        if out is None:
+            typer.echo(fragment)
+            return
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(fragment)
+        console.print(f"[bold green]Train recipe fragment written:[/] {out}")
+        return
+
+    rendered_path = render_train_recipe(
+        recipe_path=recipe,
+        target=backend,
+        train_py_path=train_py,
+        out_path=out,
+    )
+    console.print(f"[bold green]Rendered train.py written:[/] {rendered_path}")
+
+
+@app.command("mlx-transfer-prepare")
+def mlx_transfer_prepare_cmd(
+    mlx_repo: Annotated[
+        Path,
+        typer.Argument(
+            ..., exists=True, readable=True, file_okay=False, help="autoresearch-mlx checkout."
+        ),
+    ],
+    run_root: Annotated[
+        Path,
+        typer.Option(help="Artifact directory for the first public MLX transfer run."),
+    ] = Path("runs/mlx_transfer"),
+    config: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            readable=True,
+            help="TEVO config used for the bridge-safe discovery sweep.",
+        ),
+    ] = Path("configs/exp_train_recipe_bridge_owt_10m_v1.yaml"),
+    frontier: Annotated[
+        Path | None,
+        typer.Option(
+            help="Existing frontier JSON to reuse instead of launching a fresh TEVO sweep."
+        ),
+    ] = None,
+    lineage: Annotated[
+        Path | None,
+        typer.Option(help="Optional lineage JSON to copy alongside a reused frontier."),
+    ] = None,
+    modal: Annotated[
+        bool,
+        typer.Option(
+            help="Run the upstream TEVO seed benchmark and sweep on Modal instead of locally."
+        ),
+    ] = False,
+    modal_gpu: Annotated[
+        str,
+        typer.Option(help="Modal GPU preset for the upstream TEVO discovery sweep."),
+    ] = "A10G",
+    modal_local_out_dir: Annotated[
+        Path | None,
+        typer.Option(help="Local cache directory for downloaded Modal TEVO artifacts."),
+    ] = None,
+    device: Annotated[
+        str,
+        typer.Option(help="TEVO live-run device: auto, mps, cpu, or cuda."),
+    ] = "auto",
+    generations: Annotated[int, typer.Option(min=1)] = 8,
+    steps: Annotated[int, typer.Option(min=1)] = 120,
+    eval_batches: Annotated[int, typer.Option(min=1)] = 4,
+    seed: Annotated[int, typer.Option()] = 0,
+) -> None:
+    """Stage the first public TEVO -> autoresearch-mlx transfer run."""
+    run_root.mkdir(parents=True, exist_ok=True)
+    frontier_out = run_root / "frontier.json"
+    lineage_out = run_root / "frontier_lineage.json"
+    state_out = run_root / "frontier.state.json"
+    tevo_mode = "reused_frontier" if frontier is not None else ("modal" if modal else "local")
+    if tevo_mode == "local":
+        prepared_device = detect_tevo_device(device)
+    elif tevo_mode == "modal":
+        prepared_device = f"modal:{modal_gpu}"
+    else:
+        prepared_device = "reused-frontier"
+    modal_budget: dict[str, int] | None = None
+    modal_artifacts_root: Path | None = None
+
+    if frontier is None:
+        seed_summary_path = run_root / "tevo_seed_summary.json"
+        seed_history_path = run_root / "tevo_seed_history.json"
+        if modal:
+            modal_budget = cost_conscious_modal_budget(
+                generations=generations,
+                steps=steps,
+                eval_batches=eval_batches,
+            )
+            if modal_budget != {
+                "generations": int(generations),
+                "steps": int(steps),
+                "eval_batches": int(eval_batches),
+            }:
+                console.print(
+                    "[yellow]Modal TEVO discovery budget capped for the first public pass:[/] "
+                    f"{modal_budget}"
+                )
+            modal_artifacts_root = (modal_local_out_dir or (run_root / "modal")).resolve()
+            modal_artifacts_root.mkdir(parents=True, exist_ok=True)
+            modal_env = dict(os.environ, TEVO_MODAL_GPU=str(modal_gpu))
+            modal_config = _modal_repo_path(config)
+            run_slug = _modal_run_slug(run_root)
+            bench_run_id = f"{run_slug}_seed_bench"
+            benchmark_cmd = [
+                "modal",
+                "run",
+                "scripts/modal_run_benchmark.py",
+                "--config-path",
+                modal_config,
+                "--steps",
+                str(modal_budget["steps"]),
+                "--eval-batches",
+                str(modal_budget["eval_batches"]),
+                "--seed",
+                str(int(seed)),
+                "--run-id",
+                bench_run_id,
+                "--download",
+                "--local-out-dir",
+                str(modal_artifacts_root),
+            ]
+            subprocess.run(  # noqa: S603  # nosec B603
+                benchmark_cmd,
+                check=True,
+                cwd=REPO_ROOT,
+                env=modal_env,
+            )
+            _copy_required_artifact(
+                modal_artifacts_root / bench_run_id / "summary.json",
+                seed_summary_path,
+                label="Modal TEVO seed summary",
+            )
+            _copy_required_artifact(
+                modal_artifacts_root / bench_run_id / "history.json",
+                seed_history_path,
+                label="Modal TEVO seed history",
+            )
+
+            sweep_run_id = f"{run_slug}_sweep"
+            live_cmd = [
+                "modal",
+                "run",
+                "scripts/modal_run_live.py",
+                "--config-path",
+                modal_config,
+                "--generations",
+                str(modal_budget["generations"]),
+                "--steps",
+                str(modal_budget["steps"]),
+                "--eval-batches",
+                str(modal_budget["eval_batches"]),
+                "--seed",
+                str(int(seed)),
+                "--run-id",
+                sweep_run_id,
+                "--download",
+                "--local-out-dir",
+                str(modal_artifacts_root),
+                "--lineage",
+            ]
+            subprocess.run(  # noqa: S603  # nosec B603
+                live_cmd,
+                check=True,
+                cwd=REPO_ROOT,
+                env=modal_env,
+            )
+            _copy_required_artifact(
+                modal_artifacts_root / sweep_run_id / "frontier.json",
+                frontier_out,
+                label="Modal TEVO frontier",
+            )
+            _copy_required_artifact(
+                modal_artifacts_root / sweep_run_id / "frontier.state.json",
+                state_out,
+                label="Modal TEVO state",
+            )
+            lineage_source = modal_artifacts_root / sweep_run_id / "frontier_lineage.json"
+            if not lineage_source.exists():
+                lineage_source = modal_artifacts_root / sweep_run_id / "lineage.json"
+            if lineage_source.exists():
+                _copy_required_artifact(
+                    lineage_source,
+                    lineage_out,
+                    label="Modal TEVO lineage",
+                )
+        else:
+            benchmark_cmd = [
+                "python3",
+                "scripts/run_benchmark.py",
+                str(config),
+                "--steps",
+                str(int(steps)),
+                "--eval-batches",
+                str(int(eval_batches)),
+                "--device",
+                prepared_device,
+                "--out",
+                str(seed_summary_path),
+                "--history-out",
+                str(seed_history_path),
+            ]
+            subprocess.run(benchmark_cmd, check=True, cwd=REPO_ROOT)  # noqa: S603  # nosec B603
+
+            live_cmd = [
+                "python3",
+                "scripts/run_live.py",
+                str(config),
+                "--generations",
+                str(int(generations)),
+                "--steps",
+                str(int(steps)),
+                "--eval-batches",
+                str(int(eval_batches)),
+                "--device",
+                prepared_device,
+                "--seed",
+                str(int(seed)),
+                "--out",
+                str(frontier_out),
+                "--checkpoint-dir",
+                str(run_root / "checkpoints"),
+                "--lineage-out",
+                str(lineage_out),
+                "--state-out",
+                str(state_out),
+            ]
+            subprocess.run(live_cmd, check=True, cwd=REPO_ROOT)  # noqa: S603  # nosec B603
+    else:
+        if frontier.resolve() != frontier_out.resolve():
+            shutil.copy2(frontier, frontier_out)
+        else:
+            frontier_out = frontier
+        if lineage is not None:
+            if lineage.resolve() != lineage_out.resolve():
+                shutil.copy2(lineage, lineage_out)
+            else:
+                lineage_out = lineage
+
+    selected, selection_manifest_path = export_public_transfer_recipes(
+        frontier_out,
+        run_root / "train_recipes",
+    )
+    rendered_variants, render_manifest_path = render_public_transfer_variants(
+        mlx_repo,
+        selection_manifest_path,
+        run_root / "rendered_train_py",
+    )
+    arm_manifest_path = stage_public_transfer_workspaces(
+        mlx_repo=mlx_repo,
+        rendered_variants=rendered_variants,
+        out_dir=run_root / "mlx_arms",
+    )
+    prepare_manifest = {
+        "config": str(config.resolve()),
+        "device": prepared_device,
+        "tevo_mode": tevo_mode,
+        "modal_gpu": (str(modal_gpu) if tevo_mode == "modal" else None),
+        "modal_budget": modal_budget,
+        "modal_artifacts_root": (
+            str(modal_artifacts_root) if modal_artifacts_root is not None else None
+        ),
+        "frontier": str(frontier_out.resolve()),
+        "lineage": str(lineage_out.resolve()) if lineage_out.exists() else None,
+        "state": str(state_out.resolve()) if state_out.exists() else None,
+        "selection_manifest": str(selection_manifest_path.resolve()),
+        "render_manifest": str(render_manifest_path.resolve()),
+        "arm_manifest": str(arm_manifest_path.resolve()),
+        "selected_labels": [item.label for item in selected],
+        "selected_candidates": [item.candidate_id for item in selected],
+    }
+    prepare_manifest_path = run_root / "transfer_prepare_manifest.json"
+    prepare_manifest_path.write_text(json.dumps(prepare_manifest, indent=2))
+    console.print(f"[bold green]Prepared MLX transfer run:[/] {run_root}")
+    console.print(f"Frontier: {frontier_out}")
+    console.print(f"Arm manifest: {arm_manifest_path}")
+
+
+@app.command("mlx-transfer-benchmark")
+def mlx_transfer_benchmark_cmd(
+    run_root: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            readable=True,
+            file_okay=False,
+            help="Prepared transfer run directory.",
+        ),
+    ],
+    repeat: Annotated[int, typer.Option(min=1)] = 3,
+    timeout_minutes: Annotated[int, typer.Option(min=1)] = 10,
+    command: Annotated[
+        str,
+        typer.Option(help="Benchmark command to run inside each arm repo."),
+    ] = "uv run train.py",
+) -> None:
+    """Run the baseline + seeded autoresearch-mlx benchmark arms and summarize medians."""
+    arm_manifest_path = run_root / "mlx_arms" / "arm_manifest.json"
+    if not arm_manifest_path.exists():
+        raise typer.BadParameter(f"Missing arm manifest: {arm_manifest_path}")
+    _, _, summary_path, markdown_path = run_public_transfer_benchmarks(
+        arm_manifest_path,
+        out_dir=run_root / "mlx_results",
+        repeat=repeat,
+        timeout_seconds=int(timeout_minutes) * 60,
+        command=command,
+    )
+    summary_payload = json.loads(summary_path.read_text())
+    winner = summary_payload.get("winner")
+    if winner:
+        diff_path = write_winning_seed_diff(
+            arm_manifest_path,
+            summary_path,
+            run_root / "mlx_results" / "winning_seed.diff",
+        )
+        continuation_manifest = stage_public_transfer_continuation(
+            arm_manifest_path,
+            summary_path,
+            run_root / "continuation",
+            repo_root=REPO_ROOT,
+        )
+        console.print(f"[bold green]Winning seed diff:[/] {diff_path}")
+        console.print(f"[bold green]Continuation workspace:[/] {continuation_manifest}")
+    else:
+        console.print(
+            "[yellow]No winning seeded arm yet; continuation workspace was not staged.[/]"
+        )
+
+    report_payload, report_markdown = build_public_transfer_report(run_root)
+    report_path = run_root / "public_report.md"
+    report_json_path = run_root / "public_report.json"
+    report_path.write_text(report_markdown)
+    report_json_path.write_text(json.dumps(report_payload, indent=2))
+    console.print(f"[bold green]Benchmark summary written:[/] {markdown_path}")
+    console.print(f"[bold green]Public report written:[/] {report_path}")
+
+
+@app.command("mlx-transfer-audit")
+def mlx_transfer_audit_cmd(
+    seed_train_py: Annotated[
+        Path,
+        typer.Argument(
+            ..., exists=True, readable=True, help="Seed snapshot with frozen TEVO-owned regions."
+        ),
+    ],
+    candidate_train_py: Annotated[
+        Path,
+        typer.Argument(
+            ..., exists=True, readable=True, help="Current train.py to compare against the seed."
+        ),
+    ],
+    out: Annotated[Path | None, typer.Option(help="Optional JSON output path.")] = None,
+) -> None:
+    """Audit whether TEVO-owned marker regions changed between two train.py files."""
+    payload = audit_tevo_regions_from_paths(seed_train_py, candidate_train_py, out)
+    console.print_json(json=json.dumps(payload, indent=2))
+
+
+@app.command("mlx-transfer-continuation-summary")
+def mlx_transfer_continuation_summary_cmd(
+    results_tsv: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            readable=True,
+            help="Continuation results.tsv from the seeded MLX workspace.",
+        ),
+    ],
+    out: Annotated[Path | None, typer.Option(help="Optional Markdown output path.")] = None,
+) -> None:
+    """Summarize the seeded continuation best-so-far trajectory."""
+    payload = summarize_continuation_results(results_tsv)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(render_continuation_summary_markdown(payload))
+        console.print(f"[bold green]Continuation summary written:[/] {out}")
+    console.print_json(json=json.dumps(payload, indent=2))
+
+
+@app.command("mlx-transfer-report")
+def mlx_transfer_report_cmd(
+    run_root: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            readable=True,
+            file_okay=False,
+            help="Prepared transfer run directory.",
+        ),
+    ],
+    out: Annotated[Path | None, typer.Option(help="Optional Markdown output path.")] = None,
+) -> None:
+    """Build the public-facing report from TEVO, MLX benchmark, and continuation artifacts."""
+    payload, markdown = build_public_transfer_report(run_root)
+    if out is None:
+        out = run_root / "public_report.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(markdown)
+    payload_path = out.with_suffix(".json")
+    payload_path.write_text(json.dumps(payload, indent=2))
+    console.print(f"[bold green]Public report written:[/] {out}")
+
+
+@app.command("cuda-transfer-prepare")
+def cuda_transfer_prepare_cmd(
+    run_root: Annotated[
+        Path,
+        typer.Option(help="Artifact directory for the first public CUDA transfer run."),
+    ] = Path("runs/cuda_transfer"),
+    config: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            readable=True,
+            help="TEVO config used for the bridge-safe discovery sweep.",
+        ),
+    ] = Path("configs/exp_train_recipe_bridge_owt_10m_v1.yaml"),
+    autoresearch_repo: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            readable=True,
+            file_okay=False,
+            help="Optional local autoresearch checkout to render against.",
+        ),
+    ] = None,
+    autoresearch_repo_url: Annotated[
+        str,
+        typer.Option(help="Git URL for the CUDA autoresearch repo Modal will benchmark."),
+    ] = "https://github.com/karpathy/autoresearch.git",
+    autoresearch_ref: Annotated[
+        str,
+        typer.Option(help="Git ref or commit for the CUDA autoresearch repo."),
+    ] = "master",
+    frontier: Annotated[
+        Path | None,
+        typer.Option(
+            help="Existing frontier JSON to reuse instead of launching a fresh Modal TEVO sweep."
+        ),
+    ] = None,
+    lineage: Annotated[
+        Path | None,
+        typer.Option(help="Optional lineage JSON to copy alongside a reused frontier."),
+    ] = None,
+    modal_gpu: Annotated[
+        str,
+        typer.Option(help="Modal GPU preset for the TEVO discovery sweep."),
+    ] = "A10G",
+    modal_local_out_dir: Annotated[
+        Path | None,
+        typer.Option(help="Local cache directory for downloaded Modal TEVO artifacts."),
+    ] = None,
+    generations: Annotated[int, typer.Option(min=1)] = 8,
+    steps: Annotated[int, typer.Option(min=1)] = 120,
+    eval_batches: Annotated[int, typer.Option(min=1)] = 4,
+    seed: Annotated[int, typer.Option()] = 0,
+) -> None:
+    """Stage the first public TEVO -> autoresearch CUDA transfer run."""
+    run_root.mkdir(parents=True, exist_ok=True)
+    source_repo, repo_metadata = resolve_autoresearch_source_repo(
+        out_dir=run_root,
+        local_repo=autoresearch_repo,
+        repo_url=autoresearch_repo_url,
+        repo_ref=autoresearch_ref,
+    )
+    frontier_out = run_root / "frontier.json"
+    lineage_out = run_root / "frontier_lineage.json"
+    state_out = run_root / "frontier.state.json"
+    tevo_mode = "reused_frontier" if frontier is not None else "modal"
+    modal_budget: dict[str, int] | None = None
+    modal_artifacts_root: Path | None = None
+
+    if frontier is None:
+        seed_summary_path = run_root / "tevo_seed_summary.json"
+        seed_history_path = run_root / "tevo_seed_history.json"
+        modal_budget = cost_conscious_modal_budget(
+            generations=generations,
+            steps=steps,
+            eval_batches=eval_batches,
+        )
+        if modal_budget != {
+            "generations": int(generations),
+            "steps": int(steps),
+            "eval_batches": int(eval_batches),
+        }:
+            console.print(
+                "[yellow]Modal TEVO discovery budget capped for the first public CUDA pass:[/] "
+                f"{modal_budget}"
+            )
+        modal_artifacts_root = (modal_local_out_dir or (run_root / "modal" / "tevo")).resolve()
+        modal_artifacts_root.mkdir(parents=True, exist_ok=True)
+        modal_env = dict(os.environ, TEVO_MODAL_GPU=str(modal_gpu))
+        modal_config = _modal_repo_path(config)
+        run_slug = _modal_run_slug(run_root)
+        bench_run_id = f"{run_slug}_seed_bench"
+        benchmark_cmd = [
+            "modal",
+            "run",
+            "scripts/modal_run_benchmark.py",
+            "--config-path",
+            modal_config,
+            "--steps",
+            str(modal_budget["steps"]),
+            "--eval-batches",
+            str(modal_budget["eval_batches"]),
+            "--seed",
+            str(int(seed)),
+            "--run-id",
+            bench_run_id,
+            "--download",
+            "--local-out-dir",
+            str(modal_artifacts_root),
+        ]
+        subprocess.run(  # noqa: S603  # nosec B603
+            benchmark_cmd,
+            check=True,
+            cwd=REPO_ROOT,
+            env=modal_env,
+        )
+        _copy_required_artifact(
+            modal_artifacts_root / bench_run_id / "summary.json",
+            seed_summary_path,
+            label="Modal TEVO seed summary",
+        )
+        _copy_required_artifact(
+            modal_artifacts_root / bench_run_id / "history.json",
+            seed_history_path,
+            label="Modal TEVO seed history",
+        )
+
+        sweep_run_id = f"{run_slug}_sweep"
+        live_cmd = [
+            "modal",
+            "run",
+            "scripts/modal_run_live.py",
+            "--config-path",
+            modal_config,
+            "--generations",
+            str(modal_budget["generations"]),
+            "--steps",
+            str(modal_budget["steps"]),
+            "--eval-batches",
+            str(modal_budget["eval_batches"]),
+            "--seed",
+            str(int(seed)),
+            "--run-id",
+            sweep_run_id,
+            "--download",
+            "--local-out-dir",
+            str(modal_artifacts_root),
+            "--lineage",
+        ]
+        subprocess.run(  # noqa: S603  # nosec B603
+            live_cmd,
+            check=True,
+            cwd=REPO_ROOT,
+            env=modal_env,
+        )
+        _copy_required_artifact(
+            modal_artifacts_root / sweep_run_id / "frontier.json",
+            frontier_out,
+            label="Modal TEVO frontier",
+        )
+        _copy_required_artifact(
+            modal_artifacts_root / sweep_run_id / "frontier.state.json",
+            state_out,
+            label="Modal TEVO state",
+        )
+        lineage_source = modal_artifacts_root / sweep_run_id / "frontier_lineage.json"
+        if not lineage_source.exists():
+            lineage_source = modal_artifacts_root / sweep_run_id / "lineage.json"
+        if lineage_source.exists():
+            _copy_required_artifact(
+                lineage_source,
+                lineage_out,
+                label="Modal TEVO lineage",
+            )
+    else:
+        if frontier.resolve() != frontier_out.resolve():
+            shutil.copy2(frontier, frontier_out)
+        else:
+            frontier_out = frontier
+        if lineage is not None:
+            if lineage.resolve() != lineage_out.resolve():
+                shutil.copy2(lineage, lineage_out)
+            else:
+                lineage_out = lineage
+
+    selected, selection_manifest_path = export_public_transfer_recipes(
+        frontier_out,
+        run_root / "train_recipes",
+    )
+    rendered_variants, render_manifest_path = render_public_cuda_variants(
+        source_repo,
+        selection_manifest_path,
+        run_root / "rendered_train_py",
+    )
+    arm_manifest_path = stage_public_transfer_workspaces(
+        mlx_repo=source_repo,
+        rendered_variants=rendered_variants,
+        out_dir=run_root / "cuda_arms",
+    )
+    prepare_manifest = {
+        "config": str(config.resolve()),
+        "device": f"modal:{modal_gpu}",
+        "tevo_mode": tevo_mode,
+        "modal_gpu": str(modal_gpu),
+        "modal_budget": modal_budget,
+        "modal_artifacts_root": (
+            str(modal_artifacts_root) if modal_artifacts_root is not None else None
+        ),
+        "frontier": str(frontier_out.resolve()),
+        "lineage": str(lineage_out.resolve()) if lineage_out.exists() else None,
+        "state": str(state_out.resolve()) if state_out.exists() else None,
+        "selection_manifest": str(selection_manifest_path.resolve()),
+        "render_manifest": str(render_manifest_path.resolve()),
+        "arm_manifest": str(arm_manifest_path.resolve()),
+        "selected_labels": [item.label for item in selected],
+        "selected_candidates": [item.candidate_id for item in selected],
+        "autoresearch_source_repo": str(source_repo.resolve()),
+        "autoresearch_repo_url": repo_metadata.get("repo_url"),
+        "autoresearch_repo_ref": repo_metadata.get("repo_ref"),
+        "autoresearch_source_kind": repo_metadata.get("source_kind"),
+    }
+    prepare_manifest_path = run_root / "transfer_prepare_manifest.json"
+    prepare_manifest_path.write_text(json.dumps(prepare_manifest, indent=2))
+    console.print(f"[bold green]Prepared CUDA transfer run:[/] {run_root}")
+    console.print(f"Frontier: {frontier_out}")
+    console.print(f"CUDA source repo: {source_repo}")
+    console.print(f"Arm manifest: {arm_manifest_path}")
+
+
+@app.command("cuda-transfer-benchmark")
+def cuda_transfer_benchmark_cmd(
+    run_root: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            readable=True,
+            file_okay=False,
+            help="Prepared CUDA transfer run directory.",
+        ),
+    ],
+    repeat: Annotated[int, typer.Option(min=1)] = 3,
+    timeout_minutes: Annotated[int, typer.Option(min=1)] = 10,
+    modal_gpu: Annotated[
+        str,
+        typer.Option(help="Modal GPU preset for CUDA autoresearch benchmarking."),
+    ] = "A100-80GB",
+    modal_local_out_dir: Annotated[
+        Path | None,
+        typer.Option(help="Local cache directory for downloaded Modal CUDA benchmark artifacts."),
+    ] = None,
+) -> None:
+    """Run the baseline + seeded CUDA autoresearch benchmark arms through Modal."""
+    arm_manifest_path = run_root / "cuda_arms" / "arm_manifest.json"
+    if not arm_manifest_path.exists():
+        raise typer.BadParameter(f"Missing arm manifest: {arm_manifest_path}")
+    prepare_manifest_path = run_root / "transfer_prepare_manifest.json"
+    if not prepare_manifest_path.exists():
+        raise typer.BadParameter(f"Missing prepare manifest: {prepare_manifest_path}")
+    prepare_manifest = json.loads(prepare_manifest_path.read_text())
+    repo_url = str(prepare_manifest.get("autoresearch_repo_url") or "").strip()
+    repo_ref = str(prepare_manifest.get("autoresearch_repo_ref") or "master").strip()
+    if not repo_url:
+        raise typer.BadParameter(
+            "The prepared run is missing autoresearch_repo_url, "
+            "so Modal cannot clone the CUDA repo."
+        )
+
+    _, _, summary_path, markdown_path = run_public_cuda_transfer_modal_benchmarks(
+        arm_manifest_path,
+        repo_url=repo_url,
+        repo_ref=repo_ref,
+        out_dir=run_root / "cuda_results",
+        repo_root=REPO_ROOT,
+        modal_gpu=modal_gpu,
+        repeat=repeat,
+        timeout_minutes=timeout_minutes,
+        modal_local_out_dir=modal_local_out_dir or (run_root / "modal" / "autoresearch"),
+    )
+    summary_payload = json.loads(summary_path.read_text())
+    winner = summary_payload.get("winner")
+    if winner:
+        diff_path = write_winning_seed_diff(
+            arm_manifest_path,
+            summary_path,
+            run_root / "cuda_results" / "winning_seed.diff",
+        )
+        console.print(f"[bold green]Winning seed diff:[/] {diff_path}")
+    else:
+        console.print("[yellow]No winning seeded CUDA arm yet.[/]")
+
+    report_payload, report_markdown = build_public_cuda_transfer_report(run_root)
+    report_path = run_root / "cuda_public_report.md"
+    report_json_path = run_root / "cuda_public_report.json"
+    report_path.write_text(report_markdown)
+    report_json_path.write_text(json.dumps(report_payload, indent=2))
+    console.print(f"[bold green]Benchmark summary written:[/] {markdown_path}")
+    console.print(f"[bold green]CUDA public report written:[/] {report_path}")
+
+
+@app.command("cuda-transfer-report")
+def cuda_transfer_report_cmd(
+    run_root: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            readable=True,
+            file_okay=False,
+            help="Prepared CUDA transfer run directory.",
+        ),
+    ],
+    out: Annotated[Path | None, typer.Option(help="Optional Markdown output path.")] = None,
+) -> None:
+    """Build the public-facing CUDA transfer report from TEVO + Modal artifacts."""
+    payload, markdown = build_public_cuda_transfer_report(run_root)
+    if out is None:
+        out = run_root / "cuda_public_report.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(markdown)
+    payload_path = out.with_suffix(".json")
+    payload_path.write_text(json.dumps(payload, indent=2))
+    console.print(f"[bold green]CUDA public report written:[/] {out}")
 
 
 @app.command("resume-state")

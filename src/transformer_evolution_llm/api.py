@@ -11,13 +11,27 @@ import torch
 import ujson as json
 
 from .dsl import ArchitectureSpec, load_architecture_spec, save_architecture_spec
+from .train_recipe import (
+    TrainRecipe,
+    TrainRecipeTarget,
+    export_train_recipes,
+    load_train_recipe,
+    render_train_recipe_to_path,
+    save_train_recipe,
+)
 
 __all__ = [
     "ArchitectureSpec",
+    "TrainRecipe",
+    "TrainRecipeTarget",
     "load_spec",
     "save_spec",
+    "load_recipe",
+    "save_recipe",
     "run_evolution",
     "export_frontier_seed",
+    "export_train_recipe",
+    "render_train_recipe",
     "prune_checkpoints",
     "convert_checkpoints",
 ]
@@ -31,6 +45,16 @@ def load_spec(path: str | Path) -> ArchitectureSpec:
 def save_spec(spec: ArchitectureSpec, path: str | Path) -> None:
     """Persist an architecture spec to disk."""
     save_architecture_spec(spec, path)
+
+
+def load_recipe(path: str | Path) -> TrainRecipe:
+    """Read a train recipe from disk."""
+    return load_train_recipe(path)
+
+
+def save_recipe(recipe: TrainRecipe, path: str | Path) -> None:
+    """Persist a train recipe to disk."""
+    save_train_recipe(recipe, path)
 
 
 def run_evolution(
@@ -89,6 +113,55 @@ def export_frontier_seed(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_architecture_spec(spec, out_path)
+
+
+def export_train_recipe(
+    source_path: str | Path,
+    out_path: str | Path,
+    candidate_id: str | None = None,
+    top_k: int = 1,
+    metric: str = "ppl_code",
+) -> list[Path]:
+    """Export one or more train recipes from a spec or frontier file."""
+    recipes = export_train_recipes(
+        source_path=source_path,
+        candidate_id=candidate_id,
+        top_k=top_k,
+        metric=metric,
+    )
+    out_path = Path(out_path)
+    written: list[Path] = []
+    if len(recipes) == 1 and out_path.suffix in {".yaml", ".yml", ".json"}:
+        save_train_recipe(recipes[0], out_path)
+        return [out_path]
+    out_path.mkdir(parents=True, exist_ok=True)
+    for recipe in recipes:
+        safe_name = (
+            "".join(
+                ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in str(recipe.name)
+            ).strip("_")
+            or "recipe"
+        )
+        recipe_path = out_path / f"{safe_name}.train_recipe.yaml"
+        save_train_recipe(recipe, recipe_path)
+        written.append(recipe_path)
+    return written
+
+
+def render_train_recipe(
+    recipe_path: str | Path,
+    target: TrainRecipeTarget,
+    train_py_path: str | Path,
+    out_path: str | Path | None = None,
+) -> Path:
+    """Render a train recipe into a downstream train.py target."""
+    recipe = load_train_recipe(recipe_path)
+    return render_train_recipe_to_path(
+        recipe,
+        target=target,
+        train_py_path=train_py_path,
+        out_path=out_path,
+    )
 
 
 def _ids_from_state(state_path: Path) -> set[str]:

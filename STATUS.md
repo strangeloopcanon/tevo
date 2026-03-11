@@ -1,10 +1,10 @@
-# Status & Architecture Log
+# Status
 
-> **Note**: This content has been consolidated into the main README. See the collapsible "Run History & Evolution Log" appendix section in [README.md](README.md#appendix).
+So what: the current repo status is the TEVO -> `TrainRecipe` -> projected CUDA `autoresearch` proof-of-concept described in [README.md](README.md) and [docs/motif_transfer_demo.md](docs/motif_transfer_demo.md).
 
-For quick reference, the README now includes:
-- **Run History & Evolution Log** appendix with local artifacts table and architecture highlights
-- **Newest Long-Context Frontier** section with illustrative survivors
-- **Scientific Goals & Findings** section with current learnings
+Use these as the canonical entry points:
 
-For deeper dives, see [docs/evolution_takeaways.md](docs/evolution_takeaways.md).
+- [README.md](README.md) for the top-level repo story and current proof summary
+- [docs/motif_transfer_demo.md](docs/motif_transfer_demo.md) for the validated motif-transfer result
+- [docs/train_recipe_bridge.md](docs/train_recipe_bridge.md) for the bridge and projection rules
+- [docs/run_history.md](docs/run_history.md) for historical runs and older frontier snapshots
