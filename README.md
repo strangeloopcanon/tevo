@@ -1,7 +1,7 @@
-# Transformer Evolution LLM
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/strangeloopcanon/transformer-evolution-llm)
+# TEVO
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/strangeloopcanon/tevo)
 
-So what: this repo is a typed evolutionary search loop for language-model architectures with a practical handoff into upstream-style `train.py` research loops. TEVO discovers motifs under cheap proxy budgets, `TrainRecipe` carries the renderer-safe subset of those motifs, and downstream `autoresearch`-style `train.py` acts as the judge of whether they survive a real benchmark.
+So what: TEVO is a typed evolutionary search loop for language-model architectures with a practical handoff into upstream-style `train.py` research loops. It discovers motifs under cheap proxy budgets, `TrainRecipe` carries the renderer-safe subset of those motifs, and downstream `autoresearch`-style `train.py` acts as the judge of whether they survive a real benchmark.
 
 Current proof-of-concept: a projected TEVO-discovered frontier sibling improved upstream CUDA `autoresearch` from `val_bpb = 1.117953` to `1.113392` on the pinned upstream commit `c12eef778edafc89cd7ce036a7f500ddb5397a65`, while also reducing peak VRAM.
 
@@ -64,8 +64,8 @@ This repo is a sandbox for answering: under a fixed training recipe and constrai
 **Prerequisites:** Python 3.11+, a compatible accelerator (CUDA / MPS / CPU), and [`uv`](https://astral.sh/uv/).
 
 ```bash
-git clone https://github.com/strangeloopcanon/transformer-evolution-llm.git
-cd transformer-evolution-llm
+git clone https://github.com/strangeloopcanon/tevo.git
+cd tevo
 make setup
 source .venv/bin/activate
 ```
