@@ -1331,6 +1331,141 @@ def tune_attn_shape(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureS
     return child
 
 
+def tune_train_recipe_attn_shape(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Adjust attention geometry globally so a candidate stays recipe-renderable."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.attn is not None]
+    if len(blocks) != len(child.model.blocks):
+        return child
+    d_model = child.model.emb.dim
+    candidate_heads = [h for h in [2, 4, 6, 8, 12, 16, 24] if d_model % h == 0]
+    if not candidate_heads:
+        return child
+    heads = int(rng.choice(candidate_heads))
+    head_dim = d_model // heads
+    kv_head_choices = [
+        value for value in [1, 2, 4, 8, heads] if value <= heads and heads % value == 0
+    ]
+    n_kv_head = int(rng.choice(kv_head_choices or [heads]))
+    kv_groups = max(1, heads // n_kv_head)
+    attn_kind: Literal["MHA", "GQA", "MQA"]
+    if n_kv_head == heads:
+        attn_kind = "MHA"
+    elif n_kv_head == 1:
+        attn_kind = "MQA"
+    else:
+        attn_kind = "GQA"
+    for block in blocks:
+        if block.attn is None:
+            continue
+        block.attn.kind = attn_kind
+        block.attn.heads = heads
+        block.attn.head_dim = head_dim
+        block.attn.kv_groups = kv_groups
+    return child
+
+
+def tune_train_recipe_window_pattern(
+    spec: ArchitectureSpec, rng: random.Random
+) -> ArchitectureSpec:
+    """Rewrite the whole stack to a single shared S/L window pattern."""
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.attn is not None]
+    if len(blocks) != len(child.model.blocks) or not blocks:
+        return child
+    seq_len = max(1, int(child.data.seq_len))
+    half_window = max(1, seq_len // 2)
+    pattern_seed = str(rng.choice(["L", "SL", "SSLL", "SSSL", "SLSL"]))
+    pattern = list(
+        (pattern_seed * ((len(blocks) + len(pattern_seed) - 1) // len(pattern_seed)))[: len(blocks)]
+    )
+    pattern[-1] = "L"
+    for block, char in zip(blocks, pattern, strict=True):
+        if block.attn is None:
+            continue
+        if char == "S":
+            block.attn.sparsity = "sliding"
+            block.attn.sw = half_window
+        else:
+            block.attn.sparsity = "none"
+            block.attn.sw = None
+        block.attn.global_stride = None
+        block.attn.block_size = None
+        block.attn.block_stride = None
+        block.attn.dilation = None
+    return child
+
+
+def tune_train_recipe_ffn(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Adjust dense FFN hidden size and activation uniformly across the stack."""
+    child = clone_spec(spec)
+    blocks = child.model.blocks
+    if not blocks:
+        return child
+    if any(not isinstance(block.ffn, DenseFFNConfig) for block in blocks):
+        return child
+    d_model = int(child.model.emb.dim)
+    current_hidden = int(getattr(blocks[0].ffn, "hidden", 4 * d_model) or 4 * d_model)
+    hidden_choices = sorted(
+        {
+            max(256, 2 * d_model),
+            max(256, 3 * d_model),
+            max(256, 4 * d_model),
+            max(256, 5 * d_model),
+            max(256, current_hidden),
+        }
+    )
+    hidden_options = [value for value in hidden_choices if value != current_hidden]
+    hidden = int(rng.choice(hidden_options or [current_hidden]))
+    activation = cast(
+        Literal["silu", "gelu", "relu", "relu_squared", "swiglu"],
+        rng.choice(["gelu", "relu", "relu_squared", "silu", "swiglu"]),
+    )
+    for block in blocks:
+        if not isinstance(block.ffn, DenseFFNConfig):
+            continue
+        block.ffn.hidden = hidden
+        block.ffn.activation = activation
+    return child
+
+
+def toggle_train_recipe_qk_norm(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Toggle QK norm across every attention block in a recipe-safe way."""
+    del rng
+    child = clone_spec(spec)
+    blocks = [b for b in child.model.blocks if b.attn is not None]
+    if len(blocks) != len(child.model.blocks):
+        return child
+    enabled = any(
+        getattr(block.attn, "qk_norm_max", None) is not None for block in blocks if block.attn
+    )
+    for block in blocks:
+        if block.attn is None:
+            continue
+        block.attn.qk_norm_max = None if enabled else 1.0
+        if block.attn.softmax is not None:
+            block.attn.softmax.qk_norm = "none" if enabled else "rms"
+    return child
+
+
+def toggle_train_recipe_norm(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Flip the global residual norm kind between layernorm and rmsnorm."""
+    del rng
+    child = clone_spec(spec)
+    child.model.norm = "rmsnorm" if str(child.model.norm) == "layernorm" else "layernorm"
+    return child
+
+
+def tune_train_recipe_batch_size(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Adjust the per-device batch size used by the shared recipe bridge."""
+    child = clone_spec(spec)
+    choices = [1, 2, 4, 8, 16, 32]
+    current = int(getattr(child.data, "batch_size", 1) or 1)
+    options = [value for value in choices if value != current]
+    child.data.batch_size = int(rng.choice(options or [current]))
+    return child
+
+
 def tune_attn_sparsity(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     """Explore sparsity/window settings (local/global strides)."""
     child = clone_spec(spec)
@@ -1868,6 +2003,12 @@ BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "tune_hyper_connections": tune_hyper_connections,
     "toggle_selector": toggle_selector,
     "tune_rope": tune_rope,
+    "tune_train_recipe_attn_shape": tune_train_recipe_attn_shape,
+    "tune_train_recipe_window_pattern": tune_train_recipe_window_pattern,
+    "tune_train_recipe_ffn": tune_train_recipe_ffn,
+    "toggle_train_recipe_qk_norm": toggle_train_recipe_qk_norm,
+    "toggle_train_recipe_norm": toggle_train_recipe_norm,
+    "tune_train_recipe_batch_size": tune_train_recipe_batch_size,
     "tune_attn_shape": tune_attn_shape,
     "tune_attn_sparsity": tune_attn_sparsity,
     "tune_ffn_width_activation": tune_ffn_width_activation,

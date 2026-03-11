@@ -1,0 +1,87 @@
+model:
+  name: exp-train-recipe-bridge-owt-10m-v1
+  emb:
+    dim: 512
+    vocab: 50257
+    dropout: 0.0
+  blocks:
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0, sparsity: sliding, sliding_window: 512 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+    - attn: { kind: MHA, heads: 4, head_dim: 128, rope: standard, kv_groups: 1, dropout: 0.0 }
+      ffn: { type: dense, hidden: 2048, activation: relu_squared, dropout: 0.0 }
+  head:
+    tie_embeddings: true
+    vocab: 50257
+  norm: rmsnorm
+train:
+  lr: 6.0e-4
+  warmup: 20
+  clip: 1.0
+  bf16: false
+  grad_ckpt: true
+  max_tokens: 900000
+  weight_decay: 0.1
+  seed: 4242
+  passkey_eval_steps: 0
+  speedrun_eval_interval: 4
+  speedrun_eval_batches: 4
+  speedrun_target_ppl: 2500.0
+  ppl_stop_threshold: null
+  entropy_threshold: 0.5
+  entropy_patience: 3
+  instability_threshold: 500.0
+  no_improve_patience: 60
+  improvement_tolerance: 0.001
+data:
+  tokenizer: gpt2
+  hf_revision: main
+  streaming: false
+  packed: true
+  packed_train_path: runs/packed/openwebtext_10m/train.bin
+  packed_val_path: runs/packed/openwebtext_10m/val.bin
+  packed_dtype: uint16
+  seq_len: 1024
+  batch_size: 2
+  workers: 0
+  shards: []
+  eval_tokens: 65536
+  healing_shards: []
+  healing_tokens: null
+evolution:
+  rung0_thresholds:
+    max_params: 90000000
+    max_kv_bytes_per_token: 45000
+    min_throughput_proxy: 1.0
+    min_layers: 6
+  rung1_tokens: 300000
+  rung2_tokens: 900000
+  population: 16
+  topk_keep: 0.5
+  crossover_prob: 0.0
+  parent_selection: map_elites
+  archive_max_elites: 48
+  structural_elite_k: 2
+  weight_inheritance: scratch
+  mutation_allowlist:
+    - duplicate_block_span
+    - remove_block_span
+    - tune_train_recipe_attn_shape
+    - tune_train_recipe_window_pattern
+    - tune_train_recipe_ffn
+    - toggle_train_recipe_qk_norm
+    - toggle_train_recipe_norm
+  objectives:
+    speedrun_flops_to_target: min
+    ppl_code: min

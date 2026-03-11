@@ -161,3 +161,9 @@ Switch to `AGENT_MODE=production` when any apply: PII/reg data handled; >50 exte
 
 ## Work plan / issues
 All new work must be tracked in bd (not Markdown). Run `bd quickstart` / `bd init`; bd is the source of truth for steps.
+
+## Context
+- Past session transcripts are in `.context/sessions/` (one file per session).
+- Read recent sessions or grep for keywords when you need context about previous work.
+- Append decisions, pitfalls, and patterns to `.context/LEARNINGS.md`.
+- Run `memex sync` if sessions look stale.

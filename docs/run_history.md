@@ -1,6 +1,6 @@
 # Run History & Evolution Log
 
-A record of completed evolution runs, their configs, frontier sizes, and notable findings.
+So what: this page is a historical log of earlier TEVO sweeps and benchmark runs. The current shareable proof for the repo is the motif-transfer result in [motif_transfer_demo.md](motif_transfer_demo.md), not one of the older frontiers summarized here.
 
 ## Local Artifacts
 
@@ -23,15 +23,15 @@ A record of completed evolution runs, their configs, frontier sizes, and notable
 | `modal_speedrun_owt10m_v3_full1` | `exp_nanogpt_speedrun_owt_10m_v3.yaml` (96 gens, 360 steps) | 3 | V3 compute-to-target (`speedrun_flops_to_target`): frontier stayed mostly dense MHA; `memory_tokens` shows up as a recurring "speed" assist. |
 | `modal_selector_owt10m_v3_full1` | `exp_selector_style_owt_10m_v3.yaml` (96 gens, 360 steps) | 17 | V3 selector-style pressure: larger frontier with MLA + KV-policy quant points (e.g., `kv_policy.quant=nf4` + 1x GQA) plus some memory modules. |
 
-## Architecture Highlights (Current Modal Frontier)
+## Historical Selector-Style v3 Frontier Snapshot
 
-Current best-quality point from the selector-style v3 run (`modal_selector_owt10m_v3_full1`):
+Best-quality point from the selector-style v3 run (`modal_selector_owt10m_v3_full1`):
 
 - **Seed config:** `configs/frontiers/exp_selector_style_owt10m_v3_20260124/toggle_alibi-14-c5d6.yaml`
 - **Shape:** 12 blocks @ d_model=768. Features: Selector Attention (block 0), ALiBi (blocks 1, 8), MLA (block 8, `kv_latent_dim=192`).
 - **Metrics (A10G):** `ppl_code≈1277`, `throughput≈16.5k tok/s`, `kv_bytes/tok≈34.5k`, `speedrun_flops≈8.66e12`, `tokens_to_target≈47k`.
 
-KV-efficient point from the same frontier (`kv_policy` is inference-side):
+KV-efficient point from the same historical frontier (`kv_policy` is inference-side):
 
 - **Seed config:** `configs/frontiers/exp_selector_style_owt10m_v3_20260124/toggle_kv_policy-92-99c7.yaml`
 - **Shape:** 12 blocks. Features: 1x GQA (`kv_groups=3`), plus Retro, Memory Tokens, Layer Scale, and Gated Attention; `kv_policy.quant=nf4`.

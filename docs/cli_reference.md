@@ -1,71 +1,123 @@
 # CLI Reference
 
-Command-line tools for running evolution, inspecting results, and managing artifacts.
+So what: the repo now has a real CLI surface for core TEVO runs, `TrainRecipe` export/render, and `autoresearch` transfer workflows. This page is the fast map of the commands you are most likely to need.
 
 ## `evo-loop` CLI
 
-The package installs an `evo-loop` CLI tool with several subcommands:
+The package installs an `evo-loop` CLI with these top-level command families:
 
 ```bash
-evo-loop convert-checkpoints runs/<run>/checkpoints --dtype fp16 --apply
-
 evo-loop --help
 ```
 
-## Main Script: `scripts/run_live.py`
+- Core search:
+  - `run`
+  - `resume-state`
+  - `frontier`
+  - `export-seed`
+- `TrainRecipe` bridge:
+  - `train-recipe-export`
+  - `train-recipe-render`
+- Transfer workflows:
+  - `cuda-transfer-prepare`
+  - `cuda-transfer-benchmark`
+  - `cuda-transfer-report`
+  - `mlx-transfer-prepare`
+  - `mlx-transfer-benchmark`
+  - `mlx-transfer-audit`
+  - `mlx-transfer-continuation-summary`
+  - `mlx-transfer-report`
+- Maintenance:
+  - `prune-checkpoints`
+  - `cleanup-run`
+  - `convert-checkpoints`
+  - `cache`
+  - `version`
 
-Key arguments:
+## Core TEVO Run
 
-```
---device          Device to use (cpu, cuda, mps)
---generations     Number of evolution generations
---steps           Training steps per candidate
---eval-batches    Number of batches for evaluation
---seed            Random seed
---out             Output frontier JSON path
---lineage-out     Output lineage JSON path
---checkpoint-dir  Directory for model checkpoints
---prune-checkpoints-to-frontier  Delete non-frontier checkpoints after run
---mutation-steps  Number of mutations to chain per child
---parent-selection  Selection strategy (weighted, pareto_uniform, lexicase, map_elites)
+Run an evolutionary search directly:
+
+```bash
+evo-loop run configs/live_smoke.yaml \
+  --device cpu \
+  --generations 3 \
+  --steps 40 \
+  --eval-batches 2 \
+  --seed 0
 ```
 
 ## Inspecting Results
 
-The output JSON files contain the full frontier. You can inspect the lineage or export specific candidates.
-
 ```bash
-python scripts/export_seed.py runs/<run>/frontier.json \
-  --id <candidate_id> \
-  --out-config configs/seed_winner.yaml
+evo-loop frontier runs/<run>/frontier.json
+
+evo-loop export-seed runs/<run>/frontier.json \
+  <candidate_id> \
+  configs/seed_winner.yaml
 ```
 
-## Reproducing a Run
-
-To reproduce a specific architecture, export its spec (and optionally its checkpoint) and rerun a short sweep from that seed. The runner always evaluates the seed first before spawning children.
+Use the reporting scripts when you want more context than the CLI summary:
 
 ```bash
-RUN="runs/replay_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$RUN"
-python scripts/run_live.py configs/seed_winner.yaml \
-  --device mps --generations 1 --steps 240 --eval-batches 4 \
-  --out "$RUN/frontier.json" --checkpoint-dir "$RUN/checkpoints" \
-  2>&1 | tee "$RUN/live.log"
+python scripts/report_motifs.py runs/<run>/frontier.json \
+  --lineage runs/<run>/frontier_lineage.json --top 15
 ```
 
-## Motif Reports
+## TrainRecipe Bridge
 
 ```bash
-python scripts/report_motifs.py runs/<RUN>/frontier.json \
-  --lineage runs/<RUN>/frontier_lineage.json --top 15
+evo-loop train-recipe-export runs/<run>/frontier.json \
+  --candidate-id <candidate_id> \
+  --out artifacts/train_recipes/<candidate_id>.yaml
+
+evo-loop train-recipe-render artifacts/train_recipes/<candidate_id>.yaml \
+  --backend autoresearch_cuda \
+  --train-py /path/to/autoresearch/train.py
 ```
+
+See [train_recipe_bridge.md](train_recipe_bridge.md) for the compatibility rules and projection behavior.
+
+## CUDA Transfer Workflow
+
+```bash
+evo-loop cuda-transfer-prepare \
+  --run-root runs/cuda_transfer_demo \
+  --config configs/exp_train_recipe_bridge_owt_10m_v1.yaml \
+  --modal-gpu A10G
+
+evo-loop cuda-transfer-benchmark runs/cuda_transfer_demo \
+  --repeat 3 \
+  --timeout-minutes 10
+
+evo-loop cuda-transfer-report runs/cuda_transfer_demo
+```
+
+See [cuda_transfer_demo.md](cuda_transfer_demo.md) and [motif_transfer_demo.md](motif_transfer_demo.md) for the recommended public-facing CUDA path.
+
+## MLX Transfer Workflow
+
+```bash
+evo-loop mlx-transfer-prepare /path/to/autoresearch-mlx \
+  --run-root runs/mlx_transfer_demo \
+  --config configs/exp_train_recipe_bridge_owt_10m_v1.yaml
+
+evo-loop mlx-transfer-benchmark runs/mlx_transfer_demo
+
+evo-loop mlx-transfer-report runs/mlx_transfer_demo
+```
+
+See [mlx_transfer_demo.md](mlx_transfer_demo.md) for the full flow.
 
 ## Disk Hygiene
 
 Runs can accumulate checkpoints quickly. Useful cleanup tools:
 
 ```bash
-python scripts/archive_run.py runs/<run_dir> --delete-checkpoints
+evo-loop cleanup-run runs/<run_dir>/frontier.manifest.json --apply
+
+evo-loop prune-checkpoints runs/<run_dir>/checkpoints \
+  --state-path runs/<run_dir>/frontier.state.json
 
 evo-loop convert-checkpoints runs/<run_dir>/checkpoints --dtype fp16 --apply
 ```

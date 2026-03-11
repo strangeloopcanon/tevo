@@ -1,12 +1,12 @@
 # Architecture Comparison
 
-How the TEVO seed relates to Legacy GPT-2 and the nanochat speedrun recipe, and a detailed inventory of features available in the DSL.
+So what: this page is a historical architecture comparison snapshot for one nanochat-aligned TEVO run, plus a feature inventory of the DSL. It is useful background, but it is not the canonical statement of the repo's latest evidence.
 
 ## Legacy vs Speedrun vs TEVO Seed
 
 These are three different model families. Comparing them directly is useful, but they are not interchangeable baselines.
 
-| Axis | Legacy GPT-2 (2019) | nanochat speedrun recipe (current) | TEVO starting seed (this repo run) | Latest evolved frontier point (`xover-3-56da`) |
+| Axis | Legacy GPT-2 (2019) | nanochat speedrun recipe (current family) | TEVO starting seed (historical repo run) | Historical evolved frontier point (`xover-3-56da`) |
 |---|---|---|---|---|
 | Family | Original GPT-2 | nanochat GPT variant | TEVO DSL seed inspired by speedrun constraints | TEVO child from crossover lineage |
 | Core stack | Dense causal attention + LayerNorm + GELU | RoPE + RMSNorm + QK norm + ReLU^2 + sliding/full pattern | RoPE + RMSNorm + ReLU + mostly sliding-window MHA | Same family as seed; no new primitive class added |
@@ -33,10 +33,10 @@ flowchart LR
     C --> D["Evolved frontier point\nxover-3-56da\n18 layers\n+8.9% throughput vs seed\nSlightly worse speedrun loss"]
 ```
 
-Exact seed used for the latest Modal evolution run:
+Exact seed used for the historical Modal evolution run discussed on this page:
 
 - Seed architecture file: `configs/exp_nanochat_gpt2grade_d20_modal_evolve_fineweb_staggered_gpt2vocab_aeff095e.yaml`
-- Output frontier: `runs/modal/modal_nanochat_fineweb_d20_staggered_a10g_g8_s140_seed0_20260206_160807/frontier.json`
+- Original frontier path during that run: `runs/modal/modal_nanochat_fineweb_d20_staggered_a10g_g8_s140_seed0_20260206_160807/frontier.json` (historical local artifact, not part of the curated proof bundle)
 
 ## Feature Inventory
 
