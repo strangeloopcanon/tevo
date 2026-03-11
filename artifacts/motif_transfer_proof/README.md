@@ -2,6 +2,8 @@
 
 So what: this directory contains the small, stable artifact bundle behind the current TEVO -> projected CUDA `autoresearch` proof-of-concept.
 
+The tracked JSON summaries use a display-oriented upstream commit field (`repo_ref_display`) so repo secret scanning does not mistake the pinned git SHA for a leaked credential. The full commit is documented in the top-level docs.
+
 ## Contents
 
 - `baseline_summary.json`
