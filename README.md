@@ -46,6 +46,7 @@ The small proof bundle behind that claim lives in [artifacts/motif_transfer_proo
 
 - [docs/motif_transfer_demo.md](docs/motif_transfer_demo.md) for the clearest explanation of the current TEVO -> `autoresearch` result
 - [artifacts/motif_transfer_proof](artifacts/motif_transfer_proof/README.md) for the compact artifact bundle behind the current proof
+- [campaigns/campaign-001-d20-nanochat](campaigns/campaign-001-d20-nanochat/README.md) for the first optional collaborative pilot
 - [docs/train_recipe_bridge.md](docs/train_recipe_bridge.md) for the bridge design and compatibility rules
 - [docs/cuda_transfer_demo.md](docs/cuda_transfer_demo.md) for the CUDA workflow on Modal
 - [docs/configuration_guide.md](docs/configuration_guide.md) for search configs, objectives, and selection policies
@@ -106,6 +107,16 @@ python scripts/run_live.py configs/seed_winner.yaml \
 ```
 
 See [docs/configuration_guide.md](docs/configuration_guide.md) for longer sweep commands (MPS, CUDA, Modal).
+
+## Optional Campaign Layer
+
+So what: TEVO can now support a small GitHub-native collaboration loop without changing the normal solo workflow. In v1, collaboration is artifact-based, not distributed training: contributors run normal TEVO sweeps, then submit small bundles derived from the run artifacts the repo already emits.
+
+- `campaigns/.../manifest.yaml` fixes the comparison context: base config fingerprint, metric, budget, and lane list.
+- `python scripts/campaign_submit.py ...` packages an existing run into a tracked bundle under `artifacts/campaigns/...`.
+- If you are packaging an older run without `frontier.manifest.json`, pass `--config` explicitly instead of guessing provenance.
+- `python scripts/campaign_aggregate.py ...` merges comparable bundles, and `python scripts/campaign_shortlist.py ...` picks the next bridgeable candidates for downstream validation.
+- If you ignore campaigns, nothing about the existing `evo-loop` or `scripts/run_live.py` flow changes.
 
 ## What You Get From A Run
 

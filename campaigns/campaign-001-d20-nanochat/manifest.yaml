@@ -1,0 +1,54 @@
+schema_version: 1
+campaign_id: campaign-001-d20-nanochat
+title: D20 Nanochat Collaborative Pilot
+summary: >-
+  GitHub-native pilot for comparing distributed d20 nanochat TEVO searches
+  without changing the core runner. Every lane shares one base config and only
+  differs by assigned seed, with optional focus prompts for contributors.
+base_config: configs/exp_nanochat_gpt2grade_d20_modal_evolve_fineweb_staggered_gpt2vocab_aeff095e.yaml
+config_fingerprint: 25c939c3778f6df95ce8d138472cb2f5cf3bc87cc929e38045924269d9da7aa8
+primary_metric: speedrun_end_eval_loss
+objectives:
+  speedrun_loss_auc: min
+  speedrun_end_eval_loss: min
+  efficiency_score_scaled: min
+budget:
+  generations: 12
+  steps: 160
+  eval_batches: 8
+dataset: fineweb_edu_10m packed
+tokenizer: gpt2
+seq_len: 2048
+lanes:
+  - lane_id: lane-01
+    title: Seed 11
+    focus: Start from the shared base config and treat this lane as the plain baseline basin.
+    seed: 11
+  - lane_id: lane-02
+    title: Seed 17
+    focus: Pay extra attention to any sparsity or window-pattern variants that improve end loss.
+    seed: 17
+  - lane_id: lane-03
+    title: Seed 23
+    focus: Pay extra attention to optimizer or schedule mutations that help without large architecture drift.
+    seed: 23
+  - lane_id: lane-04
+    title: Seed 29
+    focus: Pay extra attention to efficient KV-layout or attention-geometry changes if they appear.
+    seed: 29
+  - lane_id: lane-05
+    title: Seed 31
+    focus: Pay extra attention to dense-block depth or FFN-shape trade-offs that remain bridge-friendly.
+    seed: 31
+  - lane_id: lane-06
+    title: Seed 37
+    focus: Pay extra attention to surprising motifs worth immediate replication even if they are not bridgeable.
+    seed: 37
+notes:
+  - >-
+    This v1 pilot keeps every lane on the same base config fingerprint on
+    purpose. That preserves comparability and keeps the collaboration layer
+    outside the core TEVO schema.
+  - >-
+    Lane focus text is advisory. The tracked comparison variable is the run
+    seed plus the artifacts produced by the existing TEVO workflow.
