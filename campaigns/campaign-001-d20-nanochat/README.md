@@ -2,6 +2,8 @@
 
 So what: this is the smallest collaborative TEVO pilot that still produces a meaningful result. Contributors run the same d20 nanochat base config under different assigned seeds, submit compact artifact bundles, and aggregate only comparable evidence. In v1, collaboration is artifact-based, not distributed training.
 
+If you want the sendable version for another person, start with [COLLABORATOR_BRIEF.md](COLLABORATOR_BRIEF.md).
+
 ## Why This Shape
 
 - The campaign is intentionally additive.
@@ -11,13 +13,22 @@ So what: this is the smallest collaborative TEVO pilot that still produces a mea
 
 ## How To Contribute
 
-1. Claim one lane in the campaign issue.
+1. Claim one lane in the campaign issue. The issue is the source of truth for lane ownership.
 2. Run the shared config with that lane's assigned seed and budget.
 3. Package the result into a compact bundle.
 4. Open a PR with only the tracked bundle under `artifacts/campaigns/campaign-001-d20-nanochat/<lane-id>/`.
 
 If you are packaging an older run that does not include `frontier.manifest.json`, pass
 `--config <path-to-the-original-config>` to `campaign_submit.py`.
+
+The default GitHub submission path is:
+
+- run locally or on Modal
+- package with `campaign_submit.py`
+- commit only the compact bundle on a branch or fork
+- open a PR back to `main`
+
+If GitHub Discussions are enabled, use them for general questions or recruiting. Use the campaign issue for claims and releases, and use PRs for actual submissions.
 
 Example:
 
@@ -51,6 +62,8 @@ python scripts/campaign_submit.py \
 - `lineage_summary.json`: mutation and status counts
 - `champion_spec.yaml`: the lane champion's TEVO spec
 - `champion.train_recipe.yaml`: only when the champion is bridge-compatible
+
+Raw `runs/`, checkpoints, and large logs stay local.
 
 ## Aggregation
 

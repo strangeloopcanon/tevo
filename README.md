@@ -112,6 +112,9 @@ See [docs/configuration_guide.md](docs/configuration_guide.md) for longer sweep 
 
 So what: TEVO can now support a small GitHub-native collaboration loop without changing the normal solo workflow. In v1, collaboration is artifact-based, not distributed training: contributors run normal TEVO sweeps, then submit small bundles derived from the run artifacts the repo already emits.
 
+- The first sendable collaborator packet lives at [campaigns/campaign-001-d20-nanochat/COLLABORATOR_BRIEF.md](campaigns/campaign-001-d20-nanochat/COLLABORATOR_BRIEF.md).
+- Runs happen locally or on Modal, not in Git branches. GitHub is for claiming lanes and submitting compact bundles by PR.
+- Use the campaign issue as the source of truth for lane ownership. If Discussions are enabled, use them for questions or recruiting, not for claims.
 - `campaigns/.../manifest.yaml` fixes the comparison context: base config fingerprint, metric, budget, and lane list.
 - `python scripts/campaign_submit.py ...` packages an existing run into a tracked bundle under `artifacts/campaigns/...`.
 - If you are packaging an older run without `frontier.manifest.json`, pass `--config` explicitly instead of guessing provenance.
