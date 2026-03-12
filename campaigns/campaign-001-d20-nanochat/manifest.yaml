@@ -6,7 +6,7 @@ summary: >-
   without changing the core runner. Every lane shares one base config and only
   differs by assigned seed, with optional focus prompts for contributors.
 base_config: configs/exp_nanochat_gpt2grade_d20_modal_evolve_fineweb_staggered_gpt2vocab_aeff095e.yaml
-config_fingerprint: 25c939c3778f6df95ce8d138472cb2f5cf3bc87cc929e38045924269d9da7aa8
+config_fingerprint: 25c939c3778f6df95ce8d138472cb2f5cf3bc87cc929e38045924269d9da7aa8  # pragma: allowlist secret
 primary_metric: speedrun_end_eval_loss
 objectives:
   speedrun_loss_auc: min
