@@ -49,6 +49,7 @@ evo-loop cuda-transfer-prepare \
   --run-root runs/cuda_transfer_demo \
   --config configs/exp_train_recipe_bridge_owt_10m_v1.yaml \
   --modal-gpu A10G \
+  --autoresearch-flavor upstream \
   --generations 8 \
   --steps 120 \
   --eval-batches 4 \
@@ -59,6 +60,7 @@ Notes:
 
 - the first TEVO discovery pass is capped to `generations <= 4`, `steps <= 120`, and `eval_batches <= 4`
 - upstream `autoresearch` is cloned from `https://github.com/karpathy/autoresearch.git` by default
+- `--autoresearch-flavor upstream` is the canonical benchmark lane; use the separate `autoresearch-at-home-handoff` flow when you want to contribute one chosen candidate into `autoresearch@home`
 - if you already have a local CUDA `autoresearch` checkout, pass `--autoresearch-repo /path/to/autoresearch`
 - oversized CUDA recipes are projected automatically before `train.py` is patched, so the transfer stays baseline-adjacent instead of silently inflating the model scale
 

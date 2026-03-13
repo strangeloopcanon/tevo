@@ -46,10 +46,36 @@ The small proof bundle behind that claim lives in [artifacts/motif_transfer_proo
 
 - [docs/motif_transfer_demo.md](docs/motif_transfer_demo.md) for the clearest explanation of the current TEVO -> `autoresearch` result
 - [artifacts/motif_transfer_proof](artifacts/motif_transfer_proof/README.md) for the compact artifact bundle behind the current proof
+- [docs/autoresearch_at_home_handoff.md](docs/autoresearch_at_home_handoff.md) for the one-candidate contribution lane into `autoresearch@home`
 - [campaigns/campaign-001-d20-nanochat](campaigns/campaign-001-d20-nanochat/README.md) for the first optional collaborative pilot
 - [docs/train_recipe_bridge.md](docs/train_recipe_bridge.md) for the bridge design and compatibility rules
 - [docs/cuda_transfer_demo.md](docs/cuda_transfer_demo.md) for the CUDA workflow on Modal
 - [docs/configuration_guide.md](docs/configuration_guide.md) for search configs, objectives, and selection policies
+
+## `autoresearch@home` Contribution Lane
+
+So what: TEVO now has a clean way to contribute one chosen candidate into `autoresearch@home` without turning TEVO itself into a swarm runner.
+
+- TEVO stays the search engine.
+- `TrainRecipe` stays the shared bridge artifact.
+- `autoresearch@home` becomes the collaborative `train.py` experiment lane.
+
+The practical workflow is:
+
+1. run TEVO locally
+2. choose one bridge-compatible candidate
+3. export an `autoresearch@home` handoff workspace
+4. run that candidate in an `autoresearch@home` fork or branch
+5. publish the result, insight, and next hypothesis through their coordinator
+
+```bash
+evo-loop autoresearch-at-home-handoff \
+  --frontier runs/<run>/frontier.json \
+  --candidate-id <candidate_id> \
+  --run-root runs/at_home_handoff
+```
+
+That command writes a staged `repo/` workspace with the TEVO-rendered `train.py` already installed. See [docs/autoresearch_at_home_handoff.md](docs/autoresearch_at_home_handoff.md) for the full flow.
 
 ## Why This Exists
 

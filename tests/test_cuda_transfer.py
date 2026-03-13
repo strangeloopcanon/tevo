@@ -7,12 +7,16 @@ from typer.testing import CliRunner
 
 from transformer_evolution_llm.cli import app
 from transformer_evolution_llm.cuda_transfer import (
+    AutoresearchFlavor,
+    CudaTransferError,
     build_public_cuda_transfer_report,
+    prepare_autoresearch_at_home_handoff,
     render_public_cuda_variants,
+    resolve_autoresearch_repo_url,
     resolve_autoresearch_source_repo,
     run_public_cuda_transfer_modal_benchmarks,
 )
-from transformer_evolution_llm.dsl import ArchitectureSpec
+from transformer_evolution_llm.dsl import ArchitectureSpec, LayerScaleConfig
 from transformer_evolution_llm.mlx_transfer import (
     export_public_transfer_recipes,
     stage_public_transfer_workspaces,
@@ -185,6 +189,24 @@ def _write_frontier(tmp_path: Path) -> Path:
     return frontier
 
 
+def _write_incompatible_frontier(tmp_path: Path) -> Path:
+    spec = _make_spec(name="not-bridge-safe", hidden=1536, kv_groups=2)
+    spec.model.blocks[0].extras = [LayerScaleConfig(init=1e-5, learnable=True)]
+    frontier = tmp_path / "frontier_bad.json"
+    frontier.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "bad-candidate",
+                    "metrics": {"ppl_code": 1.0},
+                    "spec": spec.model_dump(mode="python"),
+                }
+            ]
+        )
+    )
+    return frontier
+
+
 def _write_fake_autoresearch_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "autoresearch"
     repo.mkdir()
@@ -214,11 +236,73 @@ def test_resolve_autoresearch_source_repo_uses_git_metadata(tmp_path: Path) -> N
     _run_git([git, "add", "train.py", "prepare.py"], cwd=repo)
     _run_git([git, "commit", "-m", "seed"], cwd=repo)
 
-    resolved, metadata = resolve_autoresearch_source_repo(out_dir=tmp_path / "out", local_repo=repo)
+    resolved, metadata = resolve_autoresearch_source_repo(
+        out_dir=tmp_path / "out",
+        flavor=AutoresearchFlavor.UPSTREAM,
+        local_repo=repo,
+    )
     assert resolved == repo.resolve()
     assert metadata["source_kind"] == "local"
+    assert metadata["autoresearch_flavor"] == "upstream"
     assert metadata["repo_url"] == "https://github.com/karpathy/autoresearch.git"
     assert metadata["repo_ref"] is not None
+
+
+def test_resolve_autoresearch_source_repo_requires_prepare_py(tmp_path: Path) -> None:
+    repo = tmp_path / "broken_autoresearch"
+    repo.mkdir()
+    (repo / "train.py").write_text(CUDA_SAMPLE)
+
+    try:
+        resolve_autoresearch_source_repo(
+            out_dir=tmp_path / "out",
+            flavor=AutoresearchFlavor.UPSTREAM,
+            local_repo=repo,
+        )
+    except CudaTransferError as exc:
+        assert "prepare.py" in str(exc)
+    else:
+        raise AssertionError("expected CudaTransferError")
+
+
+def test_resolve_autoresearch_source_repo_uses_at_home_flavor_preset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    clone_calls: list[tuple[str, str, Path]] = []
+
+    def fake_clone(*, repo_url: str, repo_ref: str, out_dir: Path) -> None:
+        clone_calls.append((repo_url, repo_ref, out_dir))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "train.py").write_text(CUDA_SAMPLE)
+        (out_dir / "prepare.py").write_text("MAX_SEQ_LEN = 2048\n")
+
+    def fake_git_stdout(command: list[str]) -> str | None:
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            return "deadbeef"
+        return None
+
+    monkeypatch.setattr("transformer_evolution_llm.cuda_transfer._clone_repo_ref", fake_clone)
+    monkeypatch.setattr("transformer_evolution_llm.cuda_transfer._git_stdout", fake_git_stdout)
+
+    resolved, metadata = resolve_autoresearch_source_repo(
+        out_dir=tmp_path / "out",
+        flavor=AutoresearchFlavor.AT_HOME,
+    )
+    assert resolved == (tmp_path / "out" / "autoresearch_source")
+    assert clone_calls == [
+        (
+            "https://github.com/mutable-state-inc/autoresearch-at-home.git",
+            "master",
+            tmp_path / "out" / "autoresearch_source",
+        )
+    ]
+    assert resolve_autoresearch_repo_url(flavor=AutoresearchFlavor.AT_HOME) == (
+        "https://github.com/mutable-state-inc/autoresearch-at-home.git"
+    )
+    assert metadata["autoresearch_flavor"] == "at_home"
+    assert metadata["repo_url"] == "https://github.com/mutable-state-inc/autoresearch-at-home.git"
+    assert metadata["repo_ref"] == "deadbeef"
 
 
 def test_render_and_stage_public_cuda_transfer_run(tmp_path: Path) -> None:
@@ -307,6 +391,79 @@ def test_run_public_cuda_transfer_modal_benchmarks_with_fake_modal(
     assert "TEVO TRAIN RECIPE" in diff_path.read_text()
 
 
+def test_prepare_autoresearch_at_home_handoff_stages_repo_workspace(tmp_path: Path) -> None:
+    frontier = _write_frontier(tmp_path)
+    repo = _write_fake_autoresearch_repo(tmp_path)
+
+    manifest, manifest_path, summary_path = prepare_autoresearch_at_home_handoff(
+        frontier_path=frontier,
+        candidate_id="quality-a",
+        out_dir=tmp_path / "handoff",
+        local_repo=repo,
+        flavor=AutoresearchFlavor.AT_HOME,
+    )
+
+    handoff_dir = tmp_path / "handoff"
+    assert manifest_path == handoff_dir / "handoff_manifest.json"
+    assert summary_path == handoff_dir / "handoff_summary.md"
+    assert (handoff_dir / "candidate.train_recipe.yaml").exists()
+    assert (handoff_dir / "baseline.train.py").exists()
+    assert (handoff_dir / "candidate.train.py").exists()
+    assert (handoff_dir / "candidate.diff").exists()
+    staged_repo = handoff_dir / "repo"
+    assert staged_repo.exists()
+    staged_train = (staged_repo / "train.py").read_text()
+    assert "TEVO TRAIN RECIPE: CONSTANTS START" in staged_train
+    assert manifest["candidate_id"] == "quality-a"
+    assert manifest["autoresearch_flavor"] == "at_home"
+    assert manifest["projection_applied"] is False
+    assert manifest["staged_repo"] == str(staged_repo.resolve())
+    assert "claim this experiment through the coordinator first" in summary_path.read_text()
+
+
+def test_prepare_autoresearch_at_home_handoff_rejects_incompatible_candidate(
+    tmp_path: Path,
+) -> None:
+    frontier = _write_incompatible_frontier(tmp_path)
+    repo = _write_fake_autoresearch_repo(tmp_path)
+
+    try:
+        prepare_autoresearch_at_home_handoff(
+            frontier_path=frontier,
+            candidate_id="bad-candidate",
+            out_dir=tmp_path / "handoff",
+            local_repo=repo,
+        )
+    except CudaTransferError as exc:
+        assert "not bridge-compatible" in str(exc)
+    else:
+        raise AssertionError("expected CudaTransferError")
+
+
+def test_cli_autoresearch_at_home_handoff(tmp_path: Path) -> None:
+    frontier = _write_frontier(tmp_path)
+    repo = _write_fake_autoresearch_repo(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "autoresearch-at-home-handoff",
+            "--frontier",
+            str(frontier),
+            "--candidate-id",
+            "quality-a",
+            "--run-root",
+            str(tmp_path / "handoff"),
+            "--autoresearch-repo",
+            str(repo),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "handoff" / "repo" / "train.py").exists()
+    assert "Prepared autoresearch@home handoff" in result.output
+
+
 def test_build_public_cuda_transfer_report_and_cli(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     run_root.mkdir()
@@ -315,6 +472,7 @@ def test_build_public_cuda_transfer_report_and_cli(tmp_path: Path) -> None:
             {
                 "tevo_mode": "modal",
                 "modal_gpu": "A10G",
+                "autoresearch_flavor": "at_home",
                 "autoresearch_repo_url": "https://github.com/karpathy/autoresearch.git",
                 "autoresearch_repo_ref": "deadbeef",
             }
@@ -356,6 +514,7 @@ def test_build_public_cuda_transfer_report_and_cli(tmp_path: Path) -> None:
     payload, markdown = build_public_cuda_transfer_report(run_root)
     assert payload["tevo_seed_summary"] is not None
     assert "CUDA autoresearch benchmark" in markdown
+    assert "CUDA autoresearch flavor" in markdown
     assert "https://github.com/karpathy/autoresearch.git" in markdown
 
     runner = CliRunner()

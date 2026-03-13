@@ -30,6 +30,7 @@ class TrainRecipeTarget(StrEnum):
     """Supported downstream train.py targets."""
 
     AUTORESEARCH_CUDA = "autoresearch_cuda"
+    AUTORESEARCH_AT_HOME_CUDA = "autoresearch_at_home_cuda"
     AUTORESEARCH_MLX = "autoresearch_mlx"
 
 
@@ -139,6 +140,19 @@ _BACKEND_DEFAULTS: dict[TrainRecipeTarget, dict[str, Any]] = {
         "warmdown_ratio": 0.5,
         "final_lr_frac": 0.0,
     },
+    TrainRecipeTarget.AUTORESEARCH_AT_HOME_CUDA: {
+        "total_batch_size": 2**19,
+        "device_batch_size": 128,
+        "embedding_lr": 0.6,
+        "unembedding_lr": 0.004,
+        "matrix_lr": 0.04,
+        "scalar_lr": 0.5,
+        "weight_decay": 0.2,
+        "adam_betas": (0.8, 0.95),
+        "warmup_ratio": 0.0,
+        "warmdown_ratio": 0.5,
+        "final_lr_frac": 0.0,
+    },
     TrainRecipeTarget.AUTORESEARCH_MLX: {
         "total_batch_size": 2**16,
         "device_batch_size": 16,
@@ -166,6 +180,23 @@ _MARKER_FMT = "# === TEVO TRAIN RECIPE: {name} {edge} ==="
 
 _FALLBACK_PATTERNS: dict[TrainRecipeTarget, dict[str, re.Pattern[str]]] = {
     TrainRecipeTarget.AUTORESEARCH_CUDA: {
+        "CONSTANTS": re.compile(r"(?ms)^# Model architecture\n.*?^DEVICE_BATCH_SIZE = [^\n]*\n"),
+        "NORM": re.compile(r"(?ms)^def norm\(x\):\n.*?(?=^def has_ve\()"),
+        "VALUE_EMBED": re.compile(
+            r"(?ms)^def has_ve\(layer_idx, n_layer\):\n.*?(?=^def apply_rotary_emb\()"
+        ),
+        "MLP": re.compile(r"(?ms)^class MLP\(nn\.Module\):\n.*?(?=^class Block\(nn\.Module\):)"),
+        "QK_NORM": re.compile(
+            r"(?ms)^        q, k = apply_rotary_emb\(q, cos, sin\), "
+            r"apply_rotary_emb\(k, cos, sin\)\n"
+            r"        q, k = norm\(q\), norm\(k\)\n"
+        ),
+        "MODEL_CONFIG": re.compile(
+            r"(?ms)^def build_model_config\(depth\):\n.*?"
+            r"(?=^config = build_model_config\(DEPTH\)\n)"
+        ),
+    },
+    TrainRecipeTarget.AUTORESEARCH_AT_HOME_CUDA: {
         "CONSTANTS": re.compile(r"(?ms)^# Model architecture\n.*?^DEVICE_BATCH_SIZE = [^\n]*\n"),
         "NORM": re.compile(r"(?ms)^def norm\(x\):\n.*?(?=^def has_ve\()"),
         "VALUE_EMBED": re.compile(
@@ -376,12 +407,26 @@ def render_train_recipe_to_path(
     return output_path
 
 
+def train_recipe_projection_applied(recipe: TrainRecipe, target: TrainRecipeTarget) -> bool:
+    """Return whether a target-specific projection will modify the recipe model."""
+    return _is_cuda_train_recipe_target(target) and _needs_autoresearch_cuda_projection(
+        recipe.model
+    )
+
+
 def _prepare_train_recipe_for_target(recipe: TrainRecipe, target: TrainRecipeTarget) -> TrainRecipe:
-    if target != TrainRecipeTarget.AUTORESEARCH_CUDA:
+    if not _is_cuda_train_recipe_target(target):
         return recipe
     if not _needs_autoresearch_cuda_projection(recipe.model):
         return recipe
     return _project_recipe_for_autoresearch_cuda(recipe)
+
+
+def _is_cuda_train_recipe_target(target: TrainRecipeTarget) -> bool:
+    return target in {
+        TrainRecipeTarget.AUTORESEARCH_CUDA,
+        TrainRecipeTarget.AUTORESEARCH_AT_HOME_CUDA,
+    }
 
 
 def _looks_like_frontier(path: Path) -> bool:
@@ -736,7 +781,7 @@ def _render_constants(
 
 
 def _render_norm(target: TrainRecipeTarget) -> str:
-    if target == TrainRecipeTarget.AUTORESEARCH_CUDA:
+    if _is_cuda_train_recipe_target(target):
         return """def norm(x):
     if NORM_KIND == "layernorm":
         return F.layer_norm(x, (x.size(-1),))
@@ -762,7 +807,7 @@ def _render_has_value_embedding() -> str:
 
 
 def _render_mlp(target: TrainRecipeTarget) -> str:
-    if target == TrainRecipeTarget.AUTORESEARCH_CUDA:
+    if _is_cuda_train_recipe_target(target):
         return """def apply_mlp_activation(x):
     if MLP_ACTIVATION == "gelu":
         return F.gelu(x)
@@ -821,7 +866,7 @@ class MLP(nn.Module):
 
 
 def _render_qk_norm(target: TrainRecipeTarget) -> str:
-    if target == TrainRecipeTarget.AUTORESEARCH_CUDA:
+    if _is_cuda_train_recipe_target(target):
         return """        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         if USE_QK_NORM:
             q, k = norm(q), norm(k)
@@ -835,7 +880,7 @@ def _render_qk_norm(target: TrainRecipeTarget) -> str:
 
 
 def _render_model_config(target: TrainRecipeTarget) -> str:
-    if target == TrainRecipeTarget.AUTORESEARCH_CUDA:
+    if _is_cuda_train_recipe_target(target):
         return """def build_model_config(depth):
     assert depth == DEPTH
     assert MODEL_DIM == N_HEAD * HEAD_DIM
