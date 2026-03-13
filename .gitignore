@@ -32,3 +32,8 @@ debrief.md
 # Local agent context and editor state
 .context/
 .cursor/
+AGENTS.md
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
