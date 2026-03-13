@@ -19,6 +19,7 @@ evo-loop --help
   - `train-recipe-export`
   - `train-recipe-render`
 - Transfer workflows:
+  - `autoresearch-at-home-handoff`
   - `cuda-transfer-prepare`
   - `cuda-transfer-benchmark`
   - `cuda-transfer-report`
@@ -74,9 +75,32 @@ evo-loop train-recipe-export runs/<run>/frontier.json \
 evo-loop train-recipe-render artifacts/train_recipes/<candidate_id>.yaml \
   --backend autoresearch_cuda \
   --train-py /path/to/autoresearch/train.py
+
+evo-loop train-recipe-render artifacts/train_recipes/<candidate_id>.yaml \
+  --backend autoresearch_at_home_cuda \
+  --train-py /path/to/autoresearch-at-home/train.py
 ```
 
 See [train_recipe_bridge.md](train_recipe_bridge.md) for the compatibility rules and projection behavior.
+
+## `autoresearch@home` Handoff
+
+Use this when you already have one TEVO candidate you want to contribute into the collaborative `autoresearch@home` loop:
+
+```bash
+evo-loop autoresearch-at-home-handoff \
+  --frontier runs/<run>/frontier.json \
+  --candidate-id <candidate_id> \
+  --run-root runs/at_home_handoff
+```
+
+Useful options:
+
+- `--autoresearch-repo /path/to/autoresearch-at-home` to stage against an existing local checkout
+- `--autoresearch-repo-url <git_url>` to override the default repo URL
+- `--autoresearch-ref <git_ref>` to pin a specific branch or commit
+
+The command writes a staged `repo/` workspace with the chosen candidate already installed as `train.py`. See [autoresearch_at_home_handoff.md](autoresearch_at_home_handoff.md) for the workflow and collaboration boundary.
 
 ## CUDA Transfer Workflow
 
@@ -84,7 +108,8 @@ See [train_recipe_bridge.md](train_recipe_bridge.md) for the compatibility rules
 evo-loop cuda-transfer-prepare \
   --run-root runs/cuda_transfer_demo \
   --config configs/exp_train_recipe_bridge_owt_10m_v1.yaml \
-  --modal-gpu A10G
+  --modal-gpu A10G \
+  --autoresearch-flavor upstream
 
 evo-loop cuda-transfer-benchmark runs/cuda_transfer_demo \
   --repeat 3 \

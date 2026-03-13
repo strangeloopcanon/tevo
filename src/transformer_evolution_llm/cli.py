@@ -24,10 +24,14 @@ from .api import (
 )
 from .cache_builder import synthesize_cache
 from .cuda_transfer import (
+    AutoresearchFlavor,
+    CudaTransferError,
     build_public_cuda_transfer_report,
+    prepare_autoresearch_at_home_handoff,
     render_public_cuda_variants,
     resolve_autoresearch_source_repo,
     run_public_cuda_transfer_modal_benchmarks,
+    train_recipe_target_for_flavor,
 )
 from .mlx_transfer import (
     audit_tevo_regions_from_paths,
@@ -652,10 +656,16 @@ def cuda_transfer_prepare_cmd(
             help="Optional local autoresearch checkout to render against.",
         ),
     ] = None,
+    autoresearch_flavor: Annotated[
+        AutoresearchFlavor,
+        typer.Option(help="Named CUDA train.py flavor to target when resolving a repo preset."),
+    ] = AutoresearchFlavor.UPSTREAM,
     autoresearch_repo_url: Annotated[
-        str,
-        typer.Option(help="Git URL for the CUDA autoresearch repo Modal will benchmark."),
-    ] = "https://github.com/karpathy/autoresearch.git",
+        str | None,
+        typer.Option(
+            help="Optional Git URL override for the CUDA autoresearch repo Modal will benchmark."
+        ),
+    ] = None,
     autoresearch_ref: Annotated[
         str,
         typer.Option(help="Git ref or commit for the CUDA autoresearch repo."),
@@ -687,6 +697,7 @@ def cuda_transfer_prepare_cmd(
     run_root.mkdir(parents=True, exist_ok=True)
     source_repo, repo_metadata = resolve_autoresearch_source_repo(
         out_dir=run_root,
+        flavor=autoresearch_flavor,
         local_repo=autoresearch_repo,
         repo_url=autoresearch_repo_url,
         repo_ref=autoresearch_ref,
@@ -822,6 +833,7 @@ def cuda_transfer_prepare_cmd(
         source_repo,
         selection_manifest_path,
         run_root / "rendered_train_py",
+        target=train_recipe_target_for_flavor(autoresearch_flavor),
     )
     arm_manifest_path = stage_public_transfer_workspaces(
         mlx_repo=source_repo,
@@ -846,6 +858,7 @@ def cuda_transfer_prepare_cmd(
         "selected_labels": [item.label for item in selected],
         "selected_candidates": [item.candidate_id for item in selected],
         "autoresearch_source_repo": str(source_repo.resolve()),
+        "autoresearch_flavor": repo_metadata.get("autoresearch_flavor"),
         "autoresearch_repo_url": repo_metadata.get("repo_url"),
         "autoresearch_repo_ref": repo_metadata.get("repo_ref"),
         "autoresearch_source_kind": repo_metadata.get("source_kind"),
@@ -856,6 +869,78 @@ def cuda_transfer_prepare_cmd(
     console.print(f"Frontier: {frontier_out}")
     console.print(f"CUDA source repo: {source_repo}")
     console.print(f"Arm manifest: {arm_manifest_path}")
+
+
+@app.command("autoresearch-at-home-handoff")
+def autoresearch_at_home_handoff_cmd(
+    frontier: Annotated[
+        Path,
+        typer.Option(
+            ...,
+            exists=True,
+            readable=True,
+            help="Frontier JSON containing the chosen TEVO candidate.",
+        ),
+    ],
+    candidate_id: Annotated[
+        str,
+        typer.Option(..., help="Bridge-compatible frontier candidate id to hand off."),
+    ],
+    run_root: Annotated[
+        Path,
+        typer.Option(help="Artifact directory for the handoff bundle."),
+    ] = Path("runs/at_home_handoff"),
+    lineage: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            readable=True,
+            help="Optional lineage JSON to reference in the handoff summary.",
+        ),
+    ] = None,
+    autoresearch_repo: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            readable=True,
+            file_okay=False,
+            help="Optional local autoresearch@home checkout to stage against.",
+        ),
+    ] = None,
+    autoresearch_flavor: Annotated[
+        AutoresearchFlavor,
+        typer.Option(help="Named autoresearch-family preset to stage against."),
+    ] = AutoresearchFlavor.AT_HOME,
+    autoresearch_repo_url: Annotated[
+        str | None,
+        typer.Option(help="Optional Git URL override for the staged handoff repo."),
+    ] = None,
+    autoresearch_ref: Annotated[
+        str,
+        typer.Option(help="Git ref or commit for the staged handoff repo."),
+    ] = "master",
+) -> None:
+    """Export one TEVO candidate into a runnable autoresearch@home workspace."""
+    try:
+        _, manifest_path, summary_path = prepare_autoresearch_at_home_handoff(
+            frontier_path=frontier,
+            candidate_id=candidate_id,
+            out_dir=run_root,
+            local_repo=autoresearch_repo,
+            repo_url=autoresearch_repo_url,
+            repo_ref=autoresearch_ref,
+            flavor=autoresearch_flavor,
+            lineage_path=lineage,
+        )
+    except CudaTransferError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    manifest = json.loads(manifest_path.read_text())
+    console.print(f"[bold green]Prepared autoresearch@home handoff:[/] {run_root}")
+    console.print(f"Candidate: {candidate_id}")
+    console.print(f"Staged repo: {manifest['staged_repo']}")
+    console.print(f"Manifest: {manifest_path}")
+    console.print(f"Summary: {summary_path}")
 
 
 @app.command("cuda-transfer-benchmark")

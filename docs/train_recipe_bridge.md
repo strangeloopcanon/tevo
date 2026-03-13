@@ -1,6 +1,6 @@
 # TrainRecipe Bridge
 
-So what: TEVO can now export a constrained `TrainRecipe` artifact from compatible frontier candidates and render that recipe into the current `autoresearch` CUDA `train.py` or the `autoresearch-mlx` `train.py` layout without hand-editing the file every time. The bridge now preserves downstream training defaults unless a recipe explicitly overrides them, and oversized CUDA recipes are projected into the upstream `autoresearch` size envelope so motif-transfer probes stay comparable to stock `train.py`.
+So what: TEVO can now export a constrained `TrainRecipe` artifact from compatible frontier candidates and render that recipe into the current `autoresearch` CUDA `train.py`, the matching `autoresearch@home` CUDA `train.py`, or the `autoresearch-mlx` `train.py` layout without hand-editing the file every time. The bridge now preserves downstream training defaults unless a recipe explicitly overrides them, and oversized CUDA recipes are projected into the upstream-size CUDA envelope so motif-transfer probes stay comparable to stock `train.py`.
 
 ## What The Bridge Owns
 
@@ -63,6 +63,14 @@ evo-loop train-recipe-render runs/<run>/<candidate_id>.train_recipe.yaml \
   --train-py /path/to/autoresearch/train.py
 ```
 
+Patch a CUDA `autoresearch@home/train.py` checkout:
+
+```bash
+evo-loop train-recipe-render runs/<run>/<candidate_id>.train_recipe.yaml \
+  --backend autoresearch_at_home_cuda \
+  --train-py /path/to/autoresearch-at-home/train.py
+```
+
 Patch an Apple Silicon `autoresearch-mlx/train.py` checkout:
 
 ```bash
@@ -73,7 +81,7 @@ evo-loop train-recipe-render runs/<run>/<candidate_id>.train_recipe.yaml \
 
 If you omit `--train-py`, the command prints the TEVO-owned template zones instead of patching a file.
 
-For oversized CUDA recipes, the rendered file reflects the projected downstream-safe scaffold rather than the raw TEVO model scale.
+`autoresearch_cuda` and `autoresearch_at_home_cuda` currently share the same renderer logic and projection rules. For oversized CUDA recipes, the rendered file reflects the projected downstream-safe scaffold rather than the raw TEVO model scale.
 
 ## Stable Template Zones
 
