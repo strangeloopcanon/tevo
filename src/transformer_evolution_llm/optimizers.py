@@ -419,9 +419,112 @@ class Muon(Optimizer):
         return loss
 
 
-def build_optimizer(params: Iterable[torch.nn.Parameter], schedule: TrainSchedule) -> Optimizer:
+def _optimizer_params_with_groups(
+    params_or_model: Iterable[torch.nn.Parameter] | torch.nn.Module,
+    schedule: TrainSchedule,
+) -> list[torch.nn.Parameter] | list[dict[str, object]]:
+    if not isinstance(params_or_model, torch.nn.Module):
+        return list(params_or_model)
+
+    embed = getattr(params_or_model, "embed", None)
+    lm_head = getattr(params_or_model, "lm_head", None)
+    tied_embedding_lr = getattr(schedule, "tied_embedding_lr", None)
+    embed_lr = getattr(schedule, "embed_lr", None)
+    head_lr = getattr(schedule, "head_lr", None)
+    matrix_lr = getattr(schedule, "matrix_lr", None)
+    scalar_lr = getattr(schedule, "scalar_lr", None)
+
+    tied_weight = None
+    if isinstance(embed, torch.nn.Embedding) and isinstance(lm_head, torch.nn.Linear):
+        if lm_head.weight is embed.weight:
+            tied_weight = embed.weight
+    if all(value is None for value in (tied_embedding_lr, embed_lr, head_lr, matrix_lr, scalar_lr)):
+        return [param for param in params_or_model.parameters() if param.requires_grad]
+
+    groups_by_name: dict[str, list[torch.nn.Parameter]] = {
+        "tied_embedding": [],
+        "embedding": [],
+        "untied_head": [],
+        "matrix": [],
+        "scalar_vector": [],
+        "default": [],
+    }
+    seen: set[int] = set()
+    for name, param in params_or_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+
+        if tied_weight is not None and param is tied_weight:
+            if tied_embedding_lr is not None:
+                groups_by_name["tied_embedding"].append(param)
+            elif embed_lr is not None:
+                groups_by_name["embedding"].append(param)
+            else:
+                groups_by_name["default"].append(param)
+            continue
+
+        if name.startswith("embed.") and embed_lr is not None:
+            groups_by_name["embedding"].append(param)
+            continue
+
+        if tied_weight is None and name.startswith("lm_head.") and head_lr is not None:
+            groups_by_name["untied_head"].append(param)
+            continue
+
+        if param.ndim >= 2 and matrix_lr is not None:
+            groups_by_name["matrix"].append(param)
+            continue
+
+        if param.ndim < 2 and scalar_lr is not None:
+            groups_by_name["scalar_vector"].append(param)
+            continue
+
+        groups_by_name["default"].append(param)
+
+    group_lrs = {
+        "tied_embedding": tied_embedding_lr,
+        "embedding": embed_lr,
+        "untied_head": head_lr,
+        "matrix": matrix_lr,
+        "scalar_vector": scalar_lr,
+        "default": None,
+    }
+    groups: list[dict[str, object]] = []
+    for group_name in (
+        "default",
+        "tied_embedding",
+        "embedding",
+        "untied_head",
+        "matrix",
+        "scalar_vector",
+    ):
+        params = groups_by_name[group_name]
+        if not params:
+            continue
+        group: dict[str, object] = {"params": params, "name": group_name}
+        lr = group_lrs[group_name]
+        if lr is not None:
+            group["lr"] = float(lr)
+        groups.append(group)
+
+    if len(groups) == 1 and "lr" not in groups[0]:
+        only_group = groups[0].get("params")
+        if isinstance(only_group, list):
+            return only_group
+    return groups
+
+
+def build_optimizer(
+    params_or_model: Iterable[torch.nn.Parameter] | torch.nn.Module,
+    schedule: TrainSchedule,
+) -> Optimizer:
     cfg: OptimizerConfig = getattr(schedule, "optimizer", OptimizerConfig())
     name = (cfg.name or "adamw").lower()
+    params = _optimizer_params_with_groups(params_or_model, schedule)
     # Effective hparams: optimizer overrides or fall back to TrainSchedule
     lr = float(cfg.lr if cfg.lr is not None else schedule.lr)
     weight_decay = float(

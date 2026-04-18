@@ -1,0 +1,24 @@
+[
+  {
+    "name": "practical_round1_winner",
+    "frontier_path": "runs/runpod_parameter_golf/2026-03-21_ffn_input_combo_scouts/scout_combo_ffn_input_practical.frontier.json"
+  },
+  {
+    "name": "practical_medium_winner",
+    "frontier_path": "runs/runpod_parameter_golf/2026-03-21_medium_dual_search/medium_combo_ffn_input_practical.frontier.json"
+  },
+  {
+    "name": "abyss_scout_winner",
+    "frontier_path": "runs/runpod_parameter_golf/2026-03-20_ffn_input_broad_v3_fixed/scout3b_combo_ffn_input_abyss.frontier.json"
+  },
+  {
+    "name": "champions_feedback_child",
+    "frontier_path": "runs/runpod_parameter_golf/2026-03-21_champions_search/champions_medium.frontier.json",
+    "candidate_id": "tune_train_recipe_attn_shape+tpl__inject_feedback_loop+toggle_kv_policy+toggle_update_filter_mode-2-b3c7"
+  },
+  {
+    "name": "champions_router_child",
+    "frontier_path": "runs/runpod_parameter_golf/2026-03-21_champions_search/champions_medium.frontier.json",
+    "candidate_id": "tpl__combo-baseline-yolo-anchor+tune_gradient_transform_ns_steps+add_extra_combo+toggle_branch_router-8-af3d"
+  }
+]

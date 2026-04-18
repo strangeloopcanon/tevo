@@ -1,0 +1,90 @@
+model:
+  name: pg-lane3-attention-reallocation
+  emb:
+    dim: 384
+    vocab: 1024
+  blocks:
+    - &lane3_block
+      attn:
+        kind: MLA
+        heads: 6
+        head_dim: 64
+        kv_latent_dim: 128
+        softmax:
+          qk_norm: rms
+          softcap: 16.0
+        value_glu: true
+      ffn:
+        type: dense
+        hidden: 1152
+        activation: swiglu
+    - *lane3_block
+    - *lane3_block
+    - *lane3_block
+    - *lane3_block
+    - *lane3_block
+    - *lane3_block
+    - *lane3_block
+  head:
+    vocab: 1024
+    tie_embeddings: true
+
+train:
+  lr: 0.001
+  warmup: 32
+  clip: 1.0
+  bf16: true
+  grad_ckpt: false
+  max_tokens: 524288
+  seed: 0
+  optimizer:
+    name: adamw
+
+data:
+  tokenizer: parameter-golf
+  seq_len: 512
+  batch_size: 8
+  workers: 0
+  eval_tokens: 8192
+  shards:
+    - name: parameter-golf
+      split: train
+      weight: 1.0
+
+parameter_golf:
+  train_shards_glob: runs/parameter_golf/fineweb10b_sp1024/train_*.bin
+  val_shards_glob: runs/parameter_golf/fineweb10b_sp1024/val_*.bin
+  tokenizer_path: runs/parameter_golf/tokenizers/sp1024.model
+  artifact_budget_bytes: 16000000
+  code_bytes: 50000
+  track: 10min
+
+evolution:
+  population: 16
+  rung1_tokens: 262144
+  rung2_tokens: 524288
+  crossover_prob: 0.0
+  parent_selection: map_elites
+  weight_inheritance: scratch
+  mutation_allowlist:
+    - toggle_mla_attention
+    - toggle_linear_attention
+    - make_gqa
+    - tune_attn_shape
+    - tune_attn_sparsity
+    - tune_ffn_width_activation
+    - mix_method_recipe
+  objectives:
+    val_bpb: min
+    artifact_total_bytes: min
+    quantization_delta_bpb: min
+    throughput: max
+  rung0_thresholds:
+    max_params: 28000000
+    max_artifact_total_bytes_est: 18000000
+    max_artifact_total_bytes: 16000000
+  gate_schedule:
+    - generation: 24
+      thresholds:
+        max_artifact_total_bytes_est: 17000000
+        max_artifact_total_bytes: 16000000

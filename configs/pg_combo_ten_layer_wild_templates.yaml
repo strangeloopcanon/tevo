@@ -1,0 +1,79 @@
+templates:
+  - name: combo-ten-layer-wild-anchor
+    weight: 1.2
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+  - name: combo-ten-layer-wild-keep90
+    weight: 1.15
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-7
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.9
+          update_filter_granularity: element
+          update_filter_momentum_blend: 0.0
+  - name: combo-ten-layer-wild-block-filter
+    weight: 1.05
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-7
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 256
+          update_filter_momentum_blend: 0.0
+  - name: combo-ten-layer-wild-tail-recurrence
+    weight: 0.95
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - set_recurrence:
+          tail_blocks: 4
+          adapter: gated
+          concat_prelude: false
+          train_recurrence: 1
+          max_train_recurrence: 4
+          test_recurrences:
+            - 1
+            - 2
+            - 4

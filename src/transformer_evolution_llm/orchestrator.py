@@ -33,9 +33,24 @@ from .mutations import (
     mutation_names,
     register_template_mutations,
 )
+from .parameter_golf import (
+    ParameterGolfDataModule,
+    estimate_calibrated_artifact_total_bytes_for_spec,
+    estimate_artifact_total_bytes_for_spec,
+)
+from .parameter_golf_export import official_submission_metrics
+from .parameter_golf_seeded import (
+    incubator_promotion_summary,
+    motif_signature,
+    seed_lane_metadata,
+)
 from .scoring import (
+    artifact_budget_edge_score,
+    artifact_budget_fill_score,
+    artifact_budget_utilization,
     archive_novelty,
     behavioral_descriptor,
+    complexity_score,
     compute_composite,
     default_composites,
     default_objectives,
@@ -195,6 +210,7 @@ class EvolutionRunner:
         )
         self._mutation_success: dict[str, float] = {}
         self._mutation_counts: dict[str, int] = {}
+        self._motif_families: dict[str, set[str]] = {}
         self._novelty_archive: list[list[float]] = []
         self._novelty_k = int(getattr(self.cfg, "novelty_archive_k", 15) or 15)
         self._novelty_archive_max = int(getattr(self.cfg, "novelty_archive_max", 500) or 500)
@@ -250,10 +266,25 @@ class EvolutionRunner:
         if mode == "live":
             seed_value = int(getattr(base_spec.train, "seed", 0) or 0)
             try:
-                self.data_module = DataModule(base_spec.data, seed=seed_value)
+                if base_spec.parameter_golf is not None:
+                    self.data_module = ParameterGolfDataModule(
+                        base_spec.parameter_golf,
+                        seq_len=base_spec.data.seq_len,
+                        batch_size=base_spec.data.batch_size,
+                        seed=seed_value,
+                    )
+                else:
+                    self.data_module = DataModule(base_spec.data, seed=seed_value)
             except TypeError:
                 # Allow tests or external shims that provide a simplified DataModule signature.
-                self.data_module = DataModule(base_spec.data)
+                if base_spec.parameter_golf is not None:
+                    self.data_module = ParameterGolfDataModule(
+                        base_spec.parameter_golf,
+                        seq_len=base_spec.data.seq_len,
+                        batch_size=base_spec.data.batch_size,
+                    )
+                else:
+                    self.data_module = DataModule(base_spec.data)
         self.evaluator = (
             None if mode == "live" else evaluator_for_mode(mode, checker=self.checker, seed=seed)
         )
@@ -297,6 +328,12 @@ class EvolutionRunner:
         if self._template_learning:
             save_path_raw = getattr(self.cfg, "template_learning_save_path", None)
             save_path = Path(str(save_path_raw or "configs/mutation_templates.yaml"))
+            seed_path_raw = getattr(self.cfg, "template_learning_seed_path", None)
+            if seed_path_raw:
+                seed_path = Path(str(seed_path_raw))
+                if seed_path.exists() and not save_path.exists():
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    save_path.write_text(seed_path.read_text())
             configure_template_learning(
                 enabled=True,
                 path=save_path,
@@ -411,7 +448,7 @@ class EvolutionRunner:
             pass
         candidate.seed_state_path = None
 
-    def _objective_metrics_ok(self, candidate: Candidate) -> bool:
+    def _thresholds_ok(self, candidate: Candidate, *, require_metrics: bool) -> bool:
         if float(candidate.metrics.get("nan_seen", 0.0) or 0.0) > 0.0:
             return False
         stop_reason = candidate.metrics.get("stop_reason_code")
@@ -424,19 +461,50 @@ class EvolutionRunner:
                 return False
         thresholds = self._active_thresholds()
         for key, limit in thresholds.items():
-            if not isinstance(key, str) or not key.startswith("max_"):
+            if not isinstance(key, str):
                 continue
-            metric_name = key[len("max_") :]
+            if key.startswith("max_"):
+                metric_name = key[len("max_") :]
+                metric_val = candidate.metrics.get(metric_name)
+                if metric_val is None:
+                    if require_metrics:
+                        return False
+                    continue
+                try:
+                    metric_f = float(metric_val)
+                    limit_f = float(limit)
+                except (TypeError, ValueError):
+                    if require_metrics:
+                        return False
+                    continue
+                if metric_f > limit_f:
+                    return False
+                continue
+            if not key.startswith("min_"):
+                continue
+            metric_name = key[len("min_") :]
+            if metric_name == "throughput_proxy":
+                # StaticChecker already enforces this gate.
+                continue
             metric_val = candidate.metrics.get(metric_name)
             if metric_val is None:
-                return False
+                if require_metrics:
+                    return False
+                continue
             try:
                 metric_f = float(metric_val)
                 limit_f = float(limit)
             except (TypeError, ValueError):
+                if require_metrics:
+                    return False
+                continue
+            if metric_f < limit_f:
                 return False
-            if metric_f > limit_f:
-                return False
+        return True
+
+    def _objective_metrics_ok(self, candidate: Candidate) -> bool:
+        if not self._thresholds_ok(candidate, require_metrics=True):
+            return False
         for name in self.objective_dir:
             val = candidate.metrics.get(name)
             if val is None:
@@ -459,6 +527,123 @@ class EvolutionRunner:
             sign = 1.0 if direction == "max" else -1.0
             overrides[metric] = float(weight) / sign
         return overrides
+
+    def _annotate_official_submission_metrics(self, candidate: Candidate) -> None:
+        if candidate.spec.parameter_golf is None:
+            return
+        edge_kwargs = self._artifact_budget_edge_kwargs(candidate.spec)
+        budget_bytes = float(candidate.spec.parameter_golf.artifact_budget_bytes)
+        artifact_zlib_bytes = candidate.metrics.get("artifact_zlib_bytes")
+        try:
+            zlib_bytes = float(artifact_zlib_bytes) if artifact_zlib_bytes is not None else None
+        except (TypeError, ValueError):
+            zlib_bytes = None
+        metrics = official_submission_metrics(
+            candidate.spec,
+            artifact_zlib_bytes=zlib_bytes,
+        )
+        if str(candidate.spec.parameter_golf.lane_kind or "exportable") == "incubator":
+            metrics["main_track_eligible_est"] = 0.0
+            if "main_track_eligible_exact" in metrics:
+                metrics["main_track_eligible_exact"] = 0.0
+        if str(getattr(candidate.spec.parameter_golf, "eval_protocol", "mid_fidelity")) == "scout_fast":
+            metrics["main_track_eligible_est"] = 0.0
+            if "main_track_eligible_exact" in metrics:
+                metrics["main_track_eligible_exact"] = 0.0
+        total_bytes_est = metrics.get("official_submission_total_bytes_est")
+        metrics["official_submission_budget_utilization_est"] = artifact_budget_utilization(
+            total_bytes_est,
+            budget_bytes,
+        )
+        metrics["official_submission_budget_fill_score_est"] = artifact_budget_fill_score(
+            total_bytes_est,
+            budget_bytes,
+        )
+        metrics["official_submission_budget_edge_score_est"] = artifact_budget_edge_score(
+            total_bytes_est,
+            budget_bytes,
+            **edge_kwargs,
+        )
+        total_bytes_exact = candidate.metrics.get("artifact_total_bytes")
+        if total_bytes_exact is not None:
+            metrics["artifact_budget_utilization"] = artifact_budget_utilization(
+                total_bytes_exact,
+                budget_bytes,
+            )
+            metrics["artifact_budget_fill_score"] = artifact_budget_fill_score(
+                total_bytes_exact,
+                budget_bytes,
+            )
+            metrics["artifact_budget_edge_score"] = artifact_budget_edge_score(
+                total_bytes_exact,
+                budget_bytes,
+                **edge_kwargs,
+            )
+            metrics["official_submission_budget_utilization"] = artifact_budget_utilization(
+                total_bytes_exact,
+                budget_bytes,
+            )
+            metrics["official_submission_budget_fill_score"] = artifact_budget_fill_score(
+                total_bytes_exact,
+                budget_bytes,
+            )
+            metrics["official_submission_budget_edge_score"] = artifact_budget_edge_score(
+                total_bytes_exact,
+                budget_bytes,
+                **edge_kwargs,
+            )
+        candidate.metrics.update(metrics)
+
+    def _artifact_budget_edge_kwargs(self, spec: ArchitectureSpec) -> dict[str, float]:
+        parameter_golf = spec.parameter_golf
+        if parameter_golf is None:
+            return {}
+        return {
+            "target_utilization": float(parameter_golf.target_budget_utilization),
+            "under_window": float(parameter_golf.target_budget_under_window),
+            "over_window": float(parameter_golf.target_budget_over_window),
+        }
+
+    def _annotate_seed_lane_metadata(self, candidate: Candidate) -> None:
+        metadata = seed_lane_metadata(candidate.spec)
+        if not metadata:
+            return
+        metadata["motif_signature"] = motif_signature(candidate.spec)
+        candidate.metadata.update(metadata)
+
+    def _motif_appearance_count(self, candidate: Candidate) -> int:
+        signature = str(candidate.metadata.get("motif_signature") or "").strip()
+        if not signature:
+            return 1
+        families = set(self._motif_families.get(signature, set()))
+        family = candidate.metadata.get("seed_family")
+        if family is not None:
+            families.add(str(family))
+        return max(1, len(families))
+
+    def _record_motif_family(self, candidate: Candidate) -> None:
+        signature = str(candidate.metadata.get("motif_signature") or "").strip()
+        family = candidate.metadata.get("seed_family")
+        if not signature or family is None:
+            return
+        known = self._motif_families.setdefault(signature, set())
+        known.add(str(family))
+
+    def _annotate_incubator_metrics(self, candidate: Candidate) -> None:
+        if candidate.spec.parameter_golf is None:
+            return
+        appearance_count = self._motif_appearance_count(candidate)
+        summary = incubator_promotion_summary(
+            candidate.spec,
+            post_quant_val_bpb=candidate.metrics.get("post_quant_val_bpb"),
+            appearance_count=appearance_count,
+        )
+        delta = summary.get("delta_bpb")
+        candidate.metadata["motif_promotion"] = summary
+        candidate.metrics["motif_appearance_count"] = float(appearance_count)
+        candidate.metrics["motif_transfer_eligible"] = 1.0 if summary["eligible"] else 0.0
+        if delta is not None:
+            candidate.metrics["motif_anchor_delta_bpb"] = float(delta)
 
     def run(self, generations: int) -> list[Candidate]:
         survivors: list[Candidate] = []
@@ -488,6 +673,7 @@ class EvolutionRunner:
                     console.print(f"[red]Seed artifact cleanup failed:[/] {cleanup_exc}")
             if base_candidate.status == "completed":
                 self._update_archive(base_candidate)
+                self._record_motif_family(base_candidate)
                 survivors.append(base_candidate)
             self.pool.append(base_candidate)
             self._history.append(base_candidate)
@@ -523,6 +709,7 @@ class EvolutionRunner:
                 self._update_archive(candidate)
                 self._maybe_update_mutation_weights(candidate)
                 self._maybe_update_template_learning(candidate)
+                self._record_motif_family(candidate)
             if candidate.status == "completed":
                 survivors.append(candidate)
             self.pool.append(candidate)
@@ -544,9 +731,52 @@ class EvolutionRunner:
         return survivors
 
     def _evaluate_candidate(self, candidate: Candidate) -> None:
+        self._annotate_seed_lane_metadata(candidate)
         candidate.metrics["layers"] = float(candidate.spec.model.n_layers)
+        candidate.metrics["effective_depth"] = float(candidate.spec.model.n_layers)
+        candidate.metrics["physical_depth"] = float(candidate.spec.model.physical_block_count())
+        candidate.metrics["shared_blocks"] = float(candidate.spec.model.shared_block_count())
         candidate.metrics["moe_blocks"] = float(candidate.spec.model.moe_block_count())
+        candidate.metrics["params"] = float(estimate_params(candidate.spec))
+        candidate.metrics["seq_len"] = float(candidate.spec.data.seq_len)
         candidate.metrics["graph_entropy"] = self._graph_entropy(candidate.spec)
+        candidate.metrics["complexity_score"] = complexity_score(candidate.spec)
+        if candidate.spec.parameter_golf is not None:
+            edge_kwargs = self._artifact_budget_edge_kwargs(candidate.spec)
+            raw_payload_bytes, raw_total_bytes = estimate_artifact_total_bytes_for_spec(candidate.spec)
+            calibrated_payload_bytes, calibrated_total_bytes = (
+                estimate_calibrated_artifact_total_bytes_for_spec(candidate.spec)
+            )
+            candidate.metrics["artifact_payload_bytes_raw_est"] = float(raw_payload_bytes)
+            candidate.metrics["artifact_total_bytes_raw_est"] = float(raw_total_bytes)
+            candidate.metrics["artifact_payload_bytes_est"] = float(calibrated_payload_bytes)
+            candidate.metrics["artifact_total_bytes_est"] = float(calibrated_total_bytes)
+            candidate.metrics["artifact_code_bytes"] = float(
+                candidate.spec.parameter_golf.code_bytes
+            )
+            candidate.metrics["artifact_budget_bytes"] = float(
+                candidate.spec.parameter_golf.artifact_budget_bytes
+            )
+            candidate.metrics["artifact_budget_utilization_est"] = artifact_budget_utilization(
+                calibrated_total_bytes,
+                candidate.spec.parameter_golf.artifact_budget_bytes,
+            )
+            candidate.metrics["artifact_budget_fill_score_est"] = artifact_budget_fill_score(
+                calibrated_total_bytes,
+                candidate.spec.parameter_golf.artifact_budget_bytes,
+            )
+            candidate.metrics["artifact_budget_edge_score_est"] = artifact_budget_edge_score(
+                calibrated_total_bytes,
+                candidate.spec.parameter_golf.artifact_budget_bytes,
+                **edge_kwargs,
+            )
+            candidate.metrics["eval_protocol_is_faithful"] = (
+                0.0
+                if str(getattr(candidate.spec.parameter_golf, "eval_protocol", "mid_fidelity"))
+                == "scout_fast"
+                else 1.0
+            )
+            self._annotate_official_submission_metrics(candidate)
         # Selector-related proxies: count blocks with selector enabled and average top-k
         selector_blocks: float = 0.0
         selector_topk_sum: float = 0.0
@@ -663,28 +893,17 @@ class EvolutionRunner:
             k=max(1, int(self._novelty_k)),
         )
         self._update_novelty_archive(descriptor)
-        # Enforce rung0 thresholds even in live mode to block trivial models
-        thresholds = self._active_thresholds()
-        min_layers = float(thresholds.get("min_layers", 0.0) or 0.0)
-        min_moe = float(thresholds.get("min_moe_blocks", 0.0) or 0.0)
-        min_selector = float(thresholds.get("min_selector_blocks", 0.0) or 0.0)
-        min_memory = float(thresholds.get("min_memory_blocks", 0.0) or 0.0)
-        min_recurrences = float(thresholds.get("min_recurrences", 0.0) or 0.0)
-        min_embed_ffn = float(thresholds.get("min_embedding_ffn_blocks", 0.0) or 0.0)
-        if (
-            candidate.metrics["layers"] < min_layers
-            or candidate.metrics["moe_blocks"] < min_moe
-            or candidate.metrics["selector_blocks"] < min_selector
-            or candidate.metrics["memory_blocks"] < min_memory
-            or candidate.metrics["recurrences"] < min_recurrences
-            or candidate.metrics["embedding_ffn_blocks"] < min_embed_ffn
-        ):
+        if not self._thresholds_ok(candidate, require_metrics=False):
             candidate.status = "failed"
             self._cleanup_seed_state(candidate)
             return
         if self.mode == "live":
             static = self.checker.run(candidate.spec)
             candidate.metrics.update(static.metrics)
+            if not self._thresholds_ok(candidate, require_metrics=False):
+                candidate.status = "failed"
+                self._cleanup_seed_state(candidate)
+                return
             if not static.ok:
                 candidate.status = "failed"
                 self._cleanup_seed_state(candidate)
@@ -744,6 +963,8 @@ class EvolutionRunner:
                 self.trainer.steps = base_steps
                 return
             candidate.metrics.update(metrics1)
+            self._annotate_official_submission_metrics(candidate)
+            self._annotate_incubator_metrics(candidate)
             candidate.checkpoint = checkpoint
             # Composite metrics may be part of the objective set (e.g.,
             # efficiency_score). Compute them before objective gating.
@@ -835,6 +1056,8 @@ class EvolutionRunner:
                 self.trainer.steps = base_steps
                 return
             candidate.metrics.update(metrics2)
+            self._annotate_official_submission_metrics(candidate)
+            self._annotate_incubator_metrics(candidate)
             candidate.checkpoint = checkpoint
             self._apply_composite_metrics(candidate)
             if not self._objective_metrics_ok(candidate):
@@ -1676,7 +1899,7 @@ class EvolutionRunner:
                 resolved_overrides = {
                     str(k): float(v)
                     for k, v in saved_overrides.items()
-                    if isinstance(v, (int, float))
+                    if isinstance(v, int | float)
                 }
             else:
                 saved_signed = data.get("score_weights")
@@ -1685,7 +1908,7 @@ class EvolutionRunner:
                     decoded: dict[str, float] = {}
                     for metric, direction in saved_objective_dir.items():
                         value = saved_signed.get(metric)
-                        if not isinstance(value, (int, float)):
+                        if not isinstance(value, int | float):
                             continue
                         sign = 1.0 if direction == "max" else -1.0
                         decoded[str(metric)] = float(value) / sign
@@ -1708,7 +1931,7 @@ class EvolutionRunner:
             parsed_weights = {
                 str(key): float(value)
                 for key, value in mutation_weights.items()
-                if isinstance(value, (int, float))
+                if isinstance(value, int | float)
             }
             if runner._mutation_allowlist is not None:
                 allow = set(runner._mutation_allowlist)
@@ -1769,12 +1992,12 @@ class EvolutionRunner:
         mutation_success = data.get("mutation_success")
         if isinstance(mutation_success, dict):
             runner._mutation_success = {
-                str(k): float(v) for k, v in mutation_success.items() if isinstance(v, (int, float))
+                str(k): float(v) for k, v in mutation_success.items() if isinstance(v, int | float)
             }
         mutation_counts = data.get("mutation_counts")
         if isinstance(mutation_counts, dict):
             runner._mutation_counts = {
-                str(k): int(v) for k, v in mutation_counts.items() if isinstance(v, (int, float))
+                str(k): int(v) for k, v in mutation_counts.items() if isinstance(v, int | float)
             }
         novelty_archive = data.get("novelty_archive")
         if isinstance(novelty_archive, list):
@@ -1783,21 +2006,21 @@ class EvolutionRunner:
                 if not isinstance(descriptor, list):
                     continue
                 parsed_archive.append(
-                    [float(value) for value in descriptor if isinstance(value, (int, float))]
+                    [float(value) for value in descriptor if isinstance(value, int | float)]
                 )
             runner._novelty_archive = parsed_archive
         generation_idx = data.get("generation_idx")
-        if isinstance(generation_idx, (int, float)):
+        if isinstance(generation_idx, int | float):
             runner._generation_idx = int(generation_idx)
         active_thresholds = data.get("active_rung0_thresholds")
         if isinstance(active_thresholds, dict):
             runner._active_rung0_thresholds = {
                 str(key): float(value)
                 for key, value in active_thresholds.items()
-                if isinstance(value, (int, float))
+                if isinstance(value, int | float)
             }
         origin_counter = data.get("origin_counter")
-        if isinstance(origin_counter, (int, float)):
+        if isinstance(origin_counter, int | float):
             runner._origin_counter = int(origin_counter)
         for cand in runner.pool + runner._history:
             runner._assign_missing_origin_ids(cand.spec)
@@ -1807,7 +2030,7 @@ class EvolutionRunner:
         rng_state = data.get("rng_state")
         if rng_state:
             # Best-effort restore; ignore if incompatible
-            if isinstance(rng_state, (list, tuple)):
+            if isinstance(rng_state, list | tuple):
                 try:
                     runner.rng.setstate(tuple(rng_state))
                 except Exception:
@@ -1846,6 +2069,7 @@ class EvolutionRunner:
                 "status": cand.status,
                 "rung": cand.rung,
                 "metrics": cand.metrics,
+                "metadata": cand.metadata,
                 "spec": cand.spec.model_dump(mode="python"),
                 "mutation_trace": cand.mutation_trace,
                 "crossover_report": cand.crossover_report,

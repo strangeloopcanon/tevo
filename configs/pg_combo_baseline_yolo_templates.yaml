@@ -1,0 +1,149 @@
+templates:
+  - name: combo-baseline-yolo-anchor
+    weight: 1.25
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+
+  - name: combo-baseline-yolo-fp16-tail
+    weight: 1.1
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.075
+          tied_embedding_export_dtype: fp16
+          tied_embed_init_std: 0.0045
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+
+  - name: combo-baseline-yolo-keep90
+    weight: 1.05
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-07
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.9
+          update_filter_granularity: element
+          update_filter_momentum_blend: 0.0
+
+  - name: combo-baseline-yolo-block-filter
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-07
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 256
+          update_filter_momentum_blend: 0.0
+
+  - name: combo-baseline-yolo-tail-recurrence
+    weight: 0.95
+    conditions:
+      parameter_golf_only: true
+      requires_no_recurrence: true
+    actions:
+      - set_recurrence:
+          tail_blocks: 3
+          adapter: gated
+          concat_prelude: false
+          train_recurrence: 1
+          max_train_recurrence: 4
+          test_recurrences:
+            - 1
+            - 2
+            - 4
+
+  - name: combo-baseline-yolo-memory-tokens
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - add_extra:
+          selector: random
+          extra_type: memory_tokens
+          params:
+            tokens: 8
+            heads: 2
+            head_dim: 32
+            gating_weight: 0.08
+
+  - name: combo-baseline-yolo-layer-scale
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - add_extra:
+          selector: random
+          extra_type: layer_scale
+          params:
+            init: 1.0e-05
+            targets:
+              - attn
+              - ffn
+
+  - name: combo-baseline-yolo-ten-layer
+    weight: 0.95
+    conditions:
+      parameter_golf_only: true
+      min_blocks: 8
+    actions:
+      - insert_block:
+          position: end
+          block_template: dense_attn
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0

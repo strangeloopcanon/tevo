@@ -66,7 +66,12 @@ def estimate_params(spec: ArchitectureSpec) -> float:
             return total
         return 0.0
 
-    for block in spec.model.blocks:
+    counted_sources: set[int] = set()
+    for block_idx, block in enumerate(spec.model.blocks):
+        source_idx = spec.model.resolve_share_source(block_idx)
+        if source_idx in counted_sources:
+            continue
+        counted_sources.add(source_idx)
         if block.attn:
             heads = int(block.attn.heads)
             head_dim = int(block.attn.head_dim)
@@ -141,6 +146,16 @@ def estimate_params(spec: ArchitectureSpec) -> float:
         n = int(hyper.streams)
         layers = int(spec.model.n_layers)
         params += float(layers * (n * n + 2 * n) + n)
+    recurrence_dim = d_model
+    if isinstance(hyper, HyperConnectionsConfig) and hyper.streams > 1:
+        recurrence_dim = d_model * int(hyper.streams)
+    for rec in spec.model.recurrences:
+        input_dim = recurrence_dim * (2 if rec.concat_prelude else 1)
+        output_dim = recurrence_dim
+        if rec.adapter == "gated":
+            params += float(2 * input_dim * output_dim)
+        else:
+            params += float(input_dim * output_dim)
     return params
 
 
@@ -607,6 +622,9 @@ class StaticChecker:
             "params": params,
             "kv_bytes_per_token": kv,
             "throughput_proxy": tps,
+            "effective_depth": float(spec.model.n_layers),
+            "physical_depth": float(spec.model.physical_block_count()),
+            "shared_blocks": float(spec.model.shared_block_count()),
         }
         return StaticCheckResult(ok=not reasons, metrics=metrics, reasons=reasons)
 

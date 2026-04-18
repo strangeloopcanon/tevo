@@ -1,0 +1,36 @@
+templates:
+  - name: seed-pg-anchor-baseline
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: element
+          update_filter_momentum_blend: 0.0
+          warmup: 32
+          clip: 1.0
+
+  - name: seed-pg-anchor-keep90
+    weight: 1.2
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.9
+          update_filter_granularity: element
+          update_filter_momentum_blend: 0.0
+          warmup: 32
+          clip: 1.0

@@ -5,8 +5,11 @@ import torch
 
 from transformer_evolution_llm.candidates import Candidate
 from transformer_evolution_llm.data import TokenBatch
+from transformer_evolution_llm.dsl import ParameterGolfConfig
 from transformer_evolution_llm.models import EvolutionModel
+from transformer_evolution_llm.optimizers import build_optimizer
 from transformer_evolution_llm.trainer import FullWeightTrainer
+import transformer_evolution_llm.trainer as trainer_module
 
 
 def synthetic_batches(vocab: int, seq_len: int, steps: int):
@@ -152,3 +155,112 @@ def test_speedrun_multi_thresholds_accept_strings(tmp_path: Path, tiny_spec, mon
     assert "speedrun_auc" in metrics
     assert "speedrun_reached_3" in metrics
     assert "speedrun_reached_2" in metrics
+
+
+def test_full_weight_trainer_reports_gradient_accumulation_metrics(
+    tmp_path: Path, tiny_spec
+) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.batch_tokens = int(spec.data.seq_len) * int(spec.data.batch_size) * 2
+
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=2, eval_batches=1, device="cpu")
+    candidate = Candidate(ident="cand-accum", spec=spec)
+    metrics, _ = trainer.train(
+        candidate,
+        spec,
+        synthetic_batches(spec.model.head.vocab, spec.data.seq_len, steps=6),
+    )
+
+    assert metrics["grad_accum_steps"] == 2.0
+    assert metrics["train_micro_batch_tokens"] == float(spec.data.seq_len * spec.data.batch_size)
+    assert metrics["train_effective_batch_tokens"] == float(
+        spec.data.seq_len * spec.data.batch_size * 2
+    )
+
+
+def test_full_weight_trainer_allows_zero_clip(tmp_path: Path, tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.clip = 0.0
+
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=2, eval_batches=1, device="cpu")
+    candidate = Candidate(ident="cand-zero-clip", spec=spec)
+    metrics, _ = trainer.train(
+        candidate,
+        spec,
+        synthetic_batches(spec.model.head.vocab, spec.data.seq_len, steps=4),
+    )
+
+    assert "max_grad_norm" in metrics
+    assert math.isfinite(float(metrics["max_grad_norm"]))
+
+
+def test_muon_momentum_warmup_schedule_adjusts_group_momentum(tmp_path: Path, tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.optimizer.name = "muon"
+    spec.train.optimizer.muon_momentum = 0.95
+    spec.train.optimizer.muon_momentum_warmup_start = 0.8
+    spec.train.optimizer.muon_momentum_warmup_steps = 10
+
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=1, eval_batches=1, device="cpu")
+    model = EvolutionModel(spec.model)
+    built = build_optimizer(model, spec.train)
+    base_lrs = [float(group.get("lr", 0.0)) for group in built.param_groups]
+    base_momentums = [
+        float(group.get("momentum")) if group.get("momentum") is not None else None
+        for group in built.param_groups
+    ]
+
+    trainer._apply_optimizer_schedule(
+        built,
+        base_lrs,
+        base_momentums,
+        spec,
+        step_idx=0,
+        total_steps=10,
+        elapsed_s=0.0,
+    )
+
+    momentums = [float(group["momentum"]) for group in built.param_groups if "momentum" in group]
+    assert momentums
+    assert all(abs(momentum - 0.8) < 1e-9 for momentum in momentums)
+
+
+def test_parameter_golf_wallclock_budget_caps_training_only(
+    tmp_path: Path,
+    tiny_spec,
+    monkeypatch,
+) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        max_wallclock_seconds=5e-5,
+        eval_protocol="mid_fidelity",
+    )
+
+    ticks = {"value": 0.0}
+
+    def fake_perf_counter() -> float:
+        ticks["value"] += 1e-6
+        return ticks["value"]
+
+    monkeypatch.setattr(trainer_module.time, "perf_counter", fake_perf_counter)
+
+    trainer = FullWeightTrainer(checkpoint_dir=tmp_path, steps=10, eval_batches=1, device="cpu")
+    monkeypatch.setattr(
+        trainer,
+        "_predict_elapsed_seconds",
+        lambda _durations, fallback_seconds=0.0: max(float(fallback_seconds), 3e-5),
+    )
+
+    candidate = Candidate(ident="cand-pg-wallclock", spec=spec)
+    metrics, _ = trainer.train(
+        candidate,
+        spec,
+        synthetic_batches(spec.model.head.vocab, spec.data.seq_len, steps=40),
+    )
+
+    assert metrics["wallclock_stop_triggered"] == 1.0
+    assert metrics["train_wallclock_seconds_used"] <= metrics["wallclock_seconds_budget"] + 1e-12
+    assert metrics["total_job_seconds_used"] >= metrics["train_wallclock_seconds_used"]

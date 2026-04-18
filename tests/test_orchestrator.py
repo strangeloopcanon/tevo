@@ -2,7 +2,7 @@ from pathlib import Path
 
 from transformer_evolution_llm.api import save_spec
 from transformer_evolution_llm.candidates import Candidate
-from transformer_evolution_llm.dsl import CustomModuleConfig
+from transformer_evolution_llm.dsl import CustomModuleConfig, ParameterGolfConfig
 from transformer_evolution_llm.orchestrator import EvolutionRunner
 
 
@@ -185,3 +185,207 @@ def test_mutation_allowlist_restricts_sampling(tiny_spec) -> None:
     assert mutated
     for cand in mutated:
         assert cand.mutation_trace == ["mix_optimizer_recipe"]
+
+
+def test_parameter_golf_candidates_report_official_submission_metrics(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="exact_official_baseline",
+        lane_kind="exportable",
+        exportable_family="exact_official_baseline",
+    )
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    candidate = Candidate(ident="cand-official", spec=spec.model_copy(deep=True))
+    runner._evaluate_candidate(candidate)
+    assert "official_submission_exportable" in candidate.metrics
+    assert "official_submission_total_bytes_est" in candidate.metrics
+    assert "main_track_eligible_est" in candidate.metrics
+    assert candidate.metrics["artifact_budget_utilization_est"] > 0.0
+    assert candidate.metrics["artifact_budget_fill_score_est"] > 0.0
+    assert candidate.metrics["artifact_budget_edge_score_est"] >= 0.0
+    assert candidate.metrics["complexity_score"] > 0.0
+    assert candidate.metadata["seed_family"] == "exact_official_baseline"
+    assert candidate.metadata["lane_kind"] == "exportable"
+    assert "motif_signature" in candidate.metadata
+
+
+def test_generic_min_thresholds_can_require_richer_candidates(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="growth-lane",
+        lane_kind="incubator",
+    )
+    spec.evolution.rung0_thresholds = {"min_complexity_score": 99.0}
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    candidate = Candidate(ident="cand-growth", spec=spec.model_copy(deep=True))
+    runner._evaluate_candidate(candidate)
+    assert candidate.status == "failed"
+
+
+def test_edge_score_prefers_near_budget_candidates(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="edge-lane",
+        lane_kind="incubator",
+    )
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+
+    small = Candidate(ident="small", spec=spec.model_copy(deep=True))
+    near_edge = Candidate(ident="near-edge", spec=spec.model_copy(deep=True))
+    runner._evaluate_candidate(small)
+    runner._evaluate_candidate(near_edge)
+
+    small.metrics["artifact_total_bytes"] = 8_000_000.0
+    near_edge.metrics["artifact_total_bytes"] = 15_400_000.0
+    runner._annotate_official_submission_metrics(small)
+    runner._annotate_official_submission_metrics(near_edge)
+
+    assert near_edge.metrics["artifact_budget_edge_score"] > small.metrics["artifact_budget_edge_score"]
+
+
+def test_edge_score_respects_parameter_golf_target_window(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="edge-lane-tight",
+        lane_kind="incubator",
+        target_budget_utilization=0.99,
+        target_budget_under_window=0.05,
+        target_budget_over_window=0.02,
+    )
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+
+    below_target = Candidate(ident="below-target", spec=spec.model_copy(deep=True))
+    at_target = Candidate(ident="at-target", spec=spec.model_copy(deep=True))
+    runner._evaluate_candidate(below_target)
+    runner._evaluate_candidate(at_target)
+
+    below_target.metrics["artifact_total_bytes"] = 15_400_000.0
+    at_target.metrics["artifact_total_bytes"] = 15_840_000.0
+    runner._annotate_official_submission_metrics(below_target)
+    runner._annotate_official_submission_metrics(at_target)
+
+    assert at_target.metrics["artifact_budget_edge_score"] > below_target.metrics["artifact_budget_edge_score"]
+
+
+def test_template_learning_bootstraps_seed_file(tmp_path: Path, tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    seed_path = tmp_path / "seed_templates.yaml"
+    save_path = tmp_path / "learned" / "templates.yaml"
+    seed_payload = (
+        "templates:\n  - name: seed-one\n    weight: 1.0\n    conditions: {}\n    actions: []\n"
+    )
+    seed_path.write_text(seed_payload)
+    spec.evolution.template_learning = True
+    spec.evolution.template_learning_seed_path = str(seed_path)
+    spec.evolution.template_learning_save_path = str(save_path)
+
+    EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+
+    assert save_path.exists()
+    assert save_path.read_text() == seed_payload
+
+
+def test_incubator_lane_never_marks_candidate_main_track_eligible(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="incubator_keep90",
+        lane_kind="incubator",
+        incubator_anchor_post_quant_val_bpb=3.65,
+    )
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    candidate = Candidate(ident="cand-incubator", spec=spec.model_copy(deep=True))
+    runner._evaluate_candidate(candidate)
+    assert candidate.metrics["main_track_eligible_est"] == 0.0
+    assert candidate.metadata["lane_kind"] == "incubator"
+
+
+def test_incubator_rediscovery_counts_across_seed_families(tiny_spec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="incubator_keep90",
+        lane_kind="incubator",
+        incubator_anchor_post_quant_val_bpb=3.65,
+    )
+    runner = EvolutionRunner(
+        base_spec=spec,
+        evolution_cfg=spec.evolution,
+        mode="simulate",
+        seed=123,
+    )
+    candidate = Candidate(ident="cand-incubator", spec=spec.model_copy(deep=True))
+    candidate.metrics["post_quant_val_bpb"] = 3.65
+    runner._annotate_seed_lane_metadata(candidate)
+    signature = candidate.metadata["motif_signature"]
+    runner._motif_families[signature] = {"exact_official_baseline"}
+
+    runner._annotate_incubator_metrics(candidate)
+
+    assert candidate.metrics["motif_appearance_count"] == 2.0
+    assert candidate.metrics["motif_transfer_eligible"] == 1.0
+    assert candidate.metadata["motif_promotion"]["reason"] == "rediscovered"

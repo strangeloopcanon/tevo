@@ -10,7 +10,15 @@ from typing import Any
 import torch
 import ujson as json
 
+from .data import DataModule
 from .dsl import ArchitectureSpec, load_architecture_spec, save_architecture_spec
+from .parameter_golf import ParameterGolfDataModule
+from .parameter_golf_export import (
+    build_official_submission_plan,
+    export_parameter_golf_workspace,
+)
+from .parameter_golf_runtime import preflight_parameter_golf_config, run_parameter_golf_benchmark
+from .parameter_golf_seeded import transfer_parameter_golf_motif
 from .train_recipe import (
     TrainRecipe,
     TrainRecipeTarget,
@@ -31,9 +39,15 @@ __all__ = [
     "run_evolution",
     "export_frontier_seed",
     "export_train_recipe",
+    "export_parameter_golf_workspace",
+    "build_official_submission_plan",
+    "preflight_parameter_golf_config",
+    "build_data_module_for_spec",
     "render_train_recipe",
     "prune_checkpoints",
     "convert_checkpoints",
+    "run_parameter_golf_benchmark",
+    "transfer_parameter_golf_motif",
 ]
 
 
@@ -55,6 +69,27 @@ def load_recipe(path: str | Path) -> TrainRecipe:
 def save_recipe(recipe: TrainRecipe, path: str | Path) -> None:
     """Persist a train recipe to disk."""
     save_train_recipe(recipe, path)
+
+
+def build_data_module_for_spec(
+    spec: ArchitectureSpec,
+    *,
+    seed: int | None = None,
+) -> DataModule | ParameterGolfDataModule:
+    """Construct the right training data module for a spec.
+
+    Parameter Golf specs use the challenge shard reader instead of the generic
+    Hugging Face-backed data module.
+    """
+    seed_val = int(seed if seed is not None else getattr(spec.train, "seed", 0) or 0)
+    if spec.parameter_golf is not None:
+        return ParameterGolfDataModule(
+            spec.parameter_golf,
+            seq_len=spec.data.seq_len,
+            batch_size=spec.data.batch_size,
+            seed=seed_val,
+        )
+    return DataModule(spec.data, seed=seed_val)
 
 
 def run_evolution(
@@ -283,9 +318,7 @@ def convert_checkpoints(
             processed.append(path)
             continue
 
-        state = torch.load(
-            path, map_location="cpu"
-        )  # nosec B614 - loading trusted local checkpoints
+        state = torch.load(path, map_location="cpu")  # nosec B614 - loading trusted local checkpoints
         if not isinstance(state, dict):
             msg = f"Checkpoint {path} did not contain a state_dict mapping"
             raise ValueError(msg)

@@ -1,0 +1,112 @@
+templates:
+  - name: seed-pg-muon-block256
+    weight: 1.8
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 256
+          warmup: 32
+          clip: 1.0
+
+  - name: seed-pg-muon-block256-ns7
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 7
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 256
+          warmup: 32
+          clip: 1.0
+
+  - name: seed-pg-muon-block256-blend
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 256
+          update_filter_momentum_blend: 0.25
+          warmup: 32
+          clip: 1.0
+
+  - name: seed-pg-adamw-full-update
+    weight: 0.6
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: adamw
+          lr: 0.00085
+          gradient_transform_mode: identity
+          update_filter_mode: none
+          warmup: 64
+          clip: 1.0
+
+  - name: seed-pg-softmax-qkscale
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_attn:
+          selector: random_dense
+          qk_norm: rms
+          softcap: 16.0
+          qk_scale: 0.125
+
+  - name: seed-pg-softmax-layer-qk
+    weight: 0.6
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_attn:
+          selector: random_dense
+          qk_norm: layer
+          softcap: 12.0
+
+  - name: seed-pg-block-filter-qkscale
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 256
+          warmup: 32
+          clip: 1.0
+      - tune_attn:
+          selector: random_dense
+          qk_norm: rms
+          softcap: 16.0
+          qk_scale: 0.125

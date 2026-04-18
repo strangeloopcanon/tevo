@@ -1,0 +1,125 @@
+model:
+  name: pg-seed-incubator-keep90
+  emb:
+    dim: 512
+    vocab: 1024
+    init_std: 0.005
+  blocks:
+    - &official_block
+      attn:
+        kind: GQA
+        heads: 8
+        head_dim: 64
+        kv_groups: 2
+        rope: standard
+        rope_theta: 10000.0
+        softmax:
+          qk_norm: rms
+          softcap: 30.0
+      ffn:
+        type: dense
+        hidden: 1024
+        activation: relu_squared
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+  head:
+    vocab: 1024
+    tie_embeddings: true
+
+train:
+  lr: 0.04
+  matrix_lr: 0.04
+  scalar_lr: 0.04
+  tied_embedding_lr: 0.05
+  warmup: 20
+  warmdown_steps: 1200
+  clip: 0.0
+  bf16: true
+  grad_ckpt: false
+  batch_tokens: 65536
+  max_tokens: 10485760000
+  weight_decay: 0.0
+  seed: 0
+  optimizer:
+    name: muon
+    weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_ns_steps: 5
+    muon_momentum_warmup_start: 0.85
+    muon_momentum_warmup_steps: 500
+    gradient_transform:
+      mode: orthogonalize_2d
+      ns_steps: 5
+      eps: 1.0e-7
+    update_filter:
+      mode: bernoulli
+      keep_ratio: 0.9
+      granularity: block
+      block_size: 256
+
+data:
+  tokenizer: parameter-golf
+  seq_len: 1024
+  batch_size: 8
+  workers: 0
+  eval_tokens: 524288
+  shards:
+    - name: parameter-golf
+      split: train
+      weight: 1.0
+
+parameter_golf:
+  train_shards_glob: runs/parameter_golf_scout_data/train_*.bin
+  val_shards_glob: runs/parameter_golf_scout_data/val_*.bin
+  tokenizer_path: runs/parameter_golf/tokenizers/sp1024.model
+  artifact_budget_bytes: 16000000
+  code_bytes: 50000
+  track: 10min
+  seed_family: incubator_keep90
+  lane_kind: incubator
+  tied_embedding_export_dtype: int8
+  incubator_anchor_post_quant_val_bpb: 3.653702773958983
+  motif_promote_min_delta: 0.01
+  max_wallclock_seconds: 180
+  val_batch_tokens: 524288
+  val_loss_every: 200
+  train_log_every: 50
+
+evolution:
+  population: 12
+  rung1_tokens: 16777216
+  rung2_tokens: 67108864
+  mutation_steps: 1
+  crossover_prob: 0.0
+  parent_selection: map_elites
+  weight_inheritance: scratch
+  template_learning: true
+  template_learning_seed_path: configs/pg_seed_incubator_keep90_templates.yaml
+  template_learning_save_path: runs/parameter_golf_seed_templates/incubator_keep90.yaml
+  mutation_allowlist:
+    - toggle_update_filter_mode
+    - tune_update_filter_ratio
+    - tune_update_filter_granularity
+    - tune_update_filter_block_size
+    - tune_update_filter_momentum_blend
+    - tune_warmup
+    - tune_warmdown
+    - tune_clip
+    - tune_softmax_policy
+  objectives:
+    post_quant_val_bpb: min
+    motif_transfer_eligible: max
+    motif_anchor_delta_bpb: max
+    official_submission_code_bytes_est: min
+    artifact_total_bytes: min
+    throughput: max
+  rung0_thresholds:
+    max_params: 28000000
+    max_artifact_total_bytes_est: 24000000
+    max_artifact_total_bytes: 16000000

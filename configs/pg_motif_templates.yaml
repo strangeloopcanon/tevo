@@ -1,0 +1,107 @@
+templates:
+  - name: seed-pg-rms-softcap-gqa
+    weight: 1.4
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_attn:
+          selector: random_dense
+          kind: GQA
+          kv_groups: 4
+          qk_norm: rms
+          softcap: 16.0
+
+  - name: seed-pg-mqa-width
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_attn:
+          selector: random_dense
+          kind: MQA
+          qk_norm: rms
+          softcap: 16.0
+      - tune_ffn:
+          selector: random_dense
+          hidden_mult: 3.5
+          activation: swiglu
+
+  - name: seed-pg-mla-probe
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_attn:
+          selector: random_dense
+          kind: MLA
+          kv_latent_dim: 128
+          value_glu: true
+          qk_norm: rms
+          softcap: 16.0
+
+  - name: seed-pg-wide-swiglu
+    weight: 1.1
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_ffn:
+          selector: random_dense
+          hidden_mult: 4.0
+          activation: swiglu
+
+  - name: seed-pg-trim-gelu
+    weight: 0.8
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_ffn:
+          selector: random_dense
+          hidden_mult: 3.0
+          activation: gelu
+
+  - name: seed-pg-muon-block-filter
+    weight: 1.3
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.001
+          gradient_transform_mode: orthogonalize_2d
+          gradient_transform_ns_steps: 5
+          gradient_transform_eps: 1.0e-8
+          update_filter_mode: bernoulli
+          update_filter_keep_ratio: 0.65
+          update_filter_granularity: block
+          update_filter_block_size: 128
+          update_filter_momentum_blend: 0.25
+          warmup: 48
+          clip: 1.0
+
+  - name: seed-pg-adamw-full-update
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: adamw
+          lr: 0.00085
+          gradient_transform_mode: identity
+          update_filter_mode: none
+          warmup: 64
+          clip: 1.0
+
+  - name: seed-pg-tail-recurrence
+    weight: 0.8
+    conditions:
+      parameter_golf_only: true
+      requires_no_recurrence: true
+      min_blocks: 6
+    actions:
+      - set_recurrence:
+          tail_blocks: 3
+          adapter: gated
+          concat_prelude: true
+          train_recurrence: 1
+          max_train_recurrence: 3
+          test_recurrences: [1, 2, 4]

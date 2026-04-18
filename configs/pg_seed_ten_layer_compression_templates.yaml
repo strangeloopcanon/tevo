@@ -1,0 +1,31 @@
+templates:
+  - name: seed-ten-layer-anchor
+    weight: 1.2
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+  - name: seed-ten-layer-decoupled-wd
+    weight: 1.1
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embed_init_std: 0.004
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0

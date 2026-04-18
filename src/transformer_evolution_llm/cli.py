@@ -17,10 +17,16 @@ from . import get_version
 from .api import (
     convert_checkpoints,
     export_frontier_seed,
+    export_parameter_golf_workspace,
     export_train_recipe,
+    load_spec,
+    preflight_parameter_golf_config,
     prune_checkpoints,
     render_train_recipe,
     run_evolution,
+    run_parameter_golf_benchmark,
+    save_spec,
+    transfer_parameter_golf_motif,
 )
 from .cache_builder import synthesize_cache
 from .cuda_transfer import (
@@ -33,6 +39,7 @@ from .cuda_transfer import (
     run_public_cuda_transfer_modal_benchmarks,
     train_recipe_target_for_flavor,
 )
+from .parameter_golf_runtime import rescore_parameter_golf_checkpoint
 from .mlx_transfer import (
     audit_tevo_regions_from_paths,
     build_public_transfer_report,
@@ -96,6 +103,124 @@ def run(
 ) -> None:
     """Execute an evolutionary search run."""
     run_evolution(config_path=config, generations=generations, mode=mode, seed=seed, out_path=out)
+
+
+@app.command("parameter-golf-benchmark")
+def parameter_golf_benchmark_cmd(
+    config: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+    out: Annotated[Path, typer.Option()] = Path("runs/parameter_golf_benchmark.json"),
+    checkpoint_dir: Annotated[Path, typer.Option()] = Path("runs/parameter_golf_checkpoints"),
+    steps: Annotated[int | None, typer.Option(min=1)] = None,
+    eval_batches: Annotated[int, typer.Option(min=1)] = 2,
+    device: Annotated[str | None, typer.Option()] = None,
+    max_tokens: Annotated[int | None, typer.Option(min=1)] = None,
+    seed: Annotated[int | None, typer.Option()] = None,
+) -> None:
+    """Train a single Parameter Golf spec and write a benchmark summary."""
+    summary = run_parameter_golf_benchmark(
+        config,
+        out_path=out,
+        checkpoint_dir=checkpoint_dir,
+        steps=steps,
+        eval_batches=eval_batches,
+        device=device,
+        max_tokens=max_tokens,
+        seed=seed,
+    )
+    console.print(f"[bold green]Parameter Golf summary written:[/] {out}")
+    console.print(
+        f"val_bpb={summary['metrics'].get('val_bpb', float('nan')):.6f} "
+        f"artifact_total_bytes={summary['metrics'].get('artifact_total_bytes', float('nan')):.0f}"
+    )
+
+
+@app.command("parameter-golf-rescore")
+def parameter_golf_rescore_cmd(
+    config: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+    checkpoint: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+    out: Annotated[Path, typer.Option()] = Path("runs/parameter_golf_rescore.json"),
+    device: Annotated[str | None, typer.Option()] = None,
+    val_batch_tokens: Annotated[int | None, typer.Option(min=1)] = None,
+    eval_protocol: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    """Re-score an existing Parameter Golf checkpoint without retraining it."""
+    summary = rescore_parameter_golf_checkpoint(
+        config,
+        checkpoint,
+        out_path=out,
+        device=device,
+        val_batch_tokens=val_batch_tokens,
+        eval_protocol=eval_protocol,
+    )
+    console.print(f"[bold green]Parameter Golf rescore written:[/] {out}")
+    console.print(
+        f"val_bpb={summary['metrics'].get('val_bpb', float('nan')):.6f} "
+        f"artifact_total_bytes={summary['metrics'].get('artifact_total_bytes', float('nan')):.0f}"
+    )
+    if "parameter_golf_error_message" in summary:
+        console.print(f"[yellow]parameter_golf_error:[/] {summary['parameter_golf_error_message']}")
+
+
+@app.command("parameter-golf-preflight")
+def parameter_golf_preflight_cmd(
+    config: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+) -> None:
+    """Resolve Parameter Golf inputs and print size estimates without training."""
+    report = preflight_parameter_golf_config(config)
+    console.print_json(data=report)
+
+
+@app.command("parameter-golf-export")
+def parameter_golf_export_cmd(
+    source: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+    out: Annotated[Path, typer.Argument(help="Output directory for the exported workspace.")],
+    candidate_id: Annotated[
+        str | None,
+        typer.Option(help="Optional frontier candidate id when exporting from frontier JSON."),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option(help="Export mode: official for compact submission lane, tevo for legacy."),
+    ] = "official",
+    official_train_py: Annotated[
+        Path | None,
+        typer.Option(
+            help="Optional local path to parameter-golf/train_gpt.py for official exports."
+        ),
+    ] = None,
+) -> None:
+    """Export a TEVO spec into an official-style or legacy Parameter Golf workspace."""
+    metadata = export_parameter_golf_workspace(
+        source,
+        out,
+        candidate_id=candidate_id,
+        mode=mode,
+        official_train_py=official_train_py,
+    )
+    console.print(f"[bold green]Parameter Golf workspace written:[/] {out}")
+    console.print(
+        f"code_bytes={metadata['code_bytes']} "
+        f"artifact_total_bytes_est={metadata['artifact_total_bytes_est']}"
+    )
+
+
+@app.command("parameter-golf-transfer-motif")
+def parameter_golf_transfer_motif_cmd(
+    source: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+    target: Annotated[Path, typer.Argument(..., exists=True, readable=True)],
+    out: Annotated[Path, typer.Argument(help="Output path for the transferred spec.")],
+    include_context: Annotated[bool, typer.Option()] = False,
+    include_structure: Annotated[bool, typer.Option()] = False,
+) -> None:
+    """Copy a discovered Parameter Golf motif into another seed family."""
+    transferred = transfer_parameter_golf_motif(
+        load_spec(source),
+        load_spec(target),
+        include_context=include_context,
+        include_structure=include_structure,
+    )
+    save_spec(transferred, out)
+    console.print(f"[bold green]Transferred motif spec written:[/] {out}")
 
 
 @app.command("cache")

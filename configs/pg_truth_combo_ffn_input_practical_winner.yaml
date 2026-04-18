@@ -1,0 +1,128 @@
+model:
+  name: pg-truth-combo-ffn-input-practical-winner
+  emb:
+    dim: 512
+    vocab: 1024
+    init_std: 0.005
+  blocks:
+    - &official_block
+      attn:
+        kind: GQA
+        heads: 8
+        head_dim: 64
+        kv_groups: 2
+        rope: standard
+        rope_theta: 10000.0
+        softmax:
+          qk_norm: rms
+          softcap: 30.0
+      ffn:
+        type: dense
+        hidden: 1024
+        activation: relu_squared
+        input_source: residual
+    - attn:
+        kind: GQA
+        heads: 8
+        head_dim: 64
+        kv_groups: 2
+        rope: standard
+        rope_theta: 10000.0
+        softmax:
+          qk_norm: rms
+          softcap: 30.0
+      ffn:
+        type: dense
+        hidden: 1024
+        activation: relu_squared
+        input_source: embedding
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+    - *official_block
+  head:
+    vocab: 1024
+    tie_embeddings: true
+
+train:
+  lr: 0.04
+  matrix_lr: 0.04
+  scalar_lr: 0.04
+  tied_embedding_lr: 0.08
+  weight_decay: 0.005
+  warmup: 10
+  warmdown_steps: 600
+  clip: 0.0
+  bf16: true
+  grad_ckpt: false
+  batch_tokens: 524288
+  max_tokens: 10485760000
+  seed: 0
+  optimizer:
+    name: muon
+    weight_decay: 0.005
+    muon_momentum: 0.95
+    muon_ns_steps: 5
+    muon_momentum_warmup_start: 0.85
+    muon_momentum_warmup_steps: 500
+    gradient_transform:
+      mode: identity
+      ns_steps: 5
+      eps: 1.0e-8
+    update_filter:
+      mode: none
+
+data:
+  tokenizer: parameter-golf
+  seq_len: 1024
+  batch_size: 8
+  workers: 0
+  eval_tokens: 524288
+  shards:
+    - name: parameter-golf
+      split: train
+      weight: 1.0
+
+parameter_golf:
+  train_shards_glob: runs/parameter_golf/fineweb10b_sp1024/train_*.bin
+  val_shards_glob: runs/parameter_golf/fineweb10b_sp1024/val_*.bin
+  tokenizer_path: runs/parameter_golf/tokenizers/sp1024.model
+  artifact_budget_bytes: 16000000
+  code_bytes: 50000
+  track: 10min
+  seed_family: combo_ffn_input_practical_truth
+  lane_kind: exportable
+  exportable_family: combo_ffn_input_practical_truth
+  tied_embedding_export_dtype: int8
+  max_wallclock_seconds: 600
+  val_batch_tokens: 524288
+  val_loss_every: 200
+  train_log_every: 50
+
+evolution:
+  population: 12
+  rung1_tokens: 16777216
+  rung2_tokens: 67108864
+  mutation_steps: 2
+  crossover_prob: 0.0
+  parent_selection: map_elites
+  weight_inheritance: scratch
+  mutation_allowlist:
+    - tune_parameter_group_lrs
+    - tune_warmdown
+  objectives:
+    post_quant_val_bpb: min
+    main_track_eligible_exact: max
+    official_submission_code_bytes_est: min
+    artifact_total_bytes: min
+    throughput: max
+  rung0_thresholds:
+    max_params: 36000000
+    max_artifact_total_bytes_est: 26000000
+    max_artifact_total_bytes: 16000000
+    max_official_submission_fatal_reason_count: 0
+    max_official_submission_unsupported_patch_reason_count: 0
+    max_official_submission_code_over_budget_bytes_est: 0

@@ -1,0 +1,207 @@
+model:
+  name: pg-tomorrow-seed-11l-smear-bigram
+  emb:
+    dim: 576
+    vocab: 1024
+    init_std: 0.005
+  bigram_hash:
+    buckets: 8192
+    scale: 0.09
+    init_std: 0.01
+  blocks:
+    - &smear_block
+      attn:
+        kind: GQA
+        heads: 9
+        head_dim: 64
+        kv_groups: 3
+        rope: standard
+        rope_theta: 10000.0
+        softmax:
+          qk_norm: rms
+          softcap: 28.0
+      ffn:
+        type: dense
+        hidden: 3072
+        activation: relu_squared
+        input_source: residual
+      extras:
+        - type: smear_gate
+          width: 4
+          init_weight: 0.1
+          learnable: true
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+    - *smear_block
+  head:
+    vocab: 1024
+    tie_embeddings: true
+  norm: rmsnorm
+
+train:
+  lr: 0.018
+  matrix_lr: 0.018
+  scalar_lr: 0.036
+  tied_embedding_lr: 0.04
+  weight_decay: 0.04
+  warmup: 24
+  warmdown_steps: 600
+  clip: 0.28
+  bf16: true
+  grad_checkpoint: false
+  batch_tokens: 786432
+  max_tokens: 10485760000
+  seed: 0
+  ppl_stop_threshold: 2.5
+  speedrun_eval_interval: 0
+  optimizer:
+    name: muon
+    weight_decay: 0.04
+    muon_momentum: 0.99
+    muon_ns_steps: 5
+    muon_momentum_warmup_start: 0.9
+    muon_momentum_warmup_steps: 220
+    gradient_transform:
+      mode: identity
+      ns_steps: 5
+      eps: 1.0e-8
+    update_filter:
+      mode: none
+
+data:
+  tokenizer: parameter-golf
+  seq_len: 2048
+  batch_size: 5
+  workers: 0
+  eval_tokens: 786432
+  shards:
+    - name: parameter-golf
+      split: train
+      weight: 1.0
+
+parameter_golf:
+  train_shards_glob: runs/parameter_golf/fineweb10b_sp1024/train_*.bin
+  val_shards_glob: runs/parameter_golf/fineweb10b_sp1024/val_*.bin
+  tokenizer_path: runs/parameter_golf/tokenizers/sp1024.model
+  artifact_budget_bytes: 16000000
+  code_bytes: 50000
+  track: 10min
+  seed_family: tomorrow_smear_bigram
+  lane_kind: incubator
+  exportable_family: null
+  tied_embedding_export_dtype: fp16
+  export_quant_mode: mixed_i5_i6
+  eval_protocol: mid_fidelity
+  report_eval_modes:
+    - standard
+    - sliding64
+  target_budget_utilization: 0.98
+  target_budget_under_window: 0.18
+  target_budget_over_window: 0.04
+  max_wallclock_seconds: 600
+  val_batch_tokens: 786432
+  val_loss_every: 200
+  train_log_every: 50
+
+evolution:
+  population: 16
+  rung1_tokens: 16777216
+  rung2_tokens: 67108864
+  mutation_steps: 4
+  crossover_prob: 0.2
+  parent_selection: map_elites
+  weight_inheritance: scratch
+  topk_keep: 0.5
+  archive_max_elites: 16
+  map_elites_complexity_band: true
+  complexity_band_width: 3.0
+  structural_elite_k: 4
+  objectives:
+    post_quant_val_bpb: min
+    artifact_budget_edge_score: max
+    complexity_score: max
+    throughput: max
+  rung0_thresholds:
+    max_params: 110000000
+    max_artifact_total_bytes_est: 42000000
+    max_artifact_total_bytes: 16000000
+    max_official_submission_fatal_reason_count: 999
+    max_official_submission_unsupported_patch_reason_count: 999
+    max_official_submission_code_over_budget_bytes_est: 999999999
+    min_layers: 10
+    min_seq_len: 1536
+    min_artifact_budget_utilization_est: 0.82
+    min_artifact_budget_edge_score_est: 0.72
+    min_complexity_score: 15.0
+  gate_schedule:
+    - generation: 6
+      thresholds:
+        min_artifact_budget_utilization_est: 0.88
+        min_artifact_budget_edge_score_est: 0.8
+        min_complexity_score: 16.5
+    - generation: 12
+      thresholds:
+        min_artifact_budget_utilization_est: 0.93
+        min_artifact_budget_edge_score_est: 0.88
+        min_complexity_score: 18.0
+  mutation_allowlist:
+    - tune_parameter_group_lrs
+    - tune_optimizer_weight_decay
+    - tune_muon_momentum
+    - tune_muon_momentum_warmup
+    - tune_warmup
+    - tune_warmdown
+    - tune_clip
+    - tune_tied_embedding_export_dtype
+    - tune_parameter_golf_export_quant_mode
+    - tune_parameter_golf_context
+    - tune_train_recipe_attn_shape
+    - tune_attn_shape
+    - tune_rope
+    - toggle_selector
+    - toggle_train_recipe_qk_norm
+    - toggle_train_recipe_norm
+    - tune_softmax_policy
+    - tune_ffn_width_activation
+    - toggle_ffn_input_source
+    - add_embedding_ffn_branch
+    - tune_embedding_ffn_branch
+    - remove_embedding_ffn_branch
+    - insert_bigram_hash
+    - tune_bigram_hash
+    - insert_smear_gate
+    - tune_smear_gate
+    - dense_to_moe
+    - shift_moe
+    - mutate_topk
+    - tune_experts
+    - tune_router
+    - add_recurrence
+    - add_additional_recurrence
+    - tune_recurrence
+    - insert_assoc_memory
+    - tune_assoc_memory
+    - insert_memory_tokens
+    - tune_memory_tokens
+    - insert_chunk_memory
+    - tune_chunk_memory
+    - insert_lookup_memory
+    - tune_lookup_memory
+    - toggle_branch_router
+    - tune_branch_router
+    - insert_layer_scale
+    - tune_layer_scale
+    - toggle_linear_attention
+    - toggle_mla_attention
+    - tune_attn_sparsity
+    - toggle_hyper_connections
+    - tune_hyper_connections
+    - duplicate_block_span
+    - add_extra_combo

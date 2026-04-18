@@ -1,0 +1,31 @@
+templates:
+  - name: seed-long-context-anchor
+    weight: 1.3
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+  - name: seed-long-context-fast-matrix
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.05
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 2400
+          clip: 0.0

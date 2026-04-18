@@ -1,4 +1,9 @@
-from transformer_evolution_llm.dsl import ArchitectureSpec, HyperConnectionsConfig, StencilConfig
+from transformer_evolution_llm.dsl import (
+    ArchitectureSpec,
+    HyperConnectionsConfig,
+    RecurrenceConfig,
+    StencilConfig,
+)
 from transformer_evolution_llm.evaluation import (
     StaticChecker,
     estimate_flops_per_token,
@@ -89,3 +94,41 @@ def test_static_checker_validates_local_global_from_stencil(tiny_spec: Architect
     result = StaticChecker().run(spec)
     assert not result.ok
     assert any("local_global requires positive sliding_window" in r for r in result.reasons)
+
+
+def test_estimate_params_counts_recurrence_adapters(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks.append(spec.model.blocks[0].model_copy(deep=True))
+    base = estimate_params(spec)
+    spec.model.recurrences = [
+        RecurrenceConfig(
+            start=0,
+            end=2,
+            adapter="gated",
+            concat_prelude=True,
+            train_recurrence=1,
+            max_train_recurrence=2,
+        )
+    ]
+    expected = 2.0 * float(spec.model.emb.dim * (spec.model.emb.dim * 2))
+    assert estimate_params(spec) == base + expected
+
+
+def test_estimate_params_counts_shared_blocks_once(tiny_spec: ArchitectureSpec) -> None:
+    single = tiny_spec.model_copy(deep=True)
+
+    shared = tiny_spec.model_copy(deep=True)
+    shared_block = shared.model.blocks[0].model_copy(deep=True)
+    shared_block.share_with = 0
+    shared.model.blocks.append(shared_block)
+
+    duplicated = tiny_spec.model_copy(deep=True)
+    duplicated.model.blocks.append(duplicated.model.blocks[0].model_copy(deep=True))
+
+    assert estimate_params(shared) == estimate_params(single)
+    assert estimate_params(duplicated) > estimate_params(shared)
+
+    metrics = StaticChecker().run(shared).metrics
+    assert metrics["effective_depth"] == 2.0
+    assert metrics["physical_depth"] == 1.0
+    assert metrics["shared_blocks"] == 1.0

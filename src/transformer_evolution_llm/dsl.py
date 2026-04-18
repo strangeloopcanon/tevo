@@ -565,6 +565,14 @@ class HeadConfig(BaseModel):
     vocab: int = Field(gt=0)
 
 
+class BigramHashConfig(BaseModel):
+    """Hashed bigram side-channel added directly to token embeddings."""
+
+    buckets: int = Field(gt=0)
+    scale: float = Field(default=0.1, gt=0.0)
+    init_std: float = Field(default=0.02, gt=0.0)
+
+
 class RetroConfig(BaseModel):
     """Retro-attention style memory augmentation."""
 
@@ -681,6 +689,15 @@ class LayerScaleConfig(BaseModel):
     learnable: bool = True
 
 
+class SmearGateConfig(BaseModel):
+    """Causal smoothing gate that mixes local context before a residual add."""
+
+    type: Literal["smear_gate"] = "smear_gate"
+    width: int = Field(default=4, gt=0)
+    init_weight: float = Field(default=0.1, ge=0.0, le=1.0)
+    learnable: bool = True
+
+
 ExtraModuleConfig = Annotated[
     RetroConfig
     | GatedModuleConfig
@@ -690,7 +707,8 @@ ExtraModuleConfig = Annotated[
     | ChunkMemoryConfig
     | LookupMemoryConfig
     | BranchRouterConfig
-    | LayerScaleConfig,
+    | LayerScaleConfig
+    | SmearGateConfig,
     Field(discriminator="type"),
 ]
 
@@ -701,6 +719,11 @@ class BlockConfig(BaseModel):
     name: str | None = None
     origin_id: str | None = None
     parent_origin: str | None = None
+    share_with: int | None = Field(
+        default=None,
+        ge=0,
+        description="Optional earlier block index whose weights this logical block reuses.",
+    )
     attn: AttentionConfig | None = None
     ffn: FfnConfig | None = None
     ffn_memory: FfnConfig | None = None
@@ -709,6 +732,7 @@ class BlockConfig(BaseModel):
 
     def describe(self) -> dict[str, Any]:
         return {
+            "share_with": self.share_with,
             "attn": self.attn.model_dump(mode="python") if self.attn else None,
             "ffn": self.ffn.model_dump(mode="python") if self.ffn else None,
             "ffn_memory": self.ffn_memory.model_dump(mode="python") if self.ffn_memory else None,
@@ -760,10 +784,41 @@ class TrainSchedule(BaseModel):
 
     lr: float = Field(gt=0)
     warmup: int = Field(default=2000, ge=0)
-    clip: float = Field(default=1.0, gt=0.0)
+    warmdown_steps: int = Field(default=0, ge=0)
+    clip: float = Field(default=1.0, ge=0.0)
     bf16: bool = True
     grad_checkpoint: bool = Field(default=True, alias="grad_ckpt")
+    batch_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description="Target tokens per optimizer step after gradient accumulation.",
+    )
     max_tokens: int | None = Field(default=None, ge=0)
+    embed_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Optional dedicated learning rate for untied token embeddings.",
+    )
+    head_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Optional dedicated learning rate for an untied LM head.",
+    )
+    matrix_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Optional dedicated learning rate for matrix-shaped parameters.",
+    )
+    scalar_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Optional dedicated learning rate for scalar/vector/control parameters.",
+    )
+    tied_embedding_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Optional dedicated learning rate for a tied input/output embedding matrix.",
+    )
     weight_decay: float = Field(default=0.01, ge=0.0)
     seed: int = 0
     # MoE routing auxiliaries (optional)
@@ -843,6 +898,8 @@ class OptimizerConfig(BaseModel):
     muon_momentum: float | None = Field(default=None, ge=0.0, le=1.0)
     muon_nesterov: bool = True
     muon_ns_steps: int = Field(default=5, ge=1)
+    muon_momentum_warmup_start: float | None = Field(default=None, ge=0.0, le=1.0)
+    muon_momentum_warmup_steps: int = Field(default=0, ge=0)
     gradient_transform: GradientTransformConfig = Field(
         default_factory=lambda: GradientTransformConfig()
     )
@@ -938,11 +995,65 @@ class DataConfig(BaseModel):
         return sum(shard.weight for shard in self.shards)
 
 
+class ParameterGolfConfig(BaseModel):
+    """Challenge-specific paths and artifact limits for OpenAI Parameter Golf."""
+
+    train_shards_glob: str
+    val_shards_glob: str
+    tokenizer_path: str
+    artifact_budget_bytes: int = Field(default=16_000_000, gt=0)
+    code_bytes: int = Field(default=50_000, ge=0)
+    track: Literal["10min", "non_record"] = "10min"
+    seed_family: str | None = None
+    lane_kind: Literal["exportable", "incubator"] = "exportable"
+    exportable_family: str | None = None
+    tied_embedding_export_dtype: Literal["int8", "fp16"] = "int8"
+    export_quant_mode: Literal["int8", "int6", "int5", "mixed_i5_i6"] = "int8"
+    incubator_anchor_post_quant_val_bpb: float | None = Field(default=None, gt=0.0)
+    motif_promote_min_delta: float = Field(default=0.01, ge=0.0)
+    max_wallclock_seconds: float | None = Field(default=None, gt=0.0)
+    val_batch_tokens: int | None = Field(default=None, gt=0)
+    val_loss_every: int = Field(default=0, ge=0)
+    train_log_every: int = Field(default=0, ge=0)
+    eval_protocol: Literal["scout_fast", "mid_fidelity", "truth_full"] | None = None
+    report_eval_modes: list[Literal["standard", "sliding64"]] = Field(
+        default_factory=lambda: ["standard"]
+    )
+    target_budget_utilization: float = Field(default=0.96, gt=0.0, le=1.0)
+    target_budget_under_window: float = Field(default=0.35, gt=0.0)
+    target_budget_over_window: float = Field(default=0.10, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> ParameterGolfConfig:
+        for field_name in ("train_shards_glob", "val_shards_glob", "tokenizer_path"):
+            raw = getattr(self, field_name)
+            if not str(raw or "").strip():
+                raise ValueError(f"parameter_golf.{field_name} must be a non-empty path or glob")
+        if self.lane_kind == "incubator":
+            self.exportable_family = None
+        elif not str(self.exportable_family or "").strip():
+            self.exportable_family = self.seed_family
+        if self.eval_protocol is None:
+            wallclock = float(self.max_wallclock_seconds) if self.max_wallclock_seconds else 600.0
+            self.eval_protocol = "scout_fast" if wallclock < 600.0 else "mid_fidelity"
+        report_modes: list[str] = []
+        for mode in self.report_eval_modes:
+            if mode not in report_modes:
+                report_modes.append(mode)
+        if not report_modes:
+            report_modes = ["standard"]
+        if "standard" not in report_modes:
+            report_modes.insert(0, "standard")
+        self.report_eval_modes = report_modes
+        return self
+
+
 class ModelConfig(BaseModel):
     """Full architecture definition."""
 
     name: str = "candidate"
     emb: EmbeddingConfig
+    bigram_hash: BigramHashConfig | None = None
     blocks: list[BlockConfig]
     head: HeadConfig
     norm: Literal["layernorm", "rmsnorm"] = "layernorm"
@@ -958,9 +1069,63 @@ class ModelConfig(BaseModel):
             raise ValueError("Model requires at least one block.")
         return value
 
+    @model_validator(mode="after")
+    def validate_block_sharing(self) -> ModelConfig:
+        for idx, block in enumerate(self.blocks):
+            share_with = block.share_with
+            if share_with is None:
+                continue
+            if share_with >= idx:
+                raise ValueError(
+                    f"block {idx} share_with={share_with} must reference an earlier block"
+                )
+            source = self.blocks[share_with]
+            block_payload = dict(block.describe())
+            source_payload = dict(source.describe())
+            block_payload.pop("share_with", None)
+            source_payload.pop("share_with", None)
+            if block_payload != source_payload:
+                raise ValueError(
+                    f"block {idx} shares weights with block {share_with} but the block "
+                    "definitions differ; shared blocks must match structurally"
+                )
+        return self
+
     @property
     def n_layers(self) -> int:
         return len(self.blocks)
+
+    def resolve_share_source(self, idx: int) -> int:
+        source = int(idx)
+        seen: set[int] = set()
+        while True:
+            share_with = self.blocks[source].share_with
+            if share_with is None:
+                return source
+            if share_with in seen:
+                msg = f"Cyclic block sharing detected while resolving block {idx}"
+                raise ValueError(msg)
+            seen.add(share_with)
+            source = int(share_with)
+
+    def block_share_sources(self) -> list[int]:
+        return [self.resolve_share_source(idx) for idx in range(len(self.blocks))]
+
+    def physical_block_indices(self) -> list[int]:
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for source in self.block_share_sources():
+            if source in seen:
+                continue
+            seen.add(source)
+            ordered.append(source)
+        return ordered
+
+    def physical_block_count(self) -> int:
+        return len(self.physical_block_indices())
+
+    def shared_block_count(self) -> int:
+        return sum(1 for block in self.blocks if block.share_with is not None)
 
     def moe_block_count(self) -> int:
         return sum(
@@ -986,6 +1151,7 @@ class EvolutionConfig(BaseModel):
     gate_schedule: list[GateStep] = Field(default_factory=list)
     rung1_tokens: int = 200_000
     rung2_tokens: int = 1_000_000
+    mutation_steps: int = Field(default=1, ge=1)
     population: int = Field(default=12, ge=1)
     topk_keep: float = Field(default=0.33, gt=0.0, le=1.0)
     crossover_prob: float = Field(default=0.2, ge=0.0, le=1.0)
@@ -1072,6 +1238,7 @@ class EvolutionConfig(BaseModel):
     template_learning_max_templates: int = Field(default=128, ge=0)
     template_learning_save_every: int = Field(default=20, ge=1)
     template_learning_save_path: str = "configs/mutation_templates.yaml"
+    template_learning_seed_path: str | None = None
     template_learning_promote_min_delta: float = Field(default=0.0)
 
     @model_validator(mode="after")
@@ -1124,6 +1291,7 @@ class ArchitectureSpec(BaseModel):
     model: ModelConfig
     train: TrainSchedule
     data: DataConfig
+    parameter_golf: ParameterGolfConfig | None = None
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     priors: PriorConfig = Field(default_factory=PriorConfig)
 
@@ -1131,15 +1299,23 @@ class ArchitectureSpec(BaseModel):
         """Return a JSON-friendly summary for logging."""
         hyper = getattr(self.model, "hyper", None)
         hyper_streams = int(getattr(hyper, "streams", 1) or 1) if hyper is not None else 1
-        return {
+        summary = {
             "name": self.model.name,
             "layers": self.model.n_layers,
+            "physical_layers": self.model.physical_block_count(),
+            "shared_blocks": self.model.shared_block_count(),
             "moe_blocks": self.model.moe_block_count(),
             "seq_len": self.data.seq_len,
             "population": self.evolution.population,
             "custom_modules": sum(len(block.extras) for block in self.model.blocks),
             "hyper_streams": hyper_streams,
         }
+        if self.parameter_golf is not None:
+            summary["seed_family"] = self.parameter_golf.seed_family
+            summary["lane_kind"] = self.parameter_golf.lane_kind
+            summary["exportable_family"] = self.parameter_golf.exportable_family
+            summary["tied_embedding_export_dtype"] = self.parameter_golf.tied_embedding_export_dtype
+        return summary
 
 
 class ArchitectureSpecList(RootModel[list[ArchitectureSpec]]):
