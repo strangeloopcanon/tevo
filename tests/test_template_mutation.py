@@ -321,7 +321,8 @@ def test_parameter_golf_template_can_tune_attention(monkeypatch):
         ]
 
     monkeypatch.setattr(tm, "load_templates", fake_templates)
-    template_name, mutated = apply_template_mutation_named_with_name(spec, random.Random(0), "pg-attn")
+    rng = random.Random(0)  # noqa: S311 - deterministic test input
+    template_name, mutated = apply_template_mutation_named_with_name(spec, rng, "pg-attn")
     assert template_name == "pg-attn"
     assert any(block.attn and block.attn.kind == "MLA" for block in mutated.model.blocks)
     assert any(
@@ -361,7 +362,8 @@ def test_parameter_golf_template_can_tune_optimizer(monkeypatch):
         ]
 
     monkeypatch.setattr(tm, "load_templates", fake_templates)
-    template_name, mutated = apply_template_mutation_named_with_name(spec, random.Random(0), "pg-opt")
+    rng = random.Random(0)  # noqa: S311 - deterministic test input
+    template_name, mutated = apply_template_mutation_named_with_name(spec, rng, "pg-opt")
     assert template_name == "pg-opt"
     assert mutated.train.optimizer.name == "adamw"
     assert mutated.train.lr == 8.5e-4
@@ -397,7 +399,8 @@ def test_parameter_golf_template_can_set_recurrence(monkeypatch):
         ]
 
     monkeypatch.setattr(tm, "load_templates", fake_templates)
-    template_name, mutated = apply_template_mutation_named_with_name(spec, random.Random(0), "pg-rec")
+    rng = random.Random(0)  # noqa: S311 - deterministic test input
+    template_name, mutated = apply_template_mutation_named_with_name(spec, rng, "pg-rec")
     assert template_name == "pg-rec"
     assert len(mutated.model.recurrences) == 1
     recurrence = mutated.model.recurrences[0]

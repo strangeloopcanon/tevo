@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess  # nosec B404 - CLI orchestrates trusted local repo entrypoints.
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
 import typer
 import ujson as json
@@ -39,7 +39,6 @@ from .cuda_transfer import (
     run_public_cuda_transfer_modal_benchmarks,
     train_recipe_target_for_flavor,
 )
-from .parameter_golf_runtime import rescore_parameter_golf_checkpoint
 from .mlx_transfer import (
     audit_tevo_regions_from_paths,
     build_public_transfer_report,
@@ -54,6 +53,7 @@ from .mlx_transfer import (
     summarize_continuation_results,
     write_winning_seed_diff,
 )
+from .parameter_golf_runtime import rescore_parameter_golf_checkpoint
 from .train_recipe import TrainRecipeTarget, load_train_recipe, render_train_recipe_fragment
 
 app = typer.Typer(help="Evolutionary search loop utilities")
@@ -190,11 +190,13 @@ def parameter_golf_export_cmd(
     ] = None,
 ) -> None:
     """Export a TEVO spec into an official-style or legacy Parameter Golf workspace."""
+    if mode not in {"official", "tevo"}:
+        raise typer.BadParameter("mode must be 'official' or 'tevo'")
     metadata = export_parameter_golf_workspace(
         source,
         out,
         candidate_id=candidate_id,
-        mode=mode,
+        mode=cast(Literal["official", "tevo"], mode),
         official_train_py=official_train_py,
     )
     console.print(f"[bold green]Parameter Golf workspace written:[/] {out}")

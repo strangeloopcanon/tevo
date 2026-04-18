@@ -4,7 +4,6 @@ from pathlib import Path
 
 from transformer_evolution_llm.api import load_spec
 from transformer_evolution_llm.parameter_golf_combo_scout import (
-    COMBO_SCOUT_LANES,
     build_combo_plan,
     combo_scout_lanes,
     recommended_combo_refine_families,
@@ -21,7 +20,9 @@ def test_combo_lane_order_centers_on_winning_line() -> None:
 
 
 def test_combo_plan_builds_commands() -> None:
-    plan = build_combo_plan(stage="scout", device="cpu", seed=11, family_ids=["combo_ffn_input_practical"])
+    plan = build_combo_plan(
+        stage="scout", device="cpu", seed=11, family_ids=["combo_ffn_input_practical"]
+    )
     assert len(plan) == 1
     row = plan[0]
     assert row["family_id"] == "combo_ffn_input_practical"

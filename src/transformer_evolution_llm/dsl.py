@@ -18,6 +18,10 @@ from pydantic import (
 )
 
 
+def _default_report_eval_modes() -> list[Literal["standard", "sliding64"]]:
+    return ["standard"]
+
+
 class EmbeddingConfig(BaseModel):
     """Token embedding definition."""
 
@@ -1017,7 +1021,7 @@ class ParameterGolfConfig(BaseModel):
     train_log_every: int = Field(default=0, ge=0)
     eval_protocol: Literal["scout_fast", "mid_fidelity", "truth_full"] | None = None
     report_eval_modes: list[Literal["standard", "sliding64"]] = Field(
-        default_factory=lambda: ["standard"]
+        default_factory=_default_report_eval_modes
     )
     target_budget_utilization: float = Field(default=0.96, gt=0.0, le=1.0)
     target_budget_under_window: float = Field(default=0.35, gt=0.0)
@@ -1036,7 +1040,7 @@ class ParameterGolfConfig(BaseModel):
         if self.eval_protocol is None:
             wallclock = float(self.max_wallclock_seconds) if self.max_wallclock_seconds else 600.0
             self.eval_protocol = "scout_fast" if wallclock < 600.0 else "mid_fidelity"
-        report_modes: list[str] = []
+        report_modes: list[Literal["standard", "sliding64"]] = []
         for mode in self.report_eval_modes:
             if mode not in report_modes:
                 report_modes.append(mode)

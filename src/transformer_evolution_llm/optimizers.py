@@ -214,7 +214,7 @@ class Lion(Optimizer):
 
     def __init__(
         self,
-        params: Iterable[torch.nn.Parameter],
+        params: Iterable[torch.nn.Parameter] | Iterable[dict[str, object]],
         lr: float = 1e-4,
         betas: tuple[float, float] = (0.9, 0.99),
         weight_decay: float = 0.0,
@@ -304,7 +304,7 @@ class Muon(Optimizer):
 
     def __init__(
         self,
-        params: Iterable[torch.nn.Parameter],
+        params: Iterable[torch.nn.Parameter] | Iterable[dict[str, object]],
         lr: float = 0.02,
         momentum: float = 0.95,
         nesterov: bool = True,

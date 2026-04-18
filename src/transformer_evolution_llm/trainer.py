@@ -15,7 +15,7 @@ import traceback
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -29,8 +29,8 @@ from .models import BranchRouter, EvolutionModel, MoELayer, count_parameters
 from .morphology import match_experts_to_parent, sort_moe_experts
 from .optimizers import apply_gradient_transform_, apply_update_filter_, build_optimizer
 from .parameter_golf import (
-    DEFAULT_STANDARD_EVAL_MODE,
     DEFAULT_SLIDING_EVAL_MODE,
+    DEFAULT_STANDARD_EVAL_MODE,
     ParameterGolfDataModule,
     build_sentencepiece_luts,
     dequantize_state_dict_int8,
@@ -293,7 +293,7 @@ class FullWeightTrainer:
     def _eval_batches(self, eval_module: Any, *, eval_tokens: int) -> Iterable[TokenBatch]:
         if isinstance(eval_module, ParameterGolfDataModule):
             return eval_module.batches(max_tokens=eval_tokens, split="val")
-        return eval_module.batches(max_tokens=eval_tokens)
+        return cast(Iterable[TokenBatch], eval_module.batches(max_tokens=eval_tokens))
 
     def _parameter_golf_exact_eval_device(self) -> torch.device:
         # Apple GPU memory is too tight for the exact challenge scorer at realistic
@@ -659,7 +659,11 @@ class FullWeightTrainer:
         optimizer = build_optimizer(model, spec.train)
         base_lrs = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
         base_momentums = [
-            float(group.get("momentum")) if group.get("momentum") is not None else None
+            (
+                float(momentum_value)
+                if isinstance(momentum_value := group.get("momentum"), (int, float))
+                else None
+            )
             for group in optimizer.param_groups
         ]
         criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -1015,9 +1019,7 @@ class FullWeightTrainer:
                     speedrun_error = 1.0
                     speedrun_eval_failed = True
                     loss_val = 1e9
-                speedrun_eval_durations.append(
-                    max(time.perf_counter() - eval_started_at, 1e-6)
-                )
+                speedrun_eval_durations.append(max(time.perf_counter() - eval_started_at, 1e-6))
                 if loss_val < speedrun_best_loss:
                     speedrun_best_loss = loss_val
                 if math.isfinite(float(loss_val)):
@@ -1116,7 +1118,9 @@ class FullWeightTrainer:
                     fallback_seconds=max(
                         self._predict_elapsed_seconds(
                             train_step_durations,
-                            fallback_seconds=max(elapsed_now / float(max(optimizer_step_idx + 1, 1)), 0.0),
+                            fallback_seconds=max(
+                                elapsed_now / float(max(optimizer_step_idx + 1, 1)), 0.0
+                            ),
                         )
                         * 2.0,
                         1.0,

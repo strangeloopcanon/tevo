@@ -6,7 +6,7 @@ import copy
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import yaml
 
@@ -26,8 +26,8 @@ from .dsl import (
     MoEFFNConfig,
     RecurrenceConfig,
     RetroConfig,
-    SSMConfig,
     SoftmaxConfig,
+    SSMConfig,
 )
 
 TEMPLATE_PATH_DEFAULT = Path("configs/mutation_templates.yaml")
@@ -45,6 +45,22 @@ _TEMPLATE_LEARNING_DIRTY = False
 _TEMPLATE_WEIGHT_OVERRIDES: dict[str, float] = {}
 _TEMPLATE_RECENT: dict[str, MutationTemplate] = {}
 _TEMPLATE_POSITIVE: dict[str, int] = {}
+
+AttentionKind = Literal["MHA", "GQA", "MQA", "LINEAR", "MLA"]
+SoftmaxNorm = Literal["none", "rms", "layer"]
+ActivationName = Literal["silu", "gelu", "relu", "relu_squared", "swiglu"]
+OptimizerName = Literal["adamw", "lion", "muon"]
+ExportDType = Literal["int8", "fp16"]
+GradientTransformMode = Literal[
+    "identity",
+    "sign",
+    "normalize",
+    "orthogonalize_2d",
+    "sign_orthogonalize_2d",
+]
+UpdateFilterMode = Literal["none", "bernoulli", "topk"]
+UpdateFilterGranularity = Literal["element", "block"]
+RecurrenceAdapter = Literal["linear", "gated"]
 
 
 class TemplateAction(TypedDict, total=False):
@@ -83,6 +99,11 @@ class TemplateAction(TypedDict, total=False):
     activation: str | None
     optimizer_name: str | None
     lr: float | None
+    matrix_lr: float | None
+    scalar_lr: float | None
+    tied_embedding_lr: float | None
+    tied_embedding_export_dtype: str | None
+    tied_embed_init_std: float | None
     gradient_transform_mode: str | None
     gradient_transform_ns_steps: int | None
     gradient_transform_eps: float | None
@@ -92,6 +113,9 @@ class TemplateAction(TypedDict, total=False):
     update_filter_block_size: int | None
     update_filter_momentum_blend: float | None
     warmup: int | None
+    warmdown_steps: int | None
+    muon_momentum_warmup_start: float | None
+    muon_momentum_warmup_steps: int | None
     clip: float | None
     tail_blocks: int | None
     start_fraction: float | None
@@ -918,7 +942,7 @@ def _tune_attn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Rando
     if kind is not None:
         resolved_kind = str(kind).upper()
         if resolved_kind in {"MHA", "GQA", "MQA", "LINEAR", "MLA"}:
-            block.attn.kind = resolved_kind
+            block.attn.kind = cast(AttentionKind, resolved_kind)
             if resolved_kind == "MQA":
                 block.attn.kv_groups = max(1, int(block.attn.heads))
                 block.attn.kv_latent_dim = None
@@ -971,7 +995,9 @@ def _tune_attn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Rando
     if any(key in params for key in ("qk_norm", "qk_scale", "softcap")):
         softmax = _ensure_softmax(block.attn)
         if "qk_norm" in params and params["qk_norm"] is not None:
-            softmax.qk_norm = str(params["qk_norm"]).lower()
+            normalized_qk_norm = str(params["qk_norm"]).lower()
+            if normalized_qk_norm in {"none", "rms", "layer"}:
+                softmax.qk_norm = cast(SoftmaxNorm, normalized_qk_norm)
         if "qk_scale" in params and params["qk_scale"] is not None:
             softmax.qk_scale = params["qk_scale"]
         if "softcap" in params and params["softcap"] is not None:
@@ -991,13 +1017,17 @@ def _tune_ffn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Random
     if hidden is not None:
         block.ffn.hidden = max(128, int(hidden))
     if params.get("activation") is not None:
-        block.ffn.activation = str(params["activation"]).lower()
+        normalized_activation = str(params["activation"]).lower()
+        if normalized_activation in {"silu", "gelu", "relu", "relu_squared", "swiglu"}:
+            block.ffn.activation = cast(ActivationName, normalized_activation)
 
 
 def _tune_optimizer(spec: ArchitectureSpec, params: dict[str, Any]) -> None:
     optimizer = spec.train.optimizer
     if params.get("optimizer_name") is not None:
-        optimizer.name = str(params["optimizer_name"]).lower()
+        normalized_optimizer = str(params["optimizer_name"]).lower()
+        if normalized_optimizer in {"adamw", "lion", "muon"}:
+            optimizer.name = cast(OptimizerName, normalized_optimizer)
     if params.get("lr") is not None:
         spec.train.lr = float(params["lr"])
     if params.get("matrix_lr") is not None:
@@ -1007,9 +1037,12 @@ def _tune_optimizer(spec: ArchitectureSpec, params: dict[str, Any]) -> None:
     if params.get("tied_embedding_lr") is not None:
         spec.train.tied_embedding_lr = max(1.0e-9, float(params["tied_embedding_lr"]))
     if params.get("tied_embedding_export_dtype") is not None and spec.parameter_golf is not None:
-        spec.parameter_golf.tied_embedding_export_dtype = str(
-            params["tied_embedding_export_dtype"]
-        ).lower()
+        normalized_export_dtype = str(params["tied_embedding_export_dtype"]).lower()
+        if normalized_export_dtype in {"int8", "fp16"}:
+            spec.parameter_golf.tied_embedding_export_dtype = cast(
+                ExportDType,
+                normalized_export_dtype,
+            )
     if params.get("tied_embed_init_std") is not None:
         spec.model.emb.init_std = max(1.0e-9, float(params["tied_embed_init_std"]))
     if params.get("warmup") is not None:
@@ -1026,20 +1059,38 @@ def _tune_optimizer(spec: ArchitectureSpec, params: dict[str, Any]) -> None:
     if params.get("muon_momentum_warmup_steps") is not None:
         optimizer.muon_momentum_warmup_steps = max(0, int(params["muon_momentum_warmup_steps"]))
     if params.get("gradient_transform_mode") is not None:
-        optimizer.gradient_transform.mode = str(params["gradient_transform_mode"]).lower()
+        normalized_transform_mode = str(params["gradient_transform_mode"]).lower()
+        if normalized_transform_mode in {
+            "identity",
+            "sign",
+            "normalize",
+            "orthogonalize_2d",
+            "sign_orthogonalize_2d",
+        }:
+            optimizer.gradient_transform.mode = cast(
+                GradientTransformMode,
+                normalized_transform_mode,
+            )
     if params.get("gradient_transform_ns_steps") is not None:
         optimizer.gradient_transform.ns_steps = max(1, int(params["gradient_transform_ns_steps"]))
     if params.get("gradient_transform_eps") is not None:
         optimizer.gradient_transform.eps = max(1.0e-12, float(params["gradient_transform_eps"]))
     if params.get("update_filter_mode") is not None:
-        optimizer.update_filter.mode = str(params["update_filter_mode"]).lower()
+        normalized_filter_mode = str(params["update_filter_mode"]).lower()
+        if normalized_filter_mode in {"none", "bernoulli", "topk"}:
+            optimizer.update_filter.mode = cast(UpdateFilterMode, normalized_filter_mode)
     if params.get("update_filter_keep_ratio") is not None:
         optimizer.update_filter.keep_ratio = max(
             1.0e-3,
             min(1.0, float(params["update_filter_keep_ratio"])),
         )
     if params.get("update_filter_granularity") is not None:
-        optimizer.update_filter.granularity = str(params["update_filter_granularity"]).lower()
+        normalized_granularity = str(params["update_filter_granularity"]).lower()
+        if normalized_granularity in {"element", "block"}:
+            optimizer.update_filter.granularity = cast(
+                UpdateFilterGranularity,
+                normalized_granularity,
+            )
     if params.get("update_filter_block_size") is not None:
         optimizer.update_filter.block_size = max(1, int(params["update_filter_block_size"]))
     if params.get("update_filter_momentum_blend") is not None:
@@ -1077,7 +1128,9 @@ def _set_recurrence(spec: ArchitectureSpec, params: dict[str, Any]) -> None:
     recurrence.end = _clamp_int(int(end), lo=recurrence.start + 1, hi=n_blocks)
 
     if params.get("adapter") is not None:
-        recurrence.adapter = str(params["adapter"]).lower()
+        normalized_adapter = str(params["adapter"]).lower()
+        if normalized_adapter in {"linear", "gated"}:
+            recurrence.adapter = cast(RecurrenceAdapter, normalized_adapter)
     if "concat_prelude" in params and params["concat_prelude"] is not None:
         recurrence.concat_prelude = bool(params["concat_prelude"])
     if params.get("train_recurrence") is not None:

@@ -4,8 +4,6 @@ from pathlib import Path
 
 from transformer_evolution_llm.parameter_golf_family_scout import (
     FAMILY_SCOUT_LANES,
-    build_local_family_command,
-    build_runpod_family_command,
     build_scout_plan,
     build_smoke_assets,
     build_smoke_family_spec,

@@ -11,13 +11,14 @@ import transformer_evolution_llm.trainer as trainer_module
 from transformer_evolution_llm import api
 from transformer_evolution_llm.candidates import Candidate
 from transformer_evolution_llm.dsl import ArchitectureSpec, ParameterGolfConfig
+from transformer_evolution_llm.models import EvolutionModel
 from transformer_evolution_llm.parameter_golf import (
     ParameterGolfDataModule,
     artifact_size_calibration_table,
     build_sentencepiece_luts,
-    eval_parameter_golf_val,
     estimate_artifact_total_bytes_for_spec,
     estimate_calibrated_artifact_total_bytes_for_spec,
+    eval_parameter_golf_val,
     load_parameter_golf_shard,
     measure_quantized_artifact,
     quantize_state_dict_int8,
@@ -33,7 +34,6 @@ from transformer_evolution_llm.parameter_golf_runtime import (
     rescore_parameter_golf_checkpoint,
     run_parameter_golf_benchmark,
 )
-from transformer_evolution_llm.models import EvolutionModel
 from transformer_evolution_llm.trainer import FullWeightTrainer
 
 
@@ -222,14 +222,21 @@ def _write_official_patch_stub(path: Path) -> Path:
                 "class Hyperparameters:",
                 '    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))',
                 "",
-                "def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:",
+                (
+                    "def keep_float_tensor("
+                    "name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]"
+                    ") -> Tensor:"
+                ),
                 "    if any(pattern in name for pattern in []):",
                 "        return t.float().contiguous()",
                 "    return t",
                 "",
                 "def step(args, matrix_params, scale, optimizers, base_model):",
                 "    if args.grad_clip_norm > 0:",
-                "        torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)",
+                (
+                    "        torch.nn.utils.clip_grad_norm_("
+                    "base_model.parameters(), args.grad_clip_norm)"
+                ),
                 "    for opt in optimizers:",
                 "        opt.step()",
                 "",
@@ -350,7 +357,10 @@ def test_quantized_artifact_supports_mixed_i5_i6_export_mode() -> None:
 
     assert mixed_payload["qmeta"]["large.weight"]["bits"] == 5
     assert mixed_payload["qmeta"]["medium.weight"]["bits"] == 6
-    assert mixed_payload["quantized"]["large.weight"].numel() < int8_payload["quantized"]["large.weight"].numel()
+    assert (
+        mixed_payload["quantized"]["large.weight"].numel()
+        < int8_payload["quantized"]["large.weight"].numel()
+    )
 
 
 def test_parameter_golf_trainer_smoke(tmp_path: Path) -> None:
@@ -762,7 +772,9 @@ def test_eval_parameter_golf_val_supports_sliding64(tmp_path: Path) -> None:
     module = ParameterGolfDataModule(spec.parameter_golf, seq_len=8, batch_size=2, seed=0)
     val_tokens = module.validation_tokens()
     model = EvolutionModel(spec.model)
-    luts = build_sentencepiece_luts(spec.parameter_golf.tokenizer_path, spec.model.head.vocab, torch.device("cpu"))
+    luts = build_sentencepiece_luts(
+        spec.parameter_golf.tokenizer_path, spec.model.head.vocab, torch.device("cpu")
+    )
 
     standard_loss, standard_bpb = eval_parameter_golf_val(
         model,
@@ -827,11 +839,12 @@ def test_eval_parameter_golf_val_supports_mps_accumulators(tmp_path: Path) -> No
     assert bpb > 0.0
 
 
-def test_artifact_size_calibration_adjusts_estimate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_artifact_size_calibration_adjusts_estimate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     run_dir = tmp_path / "runs" / "runpod_parameter_golf" / "2026-03-23"
     run_dir.mkdir(parents=True)
-    (run_dir / "truth_fake.summary.json").write_text(
-        """
+    (run_dir / "truth_fake.summary.json").write_text("""
 {
   "preflight": {
     "artifact_payload_bytes_est": 2000,
@@ -844,8 +857,7 @@ def test_artifact_size_calibration_adjusts_estimate(tmp_path: Path, monkeypatch:
     "artifact_total_bytes": 1200
   }
 }
-""".strip()
-    )
+""".strip())
     monkeypatch.chdir(tmp_path)
     assets = _build_pg_assets(tmp_path / "assets_calibration")
     spec = _make_pg_spec(assets)

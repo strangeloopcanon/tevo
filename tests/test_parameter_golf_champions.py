@@ -114,7 +114,10 @@ def test_build_champion_state_writes_multiple_seed_pool(tmp_path: Path) -> None:
     pool = payload["pool"]
     names = [entry["metadata"]["champion_seed_name"] for entry in pool]
     assert names == ["seed-a", "seed-b"]
-    assert pool[0]["spec"]["parameter_golf"]["train_shards_glob"] == base.parameter_golf.train_shards_glob
+    assert (
+        pool[0]["spec"]["parameter_golf"]["train_shards_glob"]
+        == base.parameter_golf.train_shards_glob
+    )
     assert payload["frontier"] == [entry["id"] for entry in pool]
     manifest_seeds = load_champion_seed_manifest(manifest)
     assert [seed.name for seed in manifest_seeds] == ["seed-a", "seed-b"]

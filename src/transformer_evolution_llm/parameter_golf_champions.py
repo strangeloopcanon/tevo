@@ -136,7 +136,9 @@ def build_champion_candidate(
     )
 
 
-def load_frontier_entry(frontier_path: str | Path, candidate_id: str | None = None) -> dict[str, Any]:
+def load_frontier_entry(
+    frontier_path: str | Path, candidate_id: str | None = None
+) -> dict[str, Any]:
     """Load one frontier entry, defaulting to the best post-quant score."""
     path = Path(frontier_path)
     payload = json.loads(path.read_text())
@@ -195,7 +197,7 @@ def _coerce_metrics(payload: Any) -> dict[str, float]:
         if not isinstance(key, str):
             continue
         numeric = _metric_value(value)
-        if numeric == 1e9 and value not in {1e9, 1.0e9}:
+        if numeric == 1e9 and value not in {1e9}:
             continue
         metrics[key] = numeric
     return metrics

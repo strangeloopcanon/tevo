@@ -7,22 +7,22 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import torch
 
 from .candidates import Candidate
 from .dsl import load_architecture_spec
 from .models import EvolutionModel
-from .parameter_golf_export import build_official_submission_plan
 from .parameter_golf import (
     ParameterGolfDataModule,
     artifact_size_calibration_table,
-    estimate_calibrated_artifact_total_bytes_for_spec,
     estimate_artifact_total_bytes_for_spec,
+    estimate_calibrated_artifact_total_bytes_for_spec,
     resolve_parameter_golf_glob,
     resolve_parameter_golf_path,
 )
+from .parameter_golf_export import build_official_submission_plan
 from .parameter_golf_seeded import seed_lane_metadata
 from .trainer import FullWeightTrainer
 
@@ -37,8 +37,8 @@ def preflight_parameter_golf_config(config_path: str | Path) -> dict[str, Any]:
     val_shards = resolve_parameter_golf_glob(spec.parameter_golf.val_shards_glob)
     tokenizer_path = resolve_parameter_golf_path(spec.parameter_golf.tokenizer_path)
     payload_bytes_est, total_bytes_est = estimate_artifact_total_bytes_for_spec(spec)
-    calibrated_payload_est, calibrated_total_est = estimate_calibrated_artifact_total_bytes_for_spec(
-        spec
+    calibrated_payload_est, calibrated_total_est = (
+        estimate_calibrated_artifact_total_bytes_for_spec(spec)
     )
     budget = int(spec.parameter_golf.artifact_budget_bytes)
     max_est_gate = spec.evolution.rung0_thresholds.get("max_artifact_total_bytes_est")
@@ -196,7 +196,13 @@ def rescore_parameter_golf_checkpoint(
     if val_batch_tokens is not None:
         spec.parameter_golf.val_batch_tokens = int(val_batch_tokens)
     if eval_protocol is not None:
-        spec.parameter_golf.eval_protocol = str(eval_protocol)
+        normalized_eval_protocol = str(eval_protocol)
+        if normalized_eval_protocol not in {"scout_fast", "mid_fidelity", "truth_full"}:
+            raise ValueError(f"unsupported eval protocol: {eval_protocol}")
+        spec.parameter_golf.eval_protocol = cast(
+            Literal["scout_fast", "mid_fidelity", "truth_full"],
+            normalized_eval_protocol,
+        )
 
     trainer = FullWeightTrainer(device=device, steps=1, eval_batches=1)
     state_dict, recurrence_steps = _load_checkpoint_payload(checkpoint_path)

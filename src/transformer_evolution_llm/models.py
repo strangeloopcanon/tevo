@@ -45,8 +45,8 @@ from .dsl import (
     MoESSMExpertConfig,
     RecurrenceConfig,
     RetroConfig,
-    SSMConfig,
     SmearGateConfig,
+    SSMConfig,
 )
 from .memory import (
     AssociativeMemoryModule,
@@ -368,7 +368,7 @@ class SmearGateModule(nn.Module):
         if self.width >= t:
             numer = csum
         else:
-            prefix = torch.cat([torch.zeros_like(csum[:, :1]), csum[:, :-self.width]], dim=1)
+            prefix = torch.cat([torch.zeros_like(csum[:, :1]), csum[:, : -self.width]], dim=1)
             numer = csum - prefix
         denom = torch.arange(1, t + 1, device=x.device, dtype=x.dtype).clamp(max=self.width)
         smear = numer / denom.view(1, t, 1)
@@ -594,7 +594,7 @@ class SharedBlockProxy(nn.Module):
         object.__setattr__(self, "_target", target)
         self.source_idx = int(source_idx)
 
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> object:  # type: ignore[override]
         try:
             return super().__getattr__(name)
         except AttributeError:
@@ -707,7 +707,9 @@ class EvolutionModel(nn.Module):
             target = built_blocks.get(share_source)
             if target is None:
                 raise ValueError(
-                    f"Block {idx} shares with block {share_source}, but the source block was not built"
+                    "Block "
+                    f"{idx} shares with block {share_source}, "
+                    "but the source block was not built"
                 )
             logical_blocks.append(SharedBlockProxy(target, source_idx=share_source))
         self.blocks = nn.ModuleList(logical_blocks)
