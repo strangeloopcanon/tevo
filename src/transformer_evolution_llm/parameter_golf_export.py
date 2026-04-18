@@ -11,7 +11,10 @@ from typing import Any, Literal
 import ujson as json
 
 from .dsl import ArchitectureSpec, DenseFFNConfig, load_architecture_spec, save_architecture_spec
-from .parameter_golf import estimate_artifact_total_bytes_for_spec, estimate_calibrated_artifact_total_bytes_for_spec
+from .parameter_golf import (
+    estimate_artifact_total_bytes_for_spec,
+    estimate_calibrated_artifact_total_bytes_for_spec,
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_OFFICIAL_BASE_CODE_BYTES = 47_642
@@ -217,9 +220,9 @@ def build_official_submission_plan(
         fatal_reasons.append("all blocks must share the same rope_theta")
 
     softcap_values = _uniform_values(
-        float(attn.softmax.softcap)
+        float(softmax.softcap)
         for attn in attn_blocks
-        if getattr(attn, "softmax", None) is not None and attn.softmax.softcap is not None
+        if (softmax := getattr(attn, "softmax", None)) is not None and softmax.softcap is not None
     )
     if len(softcap_values) > 1:
         fatal_reasons.append("all blocks must share the same softcap")
@@ -227,9 +230,9 @@ def build_official_submission_plan(
         fatal_reasons.append("official submission lane requires a positive softcap")
 
     qk_norm_values = _uniform_values(
-        str(attn.softmax.qk_norm or "none").lower()
+        str(softmax.qk_norm or "none").lower()
         for attn in attn_blocks
-        if getattr(attn, "softmax", None) is not None
+        if (softmax := getattr(attn, "softmax", None)) is not None
     )
     if len(qk_norm_values) > 1:
         fatal_reasons.append("all blocks must share the same qk_norm policy")
@@ -348,16 +351,17 @@ def build_official_submission_plan(
     if isinstance(betas, tuple) and len(betas) >= 2:
         env_overrides["BETA1"] = str(float(betas[0]))
         env_overrides["BETA2"] = str(float(betas[1]))
-    if getattr(spec.train.optimizer, "eps", None) is not None:
-        env_overrides["ADAM_EPS"] = str(float(spec.train.optimizer.eps))
-    if getattr(spec.train.optimizer, "muon_momentum", None) is not None:
-        env_overrides["MUON_MOMENTUM"] = str(float(spec.train.optimizer.muon_momentum))
+    optimizer_eps = getattr(spec.train.optimizer, "eps", None)
+    if optimizer_eps is not None:
+        env_overrides["ADAM_EPS"] = str(float(optimizer_eps))
+    muon_momentum = getattr(spec.train.optimizer, "muon_momentum", None)
+    if muon_momentum is not None:
+        env_overrides["MUON_MOMENTUM"] = str(float(muon_momentum))
     if getattr(spec.train.optimizer, "muon_ns_steps", None) is not None:
         env_overrides["MUON_BACKEND_STEPS"] = str(int(spec.train.optimizer.muon_ns_steps))
-    if getattr(spec.train.optimizer, "muon_momentum_warmup_start", None) is not None:
-        env_overrides["MUON_MOMENTUM_WARMUP_START"] = str(
-            float(spec.train.optimizer.muon_momentum_warmup_start)
-        )
+    muon_warmup_start = getattr(spec.train.optimizer, "muon_momentum_warmup_start", None)
+    if muon_warmup_start is not None:
+        env_overrides["MUON_MOMENTUM_WARMUP_START"] = str(float(muon_warmup_start))
     if int(getattr(spec.train.optimizer, "muon_momentum_warmup_steps", 0) or 0) > 0:
         env_overrides["MUON_MOMENTUM_WARMUP_STEPS"] = str(
             int(spec.train.optimizer.muon_momentum_warmup_steps)
@@ -433,9 +437,9 @@ def build_official_submission_plan(
         "artifact_total_bytes_est": int(total_bytes_est),
         "artifact_over_budget_bytes_est": int(total_over_budget),
         "artifact_budget_bytes": int(artifact_budget),
-        "artifact_total_bytes_exact": int(exact_total_bytes)
-        if exact_total_bytes is not None
-        else None,
+        "artifact_total_bytes_exact": (
+            int(exact_total_bytes) if exact_total_bytes is not None else None
+        ),
         "artifact_over_budget_bytes_exact": (
             int(exact_over_budget) if exact_over_budget is not None else None
         ),
@@ -517,7 +521,11 @@ def _apply_supported_official_patches(base_text: str, patch_reasons: list[str]) 
 
 
 def _patch_fp16_tied_embedding_export(base_text: str) -> str:
-    header = "def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:\n"
+    header = (
+        "def keep_float_tensor("
+        "name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]"
+        ") -> Tensor:\n"
+    )
     insertion = "\n".join(
         [
             header.rstrip("\n"),
@@ -553,7 +561,10 @@ def _patch_muon_weight_decay(base_text: str) -> str:
     step_anchor = "\n".join(
         [
             "        if args.grad_clip_norm > 0:",
-            "            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)",
+            (
+                "            torch.nn.utils.clip_grad_norm_("
+                "base_model.parameters(), args.grad_clip_norm)"
+            ),
             "        for opt in optimizers:",
             "            opt.step()",
         ]
@@ -561,7 +572,10 @@ def _patch_muon_weight_decay(base_text: str) -> str:
     step_replacement = "\n".join(
         [
             "        if args.grad_clip_norm > 0:",
-            "            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)",
+            (
+                "            torch.nn.utils.clip_grad_norm_("
+                "base_model.parameters(), args.grad_clip_norm)"
+            ),
             "        if args.muon_weight_decay != 0.0:",
             "            with torch.no_grad():",
             "                for p in matrix_params:",
@@ -732,7 +746,10 @@ def _export_tevo_workspace(
     save_architecture_spec(exported_spec, exported_spec_path)
 
     code_bytes = _code_bytes(out_dir)
-    exported_spec.parameter_golf.code_bytes = int(code_bytes)
+    parameter_golf_cfg = exported_spec.parameter_golf
+    if parameter_golf_cfg is None:
+        raise ParameterGolfExportError("exported spec is missing parameter_golf configuration")
+    parameter_golf_cfg.code_bytes = int(code_bytes)
     save_architecture_spec(exported_spec, exported_spec_path)
 
     payload_bytes_est, total_bytes_est = estimate_artifact_total_bytes_for_spec(exported_spec)
@@ -746,7 +763,7 @@ def _export_tevo_workspace(
         "code_bytes": int(code_bytes),
         "artifact_payload_bytes_est": int(payload_bytes_est),
         "artifact_total_bytes_est": int(total_bytes_est),
-        "artifact_budget_bytes": int(exported_spec.parameter_golf.artifact_budget_bytes),
+        "artifact_budget_bytes": int(parameter_golf_cfg.artifact_budget_bytes),
     }
     metadata_path = out_dir / OFFICIAL_EXPORT_METADATA
     metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -789,7 +806,10 @@ def _export_official_workspace(
     train_py_path.write_text(rendered_train_py, encoding="utf-8")
 
     exported_spec = spec.model_copy(deep=True)
-    exported_spec.parameter_golf.code_bytes = int(train_py_path.stat().st_size)
+    parameter_golf_cfg = exported_spec.parameter_golf
+    if parameter_golf_cfg is None:
+        raise ParameterGolfExportError("exported spec is missing parameter_golf configuration")
+    parameter_golf_cfg.code_bytes = int(train_py_path.stat().st_size)
     spec_path = out_dir / "parameter_golf_spec.yaml"
     save_architecture_spec(exported_spec, spec_path)
 

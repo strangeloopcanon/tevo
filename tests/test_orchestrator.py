@@ -273,7 +273,10 @@ def test_edge_score_prefers_near_budget_candidates(tiny_spec) -> None:
     runner._annotate_official_submission_metrics(small)
     runner._annotate_official_submission_metrics(near_edge)
 
-    assert near_edge.metrics["artifact_budget_edge_score"] > small.metrics["artifact_budget_edge_score"]
+    assert (
+        near_edge.metrics["artifact_budget_edge_score"]
+        > small.metrics["artifact_budget_edge_score"]
+    )
 
 
 def test_edge_score_respects_parameter_golf_target_window(tiny_spec) -> None:
@@ -308,7 +311,10 @@ def test_edge_score_respects_parameter_golf_target_window(tiny_spec) -> None:
     runner._annotate_official_submission_metrics(below_target)
     runner._annotate_official_submission_metrics(at_target)
 
-    assert at_target.metrics["artifact_budget_edge_score"] > below_target.metrics["artifact_budget_edge_score"]
+    assert (
+        at_target.metrics["artifact_budget_edge_score"]
+        > below_target.metrics["artifact_budget_edge_score"]
+    )
 
 
 def test_template_learning_bootstraps_seed_file(tmp_path: Path, tiny_spec) -> None:

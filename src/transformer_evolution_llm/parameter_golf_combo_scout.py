@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .api import build_data_module_for_spec, save_spec
 from .candidates import Candidate
@@ -28,7 +28,10 @@ COMBO_SCOUT_LANES: tuple[FamilyScoutLane, ...] = (
         family_id="combo_ffn_input_practical",
         config_path=REPO_ROOT / "configs/pg_combo_ffn_input_practical.yaml",
         priority=1,
-        note="Main branch: start from the cleaned-up winner and search broadly among small, practical moves.",
+        note=(
+            "Main branch: start from the cleaned-up winner and search broadly "
+            "among small, practical moves."
+        ),
         exportable=True,
         scout=ScoutBudget(generations=12, steps=90, eval_batches=2, mutation_steps=2),
         refine=ScoutBudget(generations=24, steps=140, eval_batches=3, mutation_steps=2),
@@ -37,7 +40,10 @@ COMBO_SCOUT_LANES: tuple[FamilyScoutLane, ...] = (
         family_id="combo_ffn_input_hybrid",
         config_path=REPO_ROOT / "configs/pg_combo_ffn_input_hybrid.yaml",
         priority=2,
-        note="Hybrid branch: mix practical changes with a few structural bets that still seem transferable.",
+        note=(
+            "Hybrid branch: mix practical changes with a few structural bets "
+            "that still seem transferable."
+        ),
         exportable=False,
         scout=ScoutBudget(generations=10, steps=90, eval_batches=2, mutation_steps=2),
         refine=ScoutBudget(generations=20, steps=140, eval_batches=3, mutation_steps=2),
@@ -154,7 +160,10 @@ def run_local_smoke_combo_scouts(
             no_improve_patience=smoke_spec.train.no_improve_patience,
             improvement_tolerance=smoke_spec.train.improvement_tolerance,
         )
-        runner.data_module = build_data_module_for_spec(smoke_spec, seed=seed)
+        runner.data_module = cast(
+            Any,
+            build_data_module_for_spec(smoke_spec, seed=seed),
+        )
         runner.run(generations=generations)
 
         frontier_path = lane_root / "frontier.json"

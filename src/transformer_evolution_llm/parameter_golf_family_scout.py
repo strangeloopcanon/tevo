@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
-import sentencepiece as spm
+import sentencepiece as spm  # type: ignore[import-untyped]
 
 from .api import build_data_module_for_spec, load_spec, save_spec
 from .candidates import Candidate
@@ -355,7 +355,10 @@ def run_local_smoke_scouts(
             no_improve_patience=smoke_spec.train.no_improve_patience,
             improvement_tolerance=smoke_spec.train.improvement_tolerance,
         )
-        runner.data_module = build_data_module_for_spec(smoke_spec, seed=seed)
+        runner.data_module = cast(
+            Any,
+            build_data_module_for_spec(smoke_spec, seed=seed),
+        )
         runner.run(generations=generations)
 
         frontier_path = lane_root / "frontier.json"

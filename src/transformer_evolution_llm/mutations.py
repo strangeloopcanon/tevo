@@ -28,9 +28,9 @@ from .dsl import (
     MoEFFNConfig,
     RecurrenceConfig,
     RetroConfig,
+    SmearGateConfig,
     SoftmaxConfig,
     SSMConfig,
-    SmearGateConfig,
     UpdateFilterConfig,
 )
 from .template_mutation import (
@@ -234,7 +234,7 @@ def _clamp_feedback_sources(spec: ArchitectureSpec) -> None:
 
 
 def _block_payload_without_share(block: Any) -> dict[str, Any]:
-    payload = block.describe()
+    payload = cast(dict[str, Any], block.describe())
     payload.pop("share_with", None)
     return payload
 
@@ -698,9 +698,15 @@ def tune_parameter_golf_export_quant_mode(
     child = clone_spec(spec)
     if child.parameter_golf is None:
         return child
-    current = str(getattr(child.parameter_golf, "export_quant_mode", "int8") or "int8").lower()
-    options = [mode for mode in ("int8", "int6", "int5", "mixed_i5_i6") if mode != current]
-    child.parameter_golf.export_quant_mode = str(rng.choice(options or [current]))
+    current = child.parameter_golf.export_quant_mode
+    quant_modes: tuple[Literal["int8", "int6", "int5", "mixed_i5_i6"], ...] = (
+        "int8",
+        "int6",
+        "int5",
+        "mixed_i5_i6",
+    )
+    options = [mode for mode in quant_modes if mode != current]
+    child.parameter_golf.export_quant_mode = rng.choice(options or [current])
     return child
 
 

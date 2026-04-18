@@ -3,13 +3,13 @@ from pathlib import Path
 
 import torch
 
+import transformer_evolution_llm.trainer as trainer_module
 from transformer_evolution_llm.candidates import Candidate
 from transformer_evolution_llm.data import TokenBatch
 from transformer_evolution_llm.dsl import ParameterGolfConfig
 from transformer_evolution_llm.models import EvolutionModel
 from transformer_evolution_llm.optimizers import build_optimizer
 from transformer_evolution_llm.trainer import FullWeightTrainer
-import transformer_evolution_llm.trainer as trainer_module
 
 
 def synthetic_batches(vocab: int, seq_len: int, steps: int):

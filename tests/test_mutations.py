@@ -40,10 +40,10 @@ from transformer_evolution_llm.mutations import (
     toggle_update_filter_mode,
     tune_clip,
     tune_embedding_ffn_branch,
+    tune_embedding_init_std,
     tune_gradient_transform_eps,
     tune_gradient_transform_ns_steps,
     tune_lookup_memory,
-    tune_embedding_init_std,
     tune_muon_momentum,
     tune_muon_momentum_warmup,
     tune_optimizer,
@@ -55,8 +55,8 @@ from transformer_evolution_llm.mutations import (
     tune_update_filter_granularity,
     tune_update_filter_momentum_blend,
     tune_update_filter_ratio,
-    tune_warmup,
     tune_warmdown,
+    tune_warmup,
     unshare_block,
 )
 

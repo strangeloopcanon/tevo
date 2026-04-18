@@ -155,7 +155,7 @@ def runpod_api_request(
         },
     )
     try:
-        with request.urlopen(req, timeout=60) as response:  # noqa: S310
+        with request.urlopen(req, timeout=60) as response:  # noqa: S310  # nosec B310
             raw = response.read()
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

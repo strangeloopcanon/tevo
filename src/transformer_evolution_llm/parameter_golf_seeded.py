@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 from json import dumps as json_dumps
-from typing import Any
+from typing import Any, Literal, cast
 
 from .dsl import ArchitectureSpec
 
@@ -161,7 +161,9 @@ def transfer_parameter_golf_motif(
     child.train.weight_decay = float(source_spec.train.weight_decay)
     child.train.optimizer = source_spec.train.optimizer.model_copy(deep=True)
     child.model.emb.init_std = float(getattr(source_spec.model.emb, "init_std", 0.02) or 0.02)
-    child.model.norm = str(getattr(source_spec.model, "norm", child.model.norm) or child.model.norm)
+    source_norm = str(getattr(source_spec.model, "norm", child.model.norm) or child.model.norm)
+    if source_norm in {"layernorm", "rmsnorm"}:
+        child.model.norm = cast(Literal["layernorm", "rmsnorm"], source_norm)
 
     if child.parameter_golf is not None and source_spec.parameter_golf is not None:
         child.parameter_golf.tied_embedding_export_dtype = (
@@ -198,7 +200,9 @@ def transfer_parameter_golf_motif(
             target_block.ffn.hidden = source_block.ffn.hidden
             if hasattr(target_block.ffn, "activation") and hasattr(source_block.ffn, "activation"):
                 target_block.ffn.activation = source_block.ffn.activation
-            if hasattr(target_block.ffn, "input_source") and hasattr(source_block.ffn, "input_source"):
+            if hasattr(target_block.ffn, "input_source") and hasattr(
+                source_block.ffn, "input_source"
+            ):
                 target_block.ffn.input_source = source_block.ffn.input_source
     return child
 

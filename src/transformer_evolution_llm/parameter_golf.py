@@ -13,9 +13,10 @@ import zlib
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import numpy as np
-import sentencepiece as spm
+import sentencepiece as spm  # type: ignore[import-untyped]
 import torch
 from torch import Tensor, nn
 
@@ -39,12 +40,8 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-DEFAULT_PARAMETER_GOLF_ROOTS = (
-    Path("/workspace/tevo_runs"),
-)
-DEFAULT_PARAMETER_GOLF_CALIBRATION_GLOBS = (
-    "runs/runpod_parameter_golf/**/*summary.json",
-)
+DEFAULT_PARAMETER_GOLF_ROOTS = (Path("/workspace/tevo_runs"),)
+DEFAULT_PARAMETER_GOLF_CALIBRATION_GLOBS = ("runs/runpod_parameter_golf/**/*summary.json",)
 DEFAULT_STANDARD_EVAL_MODE = "standard"
 DEFAULT_SLIDING_EVAL_MODE = "sliding64"
 DEFAULT_SLIDING_EVAL_STRIDE = 64
@@ -482,35 +479,40 @@ def _unpack_unsigned_values(packed: torch.Tensor, *, bits: int, count: int) -> n
     if count <= 0:
         return np.empty((0,), dtype=np.uint8)
     raw = packed.detach().to("cpu", dtype=torch.uint8).numpy()
-    unpacked = np.unpackbits(raw, bitorder="big").reshape(-1, 8)[:, ::-1].reshape(-1)
-    unpacked = unpacked[: count * bits].reshape(count, bits)
+    unpacked_bits = np.unpackbits(raw, bitorder="big").reshape(-1, 8)[:, ::-1].reshape(-1)
+    bit_matrix = unpacked_bits[: count * bits].reshape(count, bits)
     weights = (1 << np.arange(bits, dtype=np.uint16)).reshape(1, bits)
-    values = (unpacked.astype(np.uint16) * weights).sum(axis=1)
-    return values.astype(np.uint16, copy=False)
+    values = (bit_matrix.astype(np.uint16) * weights).sum(axis=1)
+    return cast(np.ndarray, values.astype(np.uint16, copy=False))
 
 
 def quantize_float_tensor(tensor: Tensor, *, bits: int = 8) -> tuple[Tensor, Tensor]:
     t32 = tensor.float()
     qmax = float((1 << (int(bits) - 1)) - 1)
     if t32.ndim == 2:
-        clip_abs = (
+        row_clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+        clipped = torch.maximum(torch.minimum(t32, row_clip_abs[:, None]), -row_clip_abs[:, None])
+        scale = (row_clip_abs / qmax).clamp_min(1.0 / qmax)
         quantized = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax)
-        return quantized.to(torch.int8).contiguous(), scale.to(
-            dtype=INT8_PER_ROW_SCALE_DTYPE
-        ).contiguous()
+        return (
+            quantized.to(torch.int8).contiguous(),
+            scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(),
+        )
 
     clip_abs = (
         float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     )
-    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
-    quantized = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax)
-    return quantized.to(torch.int8).contiguous(), scale
+    scalar_scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
+    quantized = torch.clamp(
+        torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scalar_scale),
+        -qmax,
+        qmax,
+    )
+    return quantized.to(torch.int8).contiguous(), scalar_scale
 
 
 def quantize_state_dict_int8(
@@ -606,7 +608,9 @@ def quantize_state_dict_int8(
     }
     packed_quantized: dict[str, Tensor] = {}
     for name, tensor in quantized.items():
-        bits = int(qmeta.get(name, {}).get("bits", 8))
+        meta = qmeta.get(name, {})
+        bits_value = meta.get("bits", 8) if isinstance(meta, dict) else 8
+        bits = int(cast(int, bits_value))
         if bits >= 8:
             packed_quantized[name] = tensor
             continue
@@ -676,9 +680,7 @@ def dequantize_state_dict_int8(payload: dict[str, object]) -> dict[str, Tensor]:
                 .contiguous()
             )
         else:
-            out[name] = (
-                restored_quant.float() * float(scale.item())
-            ).to(dtype=dtype).contiguous()
+            out[name] = (restored_quant.float() * float(scale.item())).to(dtype=dtype).contiguous()
 
     if not isinstance(passthrough, dict):
         raise ValueError("Invalid passthrough payload")
@@ -786,6 +788,22 @@ def estimate_artifact_total_bytes_for_spec(spec: ArchitectureSpec) -> tuple[int,
     return payload_bytes, total_bytes
 
 
+def _positive_float(value: object) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if numeric <= 0.0:
+        return None
+    return numeric
+
+
+def _row_float(row: dict[str, object], key: str) -> float:
+    value = row.get(key)
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"calibration row missing numeric {key}")
+    return float(value)
+
+
 def _read_calibration_summary(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text())
@@ -797,20 +815,20 @@ def _read_calibration_summary(path: Path) -> dict[str, object] | None:
     metrics = payload.get("metrics")
     if not isinstance(preflight, dict) or not isinstance(metrics, dict):
         return None
-    est_total = preflight.get("artifact_total_bytes_est")
-    est_payload = preflight.get("artifact_payload_bytes_est")
-    exact_total = metrics.get("artifact_total_bytes")
-    exact_payload = metrics.get("artifact_payload_bytes")
-    if not all(isinstance(value, (int, float)) and float(value) > 0 for value in (est_total, est_payload, exact_total, exact_payload)):
+    est_total = _positive_float(preflight.get("artifact_total_bytes_est"))
+    est_payload = _positive_float(preflight.get("artifact_payload_bytes_est"))
+    exact_total = _positive_float(metrics.get("artifact_total_bytes"))
+    exact_payload = _positive_float(metrics.get("artifact_payload_bytes"))
+    if None in (est_total, est_payload, exact_total, exact_payload):
         return None
     return {
         "path": str(path),
         "tied_embedding_export_dtype": str(preflight.get("tied_embedding_export_dtype") or "int8"),
         "export_quant_mode": str(preflight.get("export_quant_mode") or "int8"),
-        "est_total": float(est_total),
-        "est_payload": float(est_payload),
-        "exact_total": float(exact_total),
-        "exact_payload": float(exact_payload),
+        "est_total": est_total,
+        "est_payload": est_payload,
+        "exact_total": exact_total,
+        "exact_payload": exact_payload,
     }
 
 
@@ -829,15 +847,15 @@ def artifact_size_calibration_table() -> dict[str, object]:
 
     grouped: dict[str, list[dict[str, object]]] = {}
     for row in rows:
-        group_key = (
-            f"{row['tied_embedding_export_dtype']}::{row['export_quant_mode']}"
-        )
+        group_key = f"{row['tied_embedding_export_dtype']}::{row['export_quant_mode']}"
         grouped.setdefault(group_key, []).append(row)
 
     def _group_summary(items: list[dict[str, object]]) -> dict[str, float]:
-        total_ratios = [float(item["exact_total"]) / float(item["est_total"]) for item in items]
+        total_ratios = [
+            _row_float(item, "exact_total") / _row_float(item, "est_total") for item in items
+        ]
         payload_ratios = [
-            float(item["exact_payload"]) / float(item["est_payload"]) for item in items
+            _row_float(item, "exact_payload") / _row_float(item, "est_payload") for item in items
         ]
         return {
             "sample_count": float(len(items)),
@@ -846,11 +864,15 @@ def artifact_size_calibration_table() -> dict[str, object]:
         }
 
     groups = {key: _group_summary(items) for key, items in grouped.items()}
-    overall = _group_summary(rows) if rows else {
-        "sample_count": 0.0,
-        "total_ratio_median": 1.0,
-        "payload_ratio_median": 1.0,
-    }
+    overall = (
+        _group_summary(rows)
+        if rows
+        else {
+            "sample_count": 0.0,
+            "total_ratio_median": 1.0,
+            "payload_ratio_median": 1.0,
+        }
+    )
     return {
         "sample_count": len(rows),
         "groups": groups,
@@ -953,7 +975,8 @@ class ParameterGolfDataModule:
         self.seq_len = int(seq_len)
         self.batch_size = max(1, int(batch_size))
         self._seed = int(seed)
-        self._rng = random.Random(self._seed)  # noqa: S311  # deterministic unit tests / training order
+        # Deterministic shuffle order is intentional here.
+        self._rng = random.Random(self._seed)  # noqa: S311  # nosec B311
         self._train_files = _resolve_glob(cfg.train_shards_glob)
         self._val_files = _resolve_glob(cfg.val_shards_glob)
         self._streams: dict[str, _TokenStream] = {
@@ -965,7 +988,7 @@ class ParameterGolfDataModule:
     def reset_rng(self, seed: int | None = None) -> None:
         if seed is not None:
             self._seed = int(seed)
-        self._rng = random.Random(self._seed)  # noqa: S311
+        self._rng = random.Random(self._seed)  # noqa: S311  # nosec B311
         self._streams = {
             "train": _TokenStream(self._train_files),
             "val": _TokenStream(self._val_files),

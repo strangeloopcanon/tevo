@@ -318,7 +318,9 @@ def convert_checkpoints(
             processed.append(path)
             continue
 
-        state = torch.load(path, map_location="cpu")  # nosec B614 - loading trusted local checkpoints
+        state = torch.load(
+            path, map_location="cpu"
+        )  # nosec B614 - loading trusted local checkpoints
         if not isinstance(state, dict):
             msg = f"Checkpoint {path} did not contain a state_dict mapping"
             raise ValueError(msg)

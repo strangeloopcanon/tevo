@@ -35,8 +35,8 @@ from .mutations import (
 )
 from .parameter_golf import (
     ParameterGolfDataModule,
-    estimate_calibrated_artifact_total_bytes_for_spec,
     estimate_artifact_total_bytes_for_spec,
+    estimate_calibrated_artifact_total_bytes_for_spec,
 )
 from .parameter_golf_export import official_submission_metrics
 from .parameter_golf_seeded import (
@@ -45,10 +45,10 @@ from .parameter_golf_seeded import (
     seed_lane_metadata,
 )
 from .scoring import (
+    archive_novelty,
     artifact_budget_edge_score,
     artifact_budget_fill_score,
     artifact_budget_utilization,
-    archive_novelty,
     behavioral_descriptor,
     complexity_score,
     compute_composite,
@@ -262,7 +262,7 @@ class EvolutionRunner:
             min_throughput=_threshold("min_throughput_proxy", 0.5),
         )
         self.trainer = FullWeightTrainer() if mode == "live" else None
-        self.data_module = None
+        self.data_module: DataModule | ParameterGolfDataModule | None = None
         if mode == "live":
             seed_value = int(getattr(base_spec.train, "seed", 0) or 0)
             try:
@@ -546,7 +546,10 @@ class EvolutionRunner:
             metrics["main_track_eligible_est"] = 0.0
             if "main_track_eligible_exact" in metrics:
                 metrics["main_track_eligible_exact"] = 0.0
-        if str(getattr(candidate.spec.parameter_golf, "eval_protocol", "mid_fidelity")) == "scout_fast":
+        if (
+            str(getattr(candidate.spec.parameter_golf, "eval_protocol", "mid_fidelity"))
+            == "scout_fast"
+        ):
             metrics["main_track_eligible_est"] = 0.0
             if "main_track_eligible_exact" in metrics:
                 metrics["main_track_eligible_exact"] = 0.0
@@ -743,7 +746,9 @@ class EvolutionRunner:
         candidate.metrics["complexity_score"] = complexity_score(candidate.spec)
         if candidate.spec.parameter_golf is not None:
             edge_kwargs = self._artifact_budget_edge_kwargs(candidate.spec)
-            raw_payload_bytes, raw_total_bytes = estimate_artifact_total_bytes_for_spec(candidate.spec)
+            raw_payload_bytes, raw_total_bytes = estimate_artifact_total_bytes_for_spec(
+                candidate.spec
+            )
             calibrated_payload_bytes, calibrated_total_bytes = (
                 estimate_calibrated_artifact_total_bytes_for_spec(candidate.spec)
             )

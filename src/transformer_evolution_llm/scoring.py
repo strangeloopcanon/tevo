@@ -139,8 +139,17 @@ def complexity_score(spec: ArchitectureSpec) -> float:
 
         extras_total += float(len(block.extras))
         if block.extras:
-            memory_types = {"retro", "assoc_memory", "memory_tokens", "chunk_memory", "lookup_memory"}
-            if any(getattr(extra, "type", type(extra).__name__) in memory_types for extra in block.extras):
+            memory_types = {
+                "retro",
+                "assoc_memory",
+                "memory_tokens",
+                "chunk_memory",
+                "lookup_memory",
+            }
+            if any(
+                getattr(extra, "type", type(extra).__name__) in memory_types
+                for extra in block.extras
+            ):
                 memory_blocks += 1.0
 
         attn = block.attn
