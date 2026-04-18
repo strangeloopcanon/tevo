@@ -30,6 +30,47 @@ TEVO_MODAL_GPU=A10G modal run scripts/modal_run_benchmark.py \
 
 This writes `summary.json` + `history.json` into a persisted volume and downloads them to `runs/modal/<run_id>/` when `--download` is set.
 
+## Parameter Golf runs
+Put the challenge data and tokenizer in the Modal runs volume under `parameter_golf/`, for example:
+
+- `/runs/parameter_golf/fineweb10b_sp1024/train_000.bin`
+- `/runs/parameter_golf/fineweb10b_sp1024/val_000.bin`
+- `/runs/parameter_golf/tokenizers/sp1024.model`
+
+The Parameter Golf configs in this repo use `runs/parameter_golf/...` paths on purpose. The dedicated runner remaps those to the Modal volume automatically.
+
+Preflight a config locally before launching:
+```bash
+evo-loop parameter-golf-preflight configs/pg_lane2_shared_depth.yaml
+```
+
+Run a single truth-check benchmark on Modal:
+```bash
+TEVO_MODAL_GPU=H100 modal run scripts/modal_run_parameter_golf.py \
+  --mode benchmark \
+  --config-path configs/pg_lane2_shared_depth.yaml \
+  --steps 120 --eval-batches 2 \
+  --download
+```
+
+Run a size-aware evolution sweep on Modal:
+```bash
+TEVO_MODAL_GPU=H100 modal run scripts/modal_run_parameter_golf.py \
+  --mode evolution \
+  --config-path configs/pg_lane2_shared_depth.yaml \
+  --generations 24 --steps 120 --eval-batches 2 \
+  --download
+```
+
+This writes a `preflight.json` file for every run, plus:
+
+- benchmark mode: `summary.json`, `run.log`
+- evolution mode: `frontier.json`, `frontier.state.json`, `frontier.manifest.json`, `run.log`
+
+These land in the Modal volume under `parameter_golf_modal/<run_id>/` and download to `runs/modal_parameter_golf/<run_id>/` when `--download` is set.
+
+Important: this is a practical TEVO search and truth-check path, not the final official submission path. Final leaderboard claims still need a reproducible run in the official Parameter Golf repo on `8xH100`.
+
 ## Nanochat-style FineWeb matrix (staggered budgets)
 ```bash
 ./run_nanochat_fineweb_modal_matrix.sh

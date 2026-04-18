@@ -11,6 +11,7 @@ import gc
 import json as std_json
 import math
 import time
+import traceback
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from pathlib import Path
@@ -27,6 +28,16 @@ from .evaluation import estimate_flops_per_token
 from .models import BranchRouter, EvolutionModel, MoELayer, count_parameters
 from .morphology import match_experts_to_parent, sort_moe_experts
 from .optimizers import apply_gradient_transform_, apply_update_filter_, build_optimizer
+from .parameter_golf import (
+    DEFAULT_STANDARD_EVAL_MODE,
+    DEFAULT_SLIDING_EVAL_MODE,
+    ParameterGolfDataModule,
+    build_sentencepiece_luts,
+    dequantize_state_dict_int8,
+    eval_parameter_golf_val,
+    measure_quantized_artifact,
+    quantize_state_dict_int8,
+)
 from .probes import _estimate_long_recall, run_downstream_probes, run_multi_needle_probes
 from .training_metrics import _average_router_entropy, compute_speedrun_auc, fit_learning_curve
 
@@ -77,12 +88,155 @@ class FullWeightTrainer:
         self.instability_threshold = instability_threshold
         self.no_improve_patience = no_improve_patience
         self.improvement_tolerance = improvement_tolerance
-        self._eval_module_cache: dict[str, DataModule] = {}
+        self._eval_module_cache: dict[str, Any] = {}
+        self._pg_lut_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.last_parameter_golf_error: str | None = None
         self.speedrun_callback = speedrun_callback
+
+    def _micro_batch_tokens(self, spec: ArchitectureSpec) -> int:
+        return max(1, int(spec.data.seq_len) * int(spec.data.batch_size))
+
+    def _grad_accum_steps(self, spec: ArchitectureSpec) -> int:
+        target_tokens = getattr(spec.train, "batch_tokens", None)
+        micro_tokens = self._micro_batch_tokens(spec)
+        if target_tokens is None:
+            return 1
+        return max(1, math.ceil(float(target_tokens) / float(micro_tokens)))
+
+    def _parameter_golf_wallclock_seconds(self, spec: ArchitectureSpec) -> float | None:
+        if spec.parameter_golf is None:
+            return None
+        configured = getattr(spec.parameter_golf, "max_wallclock_seconds", None)
+        if configured is not None:
+            return float(configured)
+        if str(getattr(spec.parameter_golf, "track", "") or "").lower() == "10min":
+            return 600.0
+        return None
+
+    def _parameter_golf_eval_protocol(self, spec: ArchitectureSpec) -> str:
+        if spec.parameter_golf is None:
+            return "mid_fidelity"
+        return str(getattr(spec.parameter_golf, "eval_protocol", "mid_fidelity") or "mid_fidelity")
+
+    def _parameter_golf_report_eval_modes(self, spec: ArchitectureSpec) -> list[str]:
+        if spec.parameter_golf is None:
+            return ["standard"]
+        modes = list(getattr(spec.parameter_golf, "report_eval_modes", None) or ["standard"])
+        ordered: list[str] = []
+        for mode in modes:
+            value = str(mode or "standard")
+            if value not in ordered:
+                ordered.append(value)
+        if "standard" not in ordered:
+            ordered.insert(0, "standard")
+        return ordered
+
+    def _parameter_golf_eval_token_budget(
+        self,
+        spec: ArchitectureSpec,
+        *,
+        fallback_eval_tokens: int | None,
+    ) -> int | None:
+        protocol = self._parameter_golf_eval_protocol(spec)
+        if protocol == "truth_full":
+            return None
+        if fallback_eval_tokens is not None:
+            return int(fallback_eval_tokens)
+        if spec.parameter_golf is not None and spec.parameter_golf.val_batch_tokens is not None:
+            return int(spec.parameter_golf.val_batch_tokens)
+        return getattr(spec.data, "eval_tokens", None)
+
+    def _predict_elapsed_seconds(self, samples: list[float], *, fallback_seconds: float) -> float:
+        recent = [float(item) for item in samples[-4:] if float(item) > 0.0]
+        if recent:
+            return float(sum(recent) / len(recent))
+        return max(float(fallback_seconds), 0.0)
+
+    def _parameter_golf_val_batch_tokens(
+        self,
+        spec: ArchitectureSpec,
+        *,
+        fallback_eval_tokens: int | None = None,
+    ) -> int:
+        if spec.parameter_golf is None:
+            if fallback_eval_tokens is not None:
+                return max(int(spec.data.seq_len), int(fallback_eval_tokens))
+            return max(1, int(spec.data.seq_len) * int(spec.data.batch_size))
+
+        configured = getattr(spec.parameter_golf, "val_batch_tokens", None)
+        if configured is not None:
+            return max(int(spec.data.seq_len), int(configured))
+        if fallback_eval_tokens is not None:
+            return max(int(spec.data.seq_len), int(fallback_eval_tokens))
+        eval_tokens = getattr(spec.data, "eval_tokens", None)
+        if eval_tokens is not None:
+            return max(int(spec.data.seq_len), int(eval_tokens))
+        return max(1, int(spec.data.seq_len) * int(spec.data.batch_size))
+
+    def _muon_momentum_for_step(
+        self,
+        spec: ArchitectureSpec,
+        *,
+        base_momentum: float | None,
+        step_idx: int,
+    ) -> float | None:
+        if base_momentum is None:
+            return None
+        optimizer_cfg = getattr(spec.train, "optimizer", None)
+        if optimizer_cfg is None:
+            return base_momentum
+        warmup_steps = int(getattr(optimizer_cfg, "muon_momentum_warmup_steps", 0) or 0)
+        warmup_start = getattr(optimizer_cfg, "muon_momentum_warmup_start", None)
+        if warmup_steps <= 0 or warmup_start is None:
+            return base_momentum
+        frac = min(float(max(step_idx, 0)) / float(max(warmup_steps, 1)), 1.0)
+        return (1.0 - frac) * float(warmup_start) + frac * float(base_momentum)
+
+    def _apply_optimizer_schedule(
+        self,
+        optimizer: torch.optim.Optimizer,
+        base_lrs: list[float],
+        base_momentums: list[float | None],
+        spec: ArchitectureSpec,
+        *,
+        step_idx: int,
+        total_steps: int,
+        elapsed_s: float,
+    ) -> None:
+        warmup = int(getattr(spec.train, "warmup", 0) or 0)
+        warmdown = int(getattr(spec.train, "warmdown_steps", 0) or 0)
+        scale = 1.0
+        if warmup > 0:
+            scale = min(scale, float(step_idx + 1) / float(warmup))
+        wallclock_limit = self._parameter_golf_wallclock_seconds(spec)
+        if warmdown > 0:
+            if wallclock_limit is not None and elapsed_s > 0.0 and step_idx > 0:
+                max_wallclock_ms = float(wallclock_limit) * 1000.0
+                elapsed_ms = float(elapsed_s) * 1000.0
+                step_ms = elapsed_ms / float(max(step_idx, 1))
+                warmdown_ms = float(warmdown) * step_ms
+                remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+                if remaining_ms <= warmdown_ms:
+                    scale = min(scale, remaining_ms / max(warmdown_ms, 1.0e-9))
+            elif total_steps > 0:
+                remaining = max(0, total_steps - step_idx)
+                if remaining < warmdown:
+                    scale = min(scale, float(remaining) / float(warmdown))
+        for idx, (group, base_lr) in enumerate(zip(optimizer.param_groups, base_lrs, strict=True)):
+            group["lr"] = base_lr * scale
+            base_momentum = base_momentums[idx]
+            if "momentum" in group:
+                momentum = self._muon_momentum_for_step(
+                    spec,
+                    base_momentum=base_momentum,
+                    step_idx=step_idx,
+                )
+                if momentum is not None:
+                    group["momentum"] = float(momentum)
 
     def _get_eval_module(
         self, spec: ArchitectureSpec, *, eval_batches: int | None = None
-    ) -> tuple[DataModule, int]:
+    ) -> tuple[Any, int]:
         """Return a deterministic eval DataModule + token budget.
 
         If `data.eval_shards` is provided, use it. Otherwise, reuse the training
@@ -107,6 +261,26 @@ class FullWeightTrainer:
             eval_tokens = int(spec.data.seq_len) * int(spec.data.batch_size) * batches
 
         seed_val = int(getattr(spec.train, "seed", 0) or 0)
+        if spec.parameter_golf is not None:
+            cache_payload = {
+                "parameter_golf": spec.parameter_golf.model_dump(mode="python"),
+                "seq_len": int(spec.data.seq_len),
+                "batch_size": int(spec.data.batch_size),
+            }
+            cache_key = std_json.dumps(cache_payload, sort_keys=True)
+            cache_key = f"{seed_val + 1}:{cache_key}"
+            eval_module = self._eval_module_cache.get(cache_key)
+            if eval_module is None:
+                eval_module = ParameterGolfDataModule(
+                    spec.parameter_golf,
+                    seq_len=spec.data.seq_len,
+                    batch_size=spec.data.batch_size,
+                    seed=seed_val + 1,
+                )
+                self._eval_module_cache[cache_key] = eval_module
+            eval_module.reset_rng(seed_val + 1)
+            return eval_module, eval_tokens
+
         cache_key = std_json.dumps(eval_cfg.model_dump(mode="python"), sort_keys=True)
         cache_key = f"{seed_val + 1}:{cache_key}"
         eval_module = self._eval_module_cache.get(cache_key)
@@ -115,6 +289,291 @@ class FullWeightTrainer:
             self._eval_module_cache[cache_key] = eval_module
         eval_module.reset_rng(seed_val + 1)
         return eval_module, eval_tokens
+
+    def _eval_batches(self, eval_module: Any, *, eval_tokens: int) -> Iterable[TokenBatch]:
+        if isinstance(eval_module, ParameterGolfDataModule):
+            return eval_module.batches(max_tokens=eval_tokens, split="val")
+        return eval_module.batches(max_tokens=eval_tokens)
+
+    def _parameter_golf_exact_eval_device(self) -> torch.device:
+        # Apple GPU memory is too tight for the exact challenge scorer at realistic
+        # validation batch sizes, so run the final exact check on CPU there.
+        if self.device.type == "mps":
+            return torch.device("cpu")
+        return self.device
+
+    def _get_parameter_golf_luts(
+        self,
+        spec: ArchitectureSpec,
+        *,
+        device: torch.device | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if spec.parameter_golf is None:
+            raise ValueError("parameter_golf config is required for challenge evaluation")
+        eval_device = self._parameter_golf_exact_eval_device() if device is None else device
+        cache_key = (
+            f"{eval_device.type}:{eval_device.index}:{spec.parameter_golf.tokenizer_path}:"
+            f"{spec.model.head.vocab}"
+        )
+        cached = self._pg_lut_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        luts = build_sentencepiece_luts(
+            spec.parameter_golf.tokenizer_path,
+            vocab_size=spec.model.head.vocab,
+            device=eval_device,
+        )
+        self._pg_lut_cache[cache_key] = luts
+        return luts
+
+    def _build_parameter_golf_eval_model(
+        self,
+        spec: ArchitectureSpec,
+        *,
+        state_dict: dict[str, torch.Tensor],
+        recurrence_steps: dict[int, int],
+        device: torch.device,
+    ) -> EvolutionModel:
+        eval_model = EvolutionModel(spec.model).to(device)
+        eval_model.load_state_dict(state_dict, strict=False)
+        if recurrence_steps:
+            eval_model.set_recurrence_steps(recurrence_steps)
+        return eval_model
+
+    def _parameter_golf_failure_metrics(self, spec: ArchitectureSpec) -> dict[str, float]:
+        if spec.parameter_golf is None:
+            return {}
+        budget = float(spec.parameter_golf.artifact_budget_bytes)
+        code_bytes = float(spec.parameter_golf.code_bytes)
+        return {
+            "val_loss": 1e9,
+            "val_bpb": 1e9,
+            "val_bpb_standard": 1e9,
+            "post_quant_val_bpb": 1e9,
+            "post_quant_val_bpb_standard": 1e9,
+            "quantization_delta_bpb": 1e9,
+            "artifact_code_bytes": code_bytes,
+            "artifact_budget_bytes": budget,
+            "artifact_payload_bytes": 1e9,
+            "artifact_raw_torch_bytes": 1e9,
+            "artifact_zlib_bytes": 1e9,
+            "artifact_total_bytes": 1e9,
+            "artifact_over_budget_bytes": 1e9,
+            "parameter_golf_error": 1.0,
+            "parameter_golf_eval_batch_tokens_used": 0.0,
+            "parameter_golf_post_quant_eval_batch_tokens_used": 0.0,
+            "parameter_golf_eval_backoff_count": 0.0,
+        }
+
+    def _parameter_golf_eval_batch_token_candidates(
+        self,
+        *,
+        seq_len: int,
+        batch_tokens: int,
+    ) -> list[int]:
+        minimum = max(1, int(seq_len))
+        current = max(minimum, int(batch_tokens))
+        candidates: list[int] = []
+        while True:
+            if current not in candidates:
+                candidates.append(current)
+            if current <= minimum:
+                break
+            current = max(minimum, current // 2)
+        return candidates
+
+    def _parameter_golf_retryable_eval_error(self, exc: Exception) -> bool:
+        if isinstance(exc, torch.OutOfMemoryError):
+            return True
+        message = str(exc).lower()
+        retryable_snippets = (
+            "out of memory",
+            "cuda error: out of memory",
+            "mps backend out of memory",
+            "resource exhausted",
+        )
+        return any(snippet in message for snippet in retryable_snippets)
+
+    def _parameter_golf_clear_eval_memory(self, device: torch.device) -> None:
+        gc.collect()
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            return
+        if device.type == "mps" and hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
+    def _evaluate_parameter_golf_modes_with_backoff(
+        self,
+        model: EvolutionModel,
+        *,
+        spec: ArchitectureSpec,
+        val_tokens: torch.Tensor,
+        base_bytes_lut: torch.Tensor,
+        has_leading_space_lut: torch.Tensor,
+        is_boundary_token_lut: torch.Tensor,
+        device: torch.device,
+        batch_tokens: int,
+        eval_token_budget: int | None,
+        report_modes: list[str],
+    ) -> tuple[dict[str, tuple[float, float]], int, int]:
+        candidates = self._parameter_golf_eval_batch_token_candidates(
+            seq_len=spec.data.seq_len,
+            batch_tokens=batch_tokens,
+        )
+        last_error: Exception | None = None
+        for backoff_count, candidate_batch_tokens in enumerate(candidates):
+            try:
+                results: dict[str, tuple[float, float]] = {}
+                for eval_mode in report_modes:
+                    results[eval_mode] = eval_parameter_golf_val(
+                        model,
+                        seq_len=spec.data.seq_len,
+                        val_tokens=val_tokens,
+                        base_bytes_lut=base_bytes_lut,
+                        has_leading_space_lut=has_leading_space_lut,
+                        is_boundary_token_lut=is_boundary_token_lut,
+                        device=device,
+                        batch_tokens=candidate_batch_tokens,
+                        eval_mode=eval_mode,
+                        total_eval_tokens=eval_token_budget,
+                    )
+                return results, candidate_batch_tokens, backoff_count
+            except Exception as exc:
+                last_error = exc
+                if not self._parameter_golf_retryable_eval_error(exc):
+                    raise
+                if candidate_batch_tokens <= int(spec.data.seq_len):
+                    raise
+                self._parameter_golf_clear_eval_memory(device)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Parameter Golf evaluation failed before any scoring attempt.")
+
+    def _evaluate_parameter_golf_metrics(
+        self,
+        model: EvolutionModel,
+        spec: ArchitectureSpec,
+        *,
+        recurrence_steps: dict[int, int],
+    ) -> dict[str, float]:
+        if spec.parameter_golf is None:
+            return {}
+        self.last_parameter_golf_error = None
+        eval_model: EvolutionModel | None = None
+        quant_model: EvolutionModel | None = None
+        try:
+            eval_module, eval_tokens = self._get_eval_module(spec)
+            if not isinstance(eval_module, ParameterGolfDataModule):
+                raise TypeError("Parameter Golf evaluation requires ParameterGolfDataModule")
+            val_tokens = eval_module.validation_tokens()
+            eval_device = self._parameter_golf_exact_eval_device()
+            state_dict = {
+                key: value.detach().to(device="cpu") for key, value in model.state_dict().items()
+            }
+            if eval_device == self.device:
+                eval_model = model
+            else:
+                eval_model = self._build_parameter_golf_eval_model(
+                    spec,
+                    state_dict=state_dict,
+                    recurrence_steps=recurrence_steps,
+                    device=eval_device,
+                )
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = (
+                self._get_parameter_golf_luts(spec, device=eval_device)
+            )
+            batch_tokens = self._parameter_golf_val_batch_tokens(
+                spec,
+                fallback_eval_tokens=eval_tokens,
+            )
+            eval_token_budget = self._parameter_golf_eval_token_budget(
+                spec,
+                fallback_eval_tokens=eval_tokens,
+            )
+            report_modes = self._parameter_golf_report_eval_modes(spec)
+            val_results, val_batch_tokens_used, val_backoff_count = (
+                self._evaluate_parameter_golf_modes_with_backoff(
+                    eval_model,
+                    spec=spec,
+                    val_tokens=val_tokens,
+                    base_bytes_lut=base_bytes_lut,
+                    has_leading_space_lut=has_leading_space_lut,
+                    is_boundary_token_lut=is_boundary_token_lut,
+                    device=eval_device,
+                    batch_tokens=batch_tokens,
+                    eval_token_budget=eval_token_budget,
+                    report_modes=report_modes,
+                )
+            )
+            val_loss, val_bpb = val_results["standard"]
+            artifact_metrics = measure_quantized_artifact(
+                state_dict,
+                code_bytes=spec.parameter_golf.code_bytes,
+                artifact_budget_bytes=spec.parameter_golf.artifact_budget_bytes,
+                parameter_golf=spec.parameter_golf,
+            )
+            quant_payload, _ = quantize_state_dict_int8(
+                state_dict,
+                parameter_golf=spec.parameter_golf,
+            )
+            restored_state = dequantize_state_dict_int8(quant_payload)
+            quant_model = self._build_parameter_golf_eval_model(
+                spec,
+                state_dict=restored_state,
+                recurrence_steps=recurrence_steps,
+                device=eval_device,
+            )
+            post_quant_results, post_quant_batch_tokens_used, post_quant_backoff_count = (
+                self._evaluate_parameter_golf_modes_with_backoff(
+                    quant_model,
+                    spec=spec,
+                    val_tokens=val_tokens,
+                    base_bytes_lut=base_bytes_lut,
+                    has_leading_space_lut=has_leading_space_lut,
+                    is_boundary_token_lut=is_boundary_token_lut,
+                    device=eval_device,
+                    batch_tokens=batch_tokens,
+                    eval_token_budget=eval_token_budget,
+                    report_modes=report_modes,
+                )
+            )
+            _, post_quant_val_bpb = post_quant_results["standard"]
+            metrics = dict(artifact_metrics)
+            metrics.update(
+                {
+                    "val_loss": float(val_loss),
+                    "val_bpb": float(val_bpb),
+                    "val_bpb_standard": float(val_bpb),
+                    "post_quant_val_bpb": float(post_quant_val_bpb),
+                    "post_quant_val_bpb_standard": float(post_quant_val_bpb),
+                    "quantization_delta_bpb": float(post_quant_val_bpb - val_bpb),
+                    "parameter_golf_error": 0.0,
+                    "parameter_golf_eval_batch_tokens_used": float(val_batch_tokens_used),
+                    "parameter_golf_post_quant_eval_batch_tokens_used": float(
+                        post_quant_batch_tokens_used
+                    ),
+                    "parameter_golf_eval_backoff_count": float(
+                        val_backoff_count + post_quant_backoff_count
+                    ),
+                }
+            )
+            if DEFAULT_SLIDING_EVAL_MODE in val_results:
+                metrics["val_bpb_sliding64"] = float(val_results[DEFAULT_SLIDING_EVAL_MODE][1])
+            if DEFAULT_SLIDING_EVAL_MODE in post_quant_results:
+                metrics["post_quant_val_bpb_sliding64"] = float(
+                    post_quant_results[DEFAULT_SLIDING_EVAL_MODE][1]
+                )
+            return metrics
+        except Exception as exc:
+            self.last_parameter_golf_error = (
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc().strip()}"
+            )
+            return self._parameter_golf_failure_metrics(spec)
+        finally:
+            if eval_model is not None and eval_model is not model:
+                del eval_model
+            if quant_model is not None:
+                del quant_model
 
     def _checkpoint_torch_dtype(self) -> torch.dtype:
         key = (self.checkpoint_dtype or "fp16").lower()
@@ -197,8 +656,12 @@ class FullWeightTrainer:
                 if compatible_state:
                     model.load_state_dict(compatible_state, strict=False)
                 # fall back to random init for the rest
-        optimizer = build_optimizer(model.parameters(), spec.train)
+        optimizer = build_optimizer(model, spec.train)
         base_lrs = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+        base_momentums = [
+            float(group.get("momentum")) if group.get("momentum") is not None else None
+            for group in optimizer.param_groups
+        ]
         criterion = nn.CrossEntropyLoss(ignore_index=-100)
         start_time = time.perf_counter()
         tokens_seen = 0
@@ -211,6 +674,9 @@ class FullWeightTrainer:
         max_loss_jump = 0.0
         optimizer.zero_grad()
         total_steps = max(1, self.steps)
+        grad_accum_steps = self._grad_accum_steps(spec)
+        micro_batch_tokens = self._micro_batch_tokens(spec)
+        effective_batch_tokens = micro_batch_tokens * grad_accum_steps
         # Track losses for learning curve fitting
         loss_history_steps: list[int] = []
         loss_history_values: list[float] = []
@@ -249,7 +715,7 @@ class FullWeightTrainer:
             speedrun_target_loss = math.log(speedrun_target_ppl)
         speedrun_enabled = speedrun_interval > 0
         speedrun_eval_failed = False
-        speedrun_eval_module: DataModule | None = None
+        speedrun_eval_module: Any | None = None
         speedrun_eval_tokens = 0
         speedrun_error = 0.0
         speedrun_reached = False
@@ -265,13 +731,38 @@ class FullWeightTrainer:
         speedrun_prev_eval_time = 0.0
         speedrun_prev_eval_flops = 0.0
         flops_seen = 0.0
+        wallclock_limit_s = self._parameter_golf_wallclock_seconds(spec)
+        train_step_durations: list[float] = []
+        speedrun_eval_durations: list[float] = []
+        parameter_golf_periodic_durations: list[float] = []
+        parameter_golf_val_every = 0
+        parameter_golf_val_batch_tokens = 0
+        parameter_golf_periodic_best_bpb = float("inf")
+        parameter_golf_periodic_last_bpb = 1e9
+        parameter_golf_periodic_last_loss = 1e9
+        parameter_golf_periodic_count = 0
+        parameter_golf_periodic_skipped = 0
+        parameter_golf_periodic_error = 0.0
+        parameter_golf_val_tokens: torch.Tensor | None = None
+        parameter_golf_luts: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        if spec.parameter_golf is not None:
+            parameter_golf_val_every = int(getattr(spec.parameter_golf, "val_loss_every", 0) or 0)
+            parameter_golf_val_batch_tokens = self._parameter_golf_val_batch_tokens(spec)
+            if parameter_golf_val_every > 0:
+                try:
+                    eval_module, _ = self._get_eval_module(spec)
+                    if isinstance(eval_module, ParameterGolfDataModule):
+                        parameter_golf_val_tokens = eval_module.validation_tokens()
+                        parameter_golf_luts = self._get_parameter_golf_luts(spec)
+                except Exception:
+                    parameter_golf_periodic_error = 1.0
 
         # Multi-threshold speedrun tracking
         multi_thresholds_raw = getattr(spec.train, "speedrun_multi_thresholds", None)
         multi_thresholds: list[float] = []
         if multi_thresholds_raw:
             threshold_inputs: list[Any]
-            if isinstance(multi_thresholds_raw, (str, int, float)):
+            if isinstance(multi_thresholds_raw, str | int | float):
                 threshold_inputs = [multi_thresholds_raw]
             else:
                 threshold_inputs = list(multi_thresholds_raw)
@@ -293,74 +784,131 @@ class FullWeightTrainer:
             spec,
             recurrence_steps=self._recurrence_schedule(spec, self.steps, total_steps),
         )
-        for step_idx in range(self.steps):
+        grad_total: float | torch.Tensor = 0.0
+        optimizer_step_idx = 0
+        while optimizer_step_idx < self.steps:
             recurrence_steps: dict[int, int] = {}
             if spec.model.recurrences:
-                recurrence_steps = self._recurrence_schedule(spec, step_idx, total_steps)
+                recurrence_steps = self._recurrence_schedule(spec, optimizer_step_idx, total_steps)
                 model.set_recurrence_steps(recurrence_steps)
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                stop_reason = (
-                    "token_budget" if getattr(batch_iter, "max_tokens", None) else "data_exhausted"
+            elapsed_s = max(time.perf_counter() - start_time, 0.0)
+            if wallclock_limit_s is not None and optimizer_step_idx > 0:
+                predicted_step_s = self._predict_elapsed_seconds(
+                    train_step_durations,
+                    fallback_seconds=max(elapsed_s / float(max(optimizer_step_idx, 1)), 0.0),
                 )
-                break
-            warmup = int(getattr(spec.train, "warmup", 0) or 0)
-            if warmup > 0:
-                scale = min(1.0, float(step_idx + 1) / float(warmup))
-                for group, base_lr in zip(optimizer.param_groups, base_lrs, strict=True):
-                    group["lr"] = base_lr * scale
-            input_ids = batch.input_ids.to(self.device)
-            attn_mask = batch.attention_mask.to(self.device)
-            with autocast_ctx:
-                logits = model(input_ids)
-                # Next-token prediction (causal LM): predict input_ids[t+1] from input_ids[:t+1]
-                if logits.size(1) <= 1:
-                    stop_reason = "data_exhausted"
+                remaining_s = float(wallclock_limit_s) - float(elapsed_s)
+                if remaining_s <= max(predicted_step_s, 1e-3):
+                    stop_reason = "wallclock_cap"
                     break
-                shifted_logits = logits[:, :-1, :].contiguous()
-                labels = input_ids[:, 1:].contiguous()
-                label_mask = attn_mask[:, 1:].contiguous()
-                labels = labels.masked_fill(label_mask == 0, -100)
-                loss = criterion(shifted_logits.view(-1, shifted_logits.size(-1)), labels.view(-1))
-            # Auxiliary MoE routing losses
-            aux_loss = torch.tensor(0.0, device=self.device)
-            lb_coeff = float(getattr(spec.train, "router_lb_coeff", 0.0) or 0.0)
-            ent_coeff = float(getattr(spec.train, "router_entropy_coeff", 0.0) or 0.0)
-            for mod in model.modules():
-                if not isinstance(mod, MoELayer):
-                    continue
-                layer_ent = ent_coeff
-                layer_lb = lb_coeff
-                cfg = getattr(mod, "cfg", None)
-                if cfg is not None:
-                    # Per-layer coefficients: treat as multiplier if a global coeff is set,
-                    # otherwise treat as an absolute override.
-                    aux = getattr(cfg, "router_aux_weight", None)
-                    if aux is not None:
-                        aux_val = float(aux)
-                        layer_ent = layer_ent * aux_val if layer_ent > 0.0 else aux_val
-                    lbw = getattr(cfg, "router_lb_weight", None)
-                    if lbw is not None:
-                        lb_val = float(lbw)
-                        layer_lb = layer_lb * lb_val if layer_lb > 0.0 else lb_val
-                    elif layer_lb == 0.0:
-                        layer_lb = float(getattr(cfg, "balance", 0.0) or 0.0)
-                if layer_ent > 0.0 and hasattr(mod, "last_entropy"):
-                    aux_loss = aux_loss + (-layer_ent) * mod.last_entropy
-                if layer_lb > 0.0 and hasattr(mod, "last_lb"):
-                    aux_loss = aux_loss + layer_lb * mod.last_lb
-            loss = loss + aux_loss
-            current_loss = float(loss.item())
-            if not math.isfinite(current_loss):
-                nan_or_inf = True
-                stop_reason = "nan_or_inf_loss"
-                optimizer.zero_grad()
+            self._apply_optimizer_schedule(
+                optimizer,
+                base_lrs,
+                base_momentums,
+                spec,
+                step_idx=optimizer_step_idx,
+                total_steps=total_steps,
+                elapsed_s=elapsed_s,
+            )
+
+            micro_batches_taken = 0
+            step_loss_total = 0.0
+            step_tokens = 0
+            step_started_at = time.perf_counter()
+            while micro_batches_taken < grad_accum_steps:
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    if micro_batches_taken <= 0:
+                        stop_reason = (
+                            "token_budget"
+                            if getattr(batch_iter, "max_tokens", None)
+                            else "data_exhausted"
+                        )
+                        break
+                    stop_reason = (
+                        "token_budget"
+                        if getattr(batch_iter, "max_tokens", None)
+                        else "data_exhausted"
+                    )
+                    break
+
+                input_ids = batch.input_ids.to(self.device)
+                attn_mask = batch.attention_mask.to(self.device)
+                target_ids = (
+                    batch.target_ids.to(self.device) if batch.target_ids is not None else None
+                )
+                with autocast_ctx:
+                    logits = model(input_ids)
+                    # Next-token prediction (causal LM): predict input_ids[t+1] from input_ids[:t+1]
+                    if target_ids is None and logits.size(1) <= 1:
+                        stop_reason = "data_exhausted"
+                        break
+                    if target_ids is None:
+                        shifted_logits = logits[:, :-1, :].contiguous()
+                        labels = input_ids[:, 1:].contiguous()
+                        label_mask = attn_mask[:, 1:].contiguous()
+                    else:
+                        shifted_logits = logits.contiguous()
+                        labels = target_ids.contiguous()
+                        label_mask = attn_mask.contiguous()
+                    labels = labels.masked_fill(label_mask == 0, -100)
+                    loss = criterion(
+                        shifted_logits.view(-1, shifted_logits.size(-1)),
+                        labels.view(-1),
+                    )
+                # Auxiliary MoE routing losses
+                aux_loss = torch.tensor(0.0, device=self.device)
+                lb_coeff = float(getattr(spec.train, "router_lb_coeff", 0.0) or 0.0)
+                ent_coeff = float(getattr(spec.train, "router_entropy_coeff", 0.0) or 0.0)
+                for mod in model.modules():
+                    if not isinstance(mod, MoELayer):
+                        continue
+                    layer_ent = ent_coeff
+                    layer_lb = lb_coeff
+                    cfg = getattr(mod, "cfg", None)
+                    if cfg is not None:
+                        # Per-layer coefficients: treat as multiplier if a global coeff is set,
+                        # otherwise treat as an absolute override.
+                        aux = getattr(cfg, "router_aux_weight", None)
+                        if aux is not None:
+                            aux_val = float(aux)
+                            layer_ent = layer_ent * aux_val if layer_ent > 0.0 else aux_val
+                        lbw = getattr(cfg, "router_lb_weight", None)
+                        if lbw is not None:
+                            lb_val = float(lbw)
+                            layer_lb = layer_lb * lb_val if layer_lb > 0.0 else lb_val
+                        elif layer_lb == 0.0:
+                            layer_lb = float(getattr(cfg, "balance", 0.0) or 0.0)
+                    if layer_ent > 0.0 and hasattr(mod, "last_entropy"):
+                        aux_loss = aux_loss + (-layer_ent) * mod.last_entropy
+                    if layer_lb > 0.0 and hasattr(mod, "last_lb"):
+                        aux_loss = aux_loss + layer_lb * mod.last_lb
+                loss = loss + aux_loss
+                current_loss = float(loss.item())
+                if not math.isfinite(current_loss):
+                    nan_or_inf = True
+                    stop_reason = "nan_or_inf_loss"
+                    optimizer.zero_grad()
+                    break
+
+                step_loss_total += current_loss
+                micro_batches_taken += 1
+                try:
+                    step_tokens += int(attn_mask.sum().item())
+                except Exception:
+                    step_tokens += int(input_ids.numel())
+
+                (loss / float(grad_accum_steps)).backward()
+
+            if nan_or_inf or micro_batches_taken <= 0:
                 break
 
+            current_loss = step_loss_total / float(micro_batches_taken)
+
             # Track loss for learning curve fitting (every 5 steps to avoid overhead)
-            if (step_idx + 1) % 5 == 0 or step_idx == 0:
-                loss_history_steps.append(step_idx + 1)
+            if (optimizer_step_idx + 1) % 5 == 0 or optimizer_step_idx == 0:
+                loss_history_steps.append(optimizer_step_idx + 1)
                 loss_history_values.append(current_loss)
 
             # Track recent losses for stability (keep last 20)
@@ -369,17 +917,26 @@ class FullWeightTrainer:
                 recent_losses.pop(0)
 
             # Track early and mid losses for improvement rate
-            if step_idx == min(5, total_steps // 4):
+            if optimizer_step_idx == min(5, total_steps // 4):
                 early_loss = current_loss
-            if step_idx == total_steps // 2:
+            if optimizer_step_idx == total_steps // 2:
                 mid_loss = current_loss
 
-            loss.backward()
-            grad_total = clip_grad_norm_(model.parameters(), spec.train.clip)
-            if hasattr(grad_total, "item"):
-                grad_norm = float(grad_total.item())
+            if float(spec.train.clip) > 0.0:
+                grad_total = clip_grad_norm_(model.parameters(), spec.train.clip)
+                if hasattr(grad_total, "item"):
+                    grad_norm = float(grad_total.item())
+                else:
+                    grad_norm = float(grad_total)
             else:
-                grad_norm = float(grad_total)
+                grad_sq_sum = 0.0
+                for param in model.parameters():
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    grad_sq_sum += float(grad.detach().float().pow(2).sum().item())
+                grad_norm = math.sqrt(max(grad_sq_sum, 0.0))
+                grad_total = grad_norm
             if not math.isfinite(grad_norm):
                 nan_or_inf = True
                 stop_reason = "nan_or_inf_grad"
@@ -404,10 +961,7 @@ class FullWeightTrainer:
             update_filter_keep_history.append(float(keep_frac))
             optimizer.step()
             optimizer.zero_grad()
-            try:
-                step_tokens = int(attn_mask.sum().item())
-            except Exception:
-                step_tokens = int(input_ids.numel())
+            train_step_durations.append(max(time.perf_counter() - step_started_at, 1e-6))
             tokens_seen += step_tokens
             if step_tokens > 0:
                 flops_seen += float(step_tokens) * estimate_flops_per_token(
@@ -416,23 +970,43 @@ class FullWeightTrainer:
             if (
                 speedrun_enabled
                 and not speedrun_eval_failed
-                and (step_idx + 1) % speedrun_interval == 0
+                and (optimizer_step_idx + 1) % speedrun_interval == 0
             ):
                 if speedrun_eval_module is None:
                     try:
                         speedrun_eval_module, speedrun_eval_tokens = self._get_eval_module(
-                            spec, eval_batches=speedrun_eval_batches
+                            spec,
+                            eval_batches=speedrun_eval_batches,
                         )
                     except Exception:
                         speedrun_error = 1.0
                         speedrun_eval_failed = True
                         continue
+                if wallclock_limit_s is not None:
+                    elapsed_now = max(time.perf_counter() - start_time, 0.0)
+                    predicted_speedrun_s = self._predict_elapsed_seconds(
+                        speedrun_eval_durations,
+                        fallback_seconds=self._predict_elapsed_seconds(
+                            train_step_durations,
+                            fallback_seconds=max(
+                                elapsed_now / float(max(optimizer_step_idx + 1, 1)),
+                                0.0,
+                            ),
+                        ),
+                    )
+                    if float(wallclock_limit_s) - float(elapsed_now) <= predicted_speedrun_s:
+                        speedrun_error = 1.0
+                        continue
+                eval_started_at = time.perf_counter()
                 try:
                     speedrun_eval_module.reset_rng(seed_val + 1)
                     loss_val = self._evaluate_loss(
                         model,
                         spec,
-                        speedrun_eval_module.batches(max_tokens=speedrun_eval_tokens),
+                        self._eval_batches(
+                            speedrun_eval_module,
+                            eval_tokens=speedrun_eval_tokens,
+                        ),
                         criterion,
                         eval_batches=speedrun_eval_batches,
                         empty_value=1e9,
@@ -441,12 +1015,19 @@ class FullWeightTrainer:
                     speedrun_error = 1.0
                     speedrun_eval_failed = True
                     loss_val = 1e9
+                speedrun_eval_durations.append(
+                    max(time.perf_counter() - eval_started_at, 1e-6)
+                )
                 if loss_val < speedrun_best_loss:
                     speedrun_best_loss = loss_val
                 if math.isfinite(float(loss_val)):
                     speedrun_eval_points.append((float(tokens_seen), float(loss_val)))
                 if self.speedrun_callback is not None and math.isfinite(float(loss_val)):
-                    self.speedrun_callback(int(step_idx + 1), float(loss_val), int(tokens_seen))
+                    self.speedrun_callback(
+                        int(optimizer_step_idx + 1),
+                        float(loss_val),
+                        int(tokens_seen),
+                    )
                 if (
                     not speedrun_reached
                     and speedrun_target_loss is not None
@@ -454,7 +1035,7 @@ class FullWeightTrainer:
                     and loss_val <= speedrun_target_loss
                 ):
                     elapsed = max(time.perf_counter() - start_time, 1e-6)
-                    eval_step = int(step_idx + 1)
+                    eval_step = int(optimizer_step_idx + 1)
                     eval_tokens = float(tokens_seen)
                     eval_flops = float(flops_seen)
                     eval_time = float(elapsed)
@@ -484,7 +1065,7 @@ class FullWeightTrainer:
                     )
                 if math.isfinite(float(loss_val)):
                     speedrun_prev_eval_loss = float(loss_val)
-                    speedrun_prev_eval_step = int(step_idx + 1)
+                    speedrun_prev_eval_step = int(optimizer_step_idx + 1)
                     speedrun_prev_eval_tokens = float(tokens_seen)
                     speedrun_prev_eval_time = max(time.perf_counter() - start_time, 1e-6)
                     speedrun_prev_eval_flops = float(flops_seen)
@@ -523,6 +1104,59 @@ class FullWeightTrainer:
                             multi_threshold_reached[thresh] = True
                             multi_threshold_tokens[thresh] = interp_tokens
                             multi_threshold_flops[thresh] = interp_flops
+            if (
+                parameter_golf_val_every > 0
+                and parameter_golf_val_tokens is not None
+                and parameter_golf_luts is not None
+                and (optimizer_step_idx + 1) % parameter_golf_val_every == 0
+            ):
+                elapsed_now = max(time.perf_counter() - start_time, 0.0)
+                predicted_periodic_s = self._predict_elapsed_seconds(
+                    parameter_golf_periodic_durations,
+                    fallback_seconds=max(
+                        self._predict_elapsed_seconds(
+                            train_step_durations,
+                            fallback_seconds=max(elapsed_now / float(max(optimizer_step_idx + 1, 1)), 0.0),
+                        )
+                        * 2.0,
+                        1.0,
+                    ),
+                )
+                if (
+                    wallclock_limit_s is not None
+                    and float(wallclock_limit_s) - float(elapsed_now) <= predicted_periodic_s
+                ):
+                    parameter_golf_periodic_skipped += 1
+                else:
+                    eval_started_at = time.perf_counter()
+                    try:
+                        val_loss, val_bpb = eval_parameter_golf_val(
+                            model,
+                            seq_len=spec.data.seq_len,
+                            val_tokens=parameter_golf_val_tokens,
+                            base_bytes_lut=parameter_golf_luts[0],
+                            has_leading_space_lut=parameter_golf_luts[1],
+                            is_boundary_token_lut=parameter_golf_luts[2],
+                            device=self.device,
+                            batch_tokens=parameter_golf_val_batch_tokens,
+                            eval_mode=DEFAULT_STANDARD_EVAL_MODE,
+                            total_eval_tokens=self._parameter_golf_eval_token_budget(
+                                spec,
+                                fallback_eval_tokens=spec.data.eval_tokens,
+                            ),
+                        )
+                        parameter_golf_periodic_last_loss = float(val_loss)
+                        parameter_golf_periodic_last_bpb = float(val_bpb)
+                        parameter_golf_periodic_best_bpb = min(
+                            parameter_golf_periodic_best_bpb,
+                            float(val_bpb),
+                        )
+                        parameter_golf_periodic_count += 1
+                    except Exception:
+                        parameter_golf_periodic_error = 1.0
+                    parameter_golf_periodic_durations.append(
+                        max(time.perf_counter() - eval_started_at, 1e-6)
+                    )
             # Router entropy guard
             step_entropy = _average_router_entropy(model)
             if step_entropy is not None and step_entropy < self.entropy_threshold:
@@ -544,10 +1178,19 @@ class FullWeightTrainer:
                 if no_improve >= self.no_improve_patience:
                     stop_reason = "no_improve"
                     break
+            if (
+                wallclock_limit_s is not None
+                and (time.perf_counter() - start_time) >= wallclock_limit_s
+            ):
+                stop_reason = "wallclock_cap"
+                break
+            optimizer_step_idx += 1
+            if stop_reason in {"token_budget", "data_exhausted"}:
+                break
         if nan_or_inf:
             raise RuntimeError(f"Non-finite loss/grad encountered ({stop_reason}).")
-        duration = max(time.perf_counter() - start_time, 1e-6)
-        throughput = tokens_seen / duration
+        train_duration = max(time.perf_counter() - start_time, 1e-6)
+        throughput = tokens_seen / train_duration
         model.set_recurrence_steps(self._recurrence_schedule(spec, self.steps, total_steps))
         ppl_train = self._evaluate_perplexity(model, spec, batch_iter, criterion)
         ppl_eval = ppl_train
@@ -557,7 +1200,7 @@ class FullWeightTrainer:
             ppl_eval = self._evaluate_perplexity(
                 model,
                 spec,
-                eval_module.batches(max_tokens=eval_tokens),
+                self._eval_batches(eval_module, eval_tokens=eval_tokens),
                 criterion,
             )
         except Exception:
@@ -577,6 +1220,7 @@ class FullWeightTrainer:
         state = self._checkpoint_state(model)
         torch.save(state, checkpoint_path)
         del state
+        current_recurrence_steps = dict(getattr(model, "recurrence_steps", {}))
         # Aggregate router telemetry
         router_entropy = 0.0
         router_lb = 0.0
@@ -596,7 +1240,7 @@ class FullWeightTrainer:
         count_moe = 0
         with torch.no_grad():
             for mod in model.modules():
-                if isinstance(mod, (MoELayer, BranchRouter)):
+                if isinstance(mod, MoELayer | BranchRouter):
                     last = getattr(mod, "last_entropy", None)
                     if isinstance(last, torch.Tensor):
                         router_entropy += float(last.item())
@@ -635,6 +1279,8 @@ class FullWeightTrainer:
             reason_code = 4.0
         elif stop_reason == "data_exhausted":
             reason_code = 5.0
+        elif stop_reason == "wallclock_cap":
+            reason_code = 6.0
         moe_penalty = 1.0 + 0.01 * spec.model.moe_block_count()
         # Fit learning curve to predict long-term performance
         learning_curve_metrics = fit_learning_curve(
@@ -642,6 +1288,8 @@ class FullWeightTrainer:
             loss_history_values,
             target_steps=self.steps * 10,  # Extrapolate to 10x current training
         )
+        total_duration = max(time.perf_counter() - start_time, 1e-6)
+        post_eval_duration = max(total_duration - train_duration, 0.0)
         metrics = {
             "ppl_code": perplexity,
             "ppl_train": ppl_train,
@@ -686,7 +1334,37 @@ class FullWeightTrainer:
                 if gradient_transform_apply_history
                 else 0.0
             ),
+            "grad_accum_steps": float(grad_accum_steps),
+            "train_micro_batch_tokens": float(micro_batch_tokens),
+            "train_effective_batch_tokens": float(effective_batch_tokens),
+            "wallclock_seconds_used": float(train_duration),
+            "wallclock_seconds_budget": (
+                float(wallclock_limit_s) if wallclock_limit_s is not None else 0.0
+            ),
+            "wallclock_stop_triggered": 1.0 if stop_reason == "wallclock_cap" else 0.0,
+            "train_wallclock_seconds_used": float(train_duration),
+            "post_eval_wallclock_seconds_used": float(post_eval_duration),
+            "total_job_seconds_used": float(total_duration),
         }
+        if spec.parameter_golf is not None:
+            metrics.update(
+                {
+                    "parameter_golf_val_every_steps": float(parameter_golf_val_every),
+                    "parameter_golf_val_batch_tokens": float(parameter_golf_val_batch_tokens),
+                    "parameter_golf_periodic_val_count": float(parameter_golf_periodic_count),
+                    "parameter_golf_periodic_val_skipped": float(parameter_golf_periodic_skipped),
+                    "parameter_golf_periodic_val_last_loss": float(
+                        parameter_golf_periodic_last_loss
+                    ),
+                    "parameter_golf_periodic_val_last_bpb": float(parameter_golf_periodic_last_bpb),
+                    "parameter_golf_periodic_val_best_bpb": (
+                        float(parameter_golf_periodic_best_bpb)
+                        if math.isfinite(parameter_golf_periodic_best_bpb)
+                        else 1e9
+                    ),
+                    "parameter_golf_periodic_val_error": float(parameter_golf_periodic_error),
+                }
+            )
         # Add learning curve metrics
         metrics.update(learning_curve_metrics)
 
@@ -853,6 +1531,14 @@ class FullWeightTrainer:
                 metrics["speedrun_thresholds_reached"] = float(
                     sum(1 for t in multi_thresholds if multi_threshold_reached.get(t, False))
                 )
+        if spec.parameter_golf is not None:
+            metrics.update(
+                self._evaluate_parameter_golf_metrics(
+                    model,
+                    spec,
+                    recurrence_steps=current_recurrence_steps,
+                )
+            )
         metrics.update(passkey_metrics)
 
         # Run downstream probes if enabled
@@ -959,12 +1645,20 @@ class FullWeightTrainer:
                         break
                     input_ids = batch.input_ids.to(self.device)
                     attn_mask = batch.attention_mask.to(self.device)
+                    target_ids = (
+                        batch.target_ids.to(self.device) if batch.target_ids is not None else None
+                    )
                     logits = model(input_ids)
-                    if logits.size(1) <= 1:
+                    if target_ids is None and logits.size(1) <= 1:
                         continue
-                    shifted_logits = logits[:, :-1, :].contiguous()
-                    labels = input_ids[:, 1:].contiguous()
-                    label_mask = attn_mask[:, 1:].contiguous()
+                    if target_ids is None:
+                        shifted_logits = logits[:, :-1, :].contiguous()
+                        labels = input_ids[:, 1:].contiguous()
+                        label_mask = attn_mask[:, 1:].contiguous()
+                    else:
+                        shifted_logits = logits.contiguous()
+                        labels = target_ids.contiguous()
+                        label_mask = attn_mask.contiguous()
                     labels = labels.masked_fill(label_mask == 0, -100)
                     loss = criterion(
                         shifted_logits.view(-1, shifted_logits.size(-1)),

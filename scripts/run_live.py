@@ -11,8 +11,7 @@ from pathlib import Path
 
 import typer
 
-from transformer_evolution_llm.api import load_spec
-from transformer_evolution_llm.data import DataModule
+from transformer_evolution_llm.api import build_data_module_for_spec, load_spec
 from transformer_evolution_llm.orchestrator import EvolutionRunner, default_objectives
 from transformer_evolution_llm.trainer import FullWeightTrainer
 
@@ -258,7 +257,10 @@ def main(
         no_improve_patience=train_cfg.no_improve_patience,
         improvement_tolerance=train_cfg.improvement_tolerance,
     )
-    runner.data_module = DataModule(spec.data, seed=int(getattr(spec.train, "seed", 0) or 0))
+    runner.data_module = build_data_module_for_spec(
+        spec,
+        seed=int(getattr(spec.train, "seed", 0) or 0),
+    )
     # Log device/capabilities (best effort)
     try:
         import torch
@@ -271,30 +273,40 @@ def main(
     except Exception:
         pass
     runner.checkpoint_dir = checkpoint_dir
+    if state_out is None:
+        state_out = out.with_name(out.stem + ".state.json")
+    if lineage_out is None:
+        # default next to frontier
+        lineage_out = out.with_name(out.stem + "_lineage.json")
+
+    def persist_progress() -> None:
+        try:
+            runner.save_frontier(out)
+        except Exception as exc:
+            typer.echo(f"[runner] failed to write frontier: {exc}")
+        try:
+            runner.save_state(state_out)
+        except Exception:
+            pass
+        try:
+            runner.save_lineage(lineage_out)
+        except Exception:
+            pass
+
     run_error: str | None = None
     try:
-        runner.run(generations=generations)
+        for generation_idx in range(generations):
+            runner.run(generations=1)
+            persist_progress()
+            typer.echo(
+                f"[runner] completed_generation={generation_idx + 1}/{generations} "
+                f"frontier_size={len(runner.frontier.entries)}"
+            )
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
         typer.echo(f"[runner] run crashed: {run_error}")
         typer.echo(traceback.format_exc())
-    try:
-        runner.save_frontier(out)
-    except Exception as exc:
-        typer.echo(f"[runner] failed to write frontier: {exc}")
-    if state_out is None:
-        state_out = out.with_name(out.stem + ".state.json")
-    try:
-        runner.save_state(state_out)
-    except Exception:
-        pass
-    if lineage_out is None:
-        # default next to frontier
-        lineage_out = out.with_name(out.stem + "_lineage.json")
-    try:
-        runner.save_lineage(lineage_out)
-    except Exception:
-        pass
+        persist_progress()
     if run_error is not None:
         try:
             out.with_name(out.stem + ".error.txt").write_text(run_error + "\n")

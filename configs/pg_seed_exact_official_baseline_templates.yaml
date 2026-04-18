@@ -1,0 +1,37 @@
+templates:
+  - name: seed-exact-baseline-anchor
+    weight: 1.4
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+          muon_momentum_warmup_start: 0.85
+          muon_momentum_warmup_steps: 500
+  - name: seed-exact-baseline-fast-warmdown
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.06
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 3600
+          clip: 0.0
+      - tune_attn:
+          selector: random_dense
+          qk_norm: rms
+          softcap: 24.0

@@ -23,6 +23,8 @@ def default_objectives() -> ObjectiveDir:
         "throughput": "max",
         "ram": "min",
         "layers": "max",
+        "effective_depth": "max",
+        "physical_depth": "min",
         "moe_blocks": "max",
         "novelty": "max",
         "instability": "min",
@@ -33,7 +35,150 @@ def default_objectives() -> ObjectiveDir:
         "speedrun_tokens_to_target": "min",
         "speedrun_time_to_target": "min",
         "speedrun_best_eval_loss": "min",
+        "val_bpb": "min",
+        "post_quant_val_bpb": "min",
+        "artifact_total_bytes": "min",
+        "artifact_budget_utilization_est": "max",
+        "artifact_budget_utilization": "max",
+        "artifact_budget_fill_score_est": "max",
+        "artifact_budget_fill_score": "max",
+        "artifact_budget_edge_score_est": "max",
+        "artifact_budget_edge_score": "max",
+        "complexity_score": "max",
+        "quantization_delta_bpb": "min",
+        "official_submission_code_bytes_est": "min",
+        "official_submission_patch_bytes_est": "min",
+        "official_submission_total_bytes_est": "min",
+        "official_submission_unsupported_patch_reason_count": "min",
+        "main_track_eligible_est": "max",
+        "main_track_eligible_exact": "max",
+        "motif_transfer_eligible": "max",
+        "motif_anchor_delta_bpb": "max",
     }
+
+
+def artifact_budget_utilization(total_bytes: float | None, budget_bytes: float | None) -> float:
+    """Return how much of the artifact budget a candidate uses."""
+    if total_bytes is None or budget_bytes is None:
+        return 0.0
+    if float(budget_bytes) <= 0.0:
+        return 0.0
+    return float(total_bytes) / float(budget_bytes)
+
+
+def artifact_budget_fill_score(total_bytes: float | None, budget_bytes: float | None) -> float:
+    """Reward candidates that use most of the budget without drifting far over it."""
+    utilization = artifact_budget_utilization(total_bytes, budget_bytes)
+    if utilization <= 1.0:
+        return utilization
+    overflow = utilization - 1.0
+    return max(0.0, 1.0 - 4.0 * overflow)
+
+
+def artifact_budget_edge_score(
+    total_bytes: float | None,
+    budget_bytes: float | None,
+    *,
+    target_utilization: float = 0.96,
+    under_window: float = 0.35,
+    over_window: float = 0.10,
+) -> float:
+    """Reward candidates that sit near the budget edge without going far over.
+
+    This is stronger than plain utilization: it gives little credit to models
+    that are far under-filled, peaks just below the cap, and drops once they
+    drift meaningfully over budget.
+    """
+    utilization = artifact_budget_utilization(total_bytes, budget_bytes)
+    if utilization <= 0.0:
+        return 0.0
+    if utilization <= target_utilization:
+        distance = target_utilization - utilization
+        return max(0.0, 1.0 - distance / max(under_window, 1.0e-9))
+    overflow = utilization - target_utilization
+    return max(0.0, 1.0 - overflow / max(over_window, 1.0e-9))
+
+
+def complexity_score(spec: ArchitectureSpec) -> float:
+    """Estimate how structurally rich a model is.
+
+    This is intentionally simple: it rewards depth, wider FFNs, longer context,
+    and extra architectural structure without pretending to be a quality metric.
+    """
+    model_dim = max(1, int(spec.model.emb.dim))
+    seq_len = max(1, int(spec.data.seq_len))
+    logical_layers = float(spec.model.n_layers)
+    physical_layers = float(spec.model.physical_block_count())
+    shared_blocks = float(spec.model.shared_block_count())
+    moe_blocks = 0.0
+    memory_blocks = 0.0
+    embedding_ffn_blocks = 0.0
+    ssm_blocks = 0.0
+    selector_blocks = 0.0
+    nonstandard_attn_blocks = 0.0
+    sparse_blocks = 0.0
+    extras_total = 0.0
+    ffn_multiplier_total = 0.0
+    ffn_count = 0.0
+
+    for block in spec.model.blocks:
+        for ffn in (block.ffn, getattr(block, "ffn_memory", None)):
+            if ffn is None:
+                continue
+            hidden = int(getattr(ffn, "hidden", 0) or 0)
+            if hidden > 0:
+                ffn_multiplier_total += float(hidden) / float(model_dim)
+                ffn_count += 1.0
+            if getattr(ffn, "type", "dense") == "moe":
+                moe_blocks += 1.0
+            if str(getattr(ffn, "input_source", "residual") or "residual") == "embedding":
+                embedding_ffn_blocks += 1.0
+
+        if block.ssm is not None:
+            ssm_blocks += 1.0
+
+        extras_total += float(len(block.extras))
+        if block.extras:
+            memory_types = {"retro", "assoc_memory", "memory_tokens", "chunk_memory", "lookup_memory"}
+            if any(getattr(extra, "type", type(extra).__name__) in memory_types for extra in block.extras):
+                memory_blocks += 1.0
+
+        attn = block.attn
+        if attn is None:
+            continue
+        kind = str(getattr(attn, "kind", "MHA") or "MHA").upper()
+        if kind != "MHA":
+            nonstandard_attn_blocks += 1.0
+        if str(getattr(attn, "selector", "none") or "none") != "none":
+            selector_blocks += 1.0
+        pattern = resolve_attention_pattern(attn)
+        if pattern.sparsity != "none":
+            sparse_blocks += 1.0
+
+    avg_ffn_multiplier = ffn_multiplier_total / ffn_count if ffn_count > 0 else 0.0
+    hyper = getattr(spec.model, "hyper", None)
+    hyper_streams = int(getattr(hyper, "streams", 1) or 1) if hyper is not None else 1
+    recurrence_count = float(len(spec.model.recurrences))
+    context_bonus = max(0.0, math.log2(float(seq_len) / 1024.0)) if seq_len > 1024 else 0.0
+
+    score = 0.0
+    score += logical_layers
+    score += 0.35 * physical_layers
+    score += max(0.0, avg_ffn_multiplier - 2.0)
+    score += 1.5 * context_bonus
+    score += 1.25 * moe_blocks
+    score += 1.0 * memory_blocks
+    score += 0.75 * recurrence_count
+    score += 0.5 * embedding_ffn_blocks
+    score += 0.5 * ssm_blocks
+    score += 0.4 * selector_blocks
+    score += 0.35 * nonstandard_attn_blocks
+    score += 0.25 * sparse_blocks
+    score += 0.2 * extras_total
+    score += 0.2 * shared_blocks
+    score += 0.25 * max(0, hyper_streams - 1)
+    score += 0.25 * graph_entropy(spec)
+    return float(score)
 
 
 def structural_distance(a: ArchitectureSpec, b: ArchitectureSpec) -> float:
@@ -63,6 +208,14 @@ def structural_distance(a: ArchitectureSpec, b: ArchitectureSpec) -> float:
             diff += 1.0
         if len(ba.extras) != len(bb.extras):
             diff += 0.5
+        if (ba.share_with is None) != (bb.share_with is None):
+            diff += 0.5
+        elif (
+            ba.share_with is not None
+            and bb.share_with is not None
+            and ba.share_with != bb.share_with
+        ):
+            diff += 0.25
         if ba.attn and bb.attn:
             pa = resolve_attention_pattern(ba.attn)
             pb = resolve_attention_pattern(bb.attn)
@@ -151,6 +304,8 @@ def graph_entropy(spec: ArchitectureSpec) -> float:
             tokens.append(f"sparsity:{pattern.sparsity}")
             if block.attn.gating_pos and block.attn.gating_pos != "none":
                 tokens.append(f"gate:{block.attn.gating_pos}-{block.attn.gating_op or 'dense'}")
+        if block.share_with is not None:
+            tokens.append("share:block")
         if block.ffn:
             src = getattr(block.ffn, "input_source", "residual") or "residual"
             tokens.append(f"ffn:{getattr(block.ffn, 'type', 'dense')}:{src}")
@@ -190,8 +345,11 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
     head_dim_sum = 0.0
     kv_groups_sum = 0.0
     attn_blocks = 0
+    shared_blocks = 0
 
     for block in spec.model.blocks:
+        if block.share_with is not None:
+            shared_blocks += 1
         ffns = [block.ffn, getattr(block, "ffn_memory", None)]
         has_embed_ffn = False
         for ffn in ffns:
@@ -252,6 +410,8 @@ def behavioral_descriptor(spec: ArchitectureSpec) -> list[float]:
     mask_momentum_blend = float(getattr(update_filter, "momentum_blend", 0.0) or 0.0)
     descriptor = [
         layers_f,
+        float(spec.model.physical_block_count()) / layers_f,
+        float(shared_blocks) / layers_f,
         float(moe_blocks) / layers_f,
         float(embed_ffn_blocks) / layers_f,
         float(ssm_blocks) / layers_f,

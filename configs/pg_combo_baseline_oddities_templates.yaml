@@ -1,0 +1,114 @@
+templates:
+  - name: combo-baseline-oddities-anchor
+    weight: 1.2
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+  - name: combo-baseline-oddities-tail-recurrence
+    weight: 1.05
+    conditions:
+      parameter_golf_only: true
+      requires_no_recurrence: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+      - set_recurrence:
+          tail_blocks: 3
+          adapter: gated
+          concat_prelude: false
+          train_recurrence: 1
+          max_train_recurrence: 4
+          test_recurrences:
+            - 1
+            - 2
+            - 4
+  - name: combo-baseline-oddities-memory-tokens
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+      - add_extra:
+          selector: random
+          extra_type: memory_tokens
+          params:
+            tokens: 8
+            heads: 2
+            head_dim: 32
+            gating_weight: 0.08
+  - name: combo-baseline-oddities-layer-scale
+    weight: 0.95
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+      - add_extra:
+          selector: random
+          extra_type: layer_scale
+          params:
+            init: 1.0e-05
+            targets:
+              - attn
+              - ffn
+  - name: combo-baseline-oddities-feedback
+    weight: 0.9
+    conditions:
+      parameter_golf_only: true
+      min_blocks: 6
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+      - add_extra:
+          selector: random
+          extra_type: feedback
+          params:
+            strength: 0.08

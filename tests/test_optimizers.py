@@ -4,11 +4,13 @@ import torch
 
 from transformer_evolution_llm import optimizers as optimizers_mod
 from transformer_evolution_llm.dsl import (
+    ArchitectureSpec,
     GradientTransformConfig,
     OptimizerConfig,
     TrainSchedule,
     UpdateFilterConfig,
 )
+from transformer_evolution_llm.models import EvolutionModel
 from transformer_evolution_llm.optimizers import (
     _topk_mask,
     apply_gradient_transform_,
@@ -191,3 +193,91 @@ def test_topk_mask_clamps_out_of_bounds_indices(monkeypatch) -> None:
     # Clamp turns the invalid index into the last valid index.
     assert bool(mask[0].item())
     assert bool(mask[-1].item())
+
+
+def test_build_optimizer_splits_tied_embedding_lr_group() -> None:
+    spec = ArchitectureSpec(
+        model={
+            "name": "tiny-tied",
+            "emb": {"dim": 8, "vocab": 16},
+            "blocks": [
+                {
+                    "attn": {"kind": "MQA", "heads": 1, "head_dim": 8},
+                    "ffn": {"type": "dense", "hidden": 16, "activation": "gelu"},
+                }
+            ],
+            "head": {"vocab": 16, "tie_embeddings": True},
+        },
+        train={
+            "lr": 1e-3,
+            "tied_embedding_lr": 5e-2,
+            "warmup": 0,
+            "clip": 1.0,
+            "bf16": False,
+            "grad_ckpt": False,
+            "max_tokens": 16,
+        },
+        data={
+            "tokenizer": "gpt2",
+            "seq_len": 4,
+            "batch_size": 1,
+            "workers": 0,
+            "shards": [{"name": "dummy", "split": "train", "weight": 1.0}],
+        },
+    )
+    model = EvolutionModel(spec.model)
+
+    optimizer = build_optimizer(model, spec.train)
+
+    assert len(optimizer.param_groups) == 2
+    group_lrs = sorted(float(group["lr"]) for group in optimizer.param_groups)
+    assert group_lrs == [1e-3, 5e-2]
+    tied_group = next(group for group in optimizer.param_groups if float(group["lr"]) == 5e-2)
+    assert tied_group["params"] == [model.embed.weight]
+
+
+def test_build_optimizer_splits_official_style_parameter_groups() -> None:
+    spec = ArchitectureSpec(
+        model={
+            "name": "tiny-untied",
+            "emb": {"dim": 8, "vocab": 16},
+            "blocks": [
+                {
+                    "attn": {"kind": "GQA", "heads": 2, "head_dim": 4, "kv_groups": 1},
+                    "ffn": {"type": "dense", "hidden": 16, "activation": "relu_squared"},
+                }
+            ],
+            "head": {"vocab": 16, "tie_embeddings": False},
+        },
+        train={
+            "lr": 1e-3,
+            "embed_lr": 2e-3,
+            "head_lr": 3e-3,
+            "matrix_lr": 4e-3,
+            "scalar_lr": 5e-3,
+            "warmup": 0,
+            "clip": 1.0,
+            "bf16": False,
+            "grad_ckpt": False,
+            "max_tokens": 16,
+            "optimizer": {"name": "muon"},
+        },
+        data={
+            "tokenizer": "gpt2",
+            "seq_len": 4,
+            "batch_size": 1,
+            "workers": 0,
+            "shards": [{"name": "dummy", "split": "train", "weight": 1.0}],
+        },
+    )
+    model = EvolutionModel(spec.model)
+
+    optimizer = build_optimizer(model, spec.train)
+
+    group_lrs = {
+        str(group.get("name", "default")): float(group["lr"]) for group in optimizer.param_groups
+    }
+    assert group_lrs["embedding"] == 2e-3
+    assert group_lrs["untied_head"] == 3e-3
+    assert group_lrs["matrix"] == 4e-3
+    assert group_lrs["scalar_vector"] == 5e-3

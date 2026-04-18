@@ -198,3 +198,21 @@ def test_embedding_ffn_branch_forward() -> None:
     out = model(x)
     assert out.shape == (2, cfg.data.seq_len, 64)
     assert torch.isfinite(out).all()
+
+
+def test_shared_block_proxy_reuses_state_without_duplicate_keys(
+    tiny_spec: ArchitectureSpec,
+) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    shared_block = spec.model.blocks[0].model_copy(deep=True)
+    shared_block.share_with = 0
+    spec.model.blocks.append(shared_block)
+
+    model = EvolutionModel(spec.model)
+    x = torch.randint(0, spec.model.head.vocab, (2, spec.data.seq_len))
+    out = model(x)
+    assert out.shape == (2, spec.data.seq_len, spec.model.head.vocab)
+
+    state_keys = list(model.state_dict().keys())
+    assert any(key.startswith("blocks.0.") for key in state_keys)
+    assert not any(key.startswith("blocks.1.") for key in state_keys)

@@ -42,6 +42,7 @@ class TokenBatch:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     uids: list[str]
+    target_ids: torch.Tensor | None = None
 
 
 class DataModule:

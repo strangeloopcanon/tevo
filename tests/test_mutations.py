@@ -5,6 +5,7 @@ from transformer_evolution_llm.dsl import (
     CustomModuleConfig,
     LookupMemoryConfig,
     MoEFFNConfig,
+    ParameterGolfConfig,
     RecurrenceConfig,
     RetroConfig,
 )
@@ -28,6 +29,7 @@ from transformer_evolution_llm.mutations import (
     remove_recurrence,
     resample_optimizer_base,
     sanitize_topology,
+    share_block_with_previous,
     simplify_attention,
     strip_extras,
     template_registry_name,
@@ -41,12 +43,21 @@ from transformer_evolution_llm.mutations import (
     tune_gradient_transform_eps,
     tune_gradient_transform_ns_steps,
     tune_lookup_memory,
+    tune_embedding_init_std,
+    tune_muon_momentum,
+    tune_muon_momentum_warmup,
     tune_optimizer,
+    tune_optimizer_weight_decay,
+    tune_parameter_golf_context,
+    tune_parameter_group_lrs,
+    tune_tied_embedding_export_dtype,
     tune_update_filter_block_size,
     tune_update_filter_granularity,
     tune_update_filter_momentum_blend,
     tune_update_filter_ratio,
     tune_warmup,
+    tune_warmdown,
+    unshare_block,
 )
 
 
@@ -215,7 +226,95 @@ def test_tune_warmup_changes_value(tiny_spec: ArchitectureSpec) -> None:
 def test_tune_clip_keeps_positive(tiny_spec: ArchitectureSpec) -> None:
     rng = random.Random(12)  # noqa: S311 - deterministic unit tests
     child = tune_clip(tiny_spec, rng=rng)
-    assert child.train.clip > 0.0
+    assert child.train.clip >= 0.0
+
+
+def test_tune_warmdown_changes_value(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(1212)  # noqa: S311 - deterministic unit tests
+    child = tune_warmdown(tiny_spec, rng=rng)
+    assert child.train.warmdown_steps >= 0
+    assert child.train.warmdown_steps != tiny_spec.train.warmdown_steps
+
+
+def test_tune_parameter_group_lrs_keeps_valid_values(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(1213)  # noqa: S311 - deterministic unit tests
+    child = tune_parameter_group_lrs(tiny_spec, rng=rng)
+    for value in (
+        child.train.tied_embedding_lr,
+        child.train.embed_lr,
+        child.train.head_lr,
+        child.train.matrix_lr,
+        child.train.scalar_lr,
+    ):
+        assert value is None or value > 0.0
+
+
+def test_tune_muon_momentum_warmup_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.optimizer.name = "muon"
+    rng = random.Random(1214)  # noqa: S311 - deterministic unit tests
+    child = tune_muon_momentum_warmup(spec, rng=rng)
+    start = child.train.optimizer.muon_momentum_warmup_start
+    steps = child.train.optimizer.muon_momentum_warmup_steps
+    assert start is None or 0.0 <= start <= 1.0
+    assert steps >= 0
+
+
+def test_tune_muon_momentum_keeps_valid_bounds(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.optimizer.name = "muon"
+    rng = random.Random(1215)  # noqa: S311 - deterministic unit tests
+    child = tune_muon_momentum(spec, rng=rng)
+    assert 0.0 <= float(child.train.optimizer.muon_momentum or 0.0) <= 1.0
+
+
+def test_tune_embedding_init_std_changes_value(tiny_spec: ArchitectureSpec) -> None:
+    rng = random.Random(1216)  # noqa: S311 - deterministic unit tests
+    child = tune_embedding_init_std(tiny_spec, rng=rng)
+    assert child.model.emb.init_std > 0.0
+    assert child.model.emb.init_std != tiny_spec.model.emb.init_std
+
+
+def test_tune_optimizer_weight_decay_updates_schedule_and_optimizer(
+    tiny_spec: ArchitectureSpec,
+) -> None:
+    rng = random.Random(1217)  # noqa: S311 - deterministic unit tests
+    child = tune_optimizer_weight_decay(tiny_spec, rng=rng)
+    assert child.train.weight_decay == child.train.optimizer.weight_decay
+    assert child.train.weight_decay >= 0.0
+
+
+def test_tune_tied_embedding_export_dtype_toggles_value(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+    )
+    rng = random.Random(1218)  # noqa: S311 - deterministic unit tests
+    child = tune_tied_embedding_export_dtype(spec, rng=rng)
+    assert child.parameter_golf is not None
+    assert child.parameter_golf.tied_embedding_export_dtype == "fp16"
+
+
+def test_tune_parameter_golf_context_rescales_batch_shape(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        val_batch_tokens=4096,
+    )
+    spec.train.batch_tokens = 4096
+    spec.data.seq_len = 1024
+    spec.data.batch_size = 4
+    spec.data.eval_tokens = 4096
+    rng = random.Random(1219)  # noqa: S311 - deterministic unit tests
+    child = tune_parameter_golf_context(spec, rng=rng)
+    assert child.data.seq_len in {1024, 1536, 2048}
+    assert child.data.batch_size >= 1
+    assert child.train.batch_tokens is not None
+    assert child.train.batch_tokens >= child.data.seq_len * child.data.batch_size
 
 
 def test_add_additional_recurrence_keeps_train_le_max(tiny_spec: ArchitectureSpec) -> None:
@@ -259,6 +358,26 @@ def test_remove_recurrence_removes_entries(tiny_spec: ArchitectureSpec) -> None:
     spec = add_additional_recurrence(spec, rng=random.Random(18))  # noqa: S311
     child = remove_recurrence(spec, rng=random.Random(19))  # noqa: S311
     assert len(child.model.recurrences) <= len(spec.model.recurrences)
+
+
+def test_share_and_unshare_block_mutations(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks = [spec.model.blocks[0].model_copy(deep=True) for _ in range(3)]
+    shared = share_block_with_previous(spec, rng=random.Random(20))  # noqa: S311
+    assert any(block.share_with is not None for block in shared.model.blocks[1:])
+
+    unshared = unshare_block(shared, rng=random.Random(21))  # noqa: S311
+    assert sum(block.share_with is not None for block in unshared.model.blocks) <= sum(
+        block.share_with is not None for block in shared.model.blocks
+    )
+
+
+def test_sanitize_topology_clears_invalid_share_reference(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.model.blocks = [spec.model.blocks[0].model_copy(deep=True) for _ in range(2)]
+    spec.model.blocks[1].share_with = 1
+    cleaned = sanitize_topology(spec)
+    assert cleaned.model.blocks[1].share_with is None
 
 
 def test_simplify_attention_sets_mha(tiny_spec: ArchitectureSpec) -> None:

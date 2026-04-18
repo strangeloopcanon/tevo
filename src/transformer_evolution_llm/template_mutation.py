@@ -24,8 +24,10 @@ from .dsl import (
     LookupMemoryConfig,
     MemoryTokensConfig,
     MoEFFNConfig,
+    RecurrenceConfig,
     RetroConfig,
     SSMConfig,
+    SoftmaxConfig,
 )
 
 TEMPLATE_PATH_DEFAULT = Path("configs/mutation_templates.yaml")
@@ -69,6 +71,38 @@ class TemplateAction(TypedDict, total=False):
     block_stride: int | None
     global_stride: int | None
     dilation: int | None
+    kind: str | None
+    kv_groups: int | None
+    kv_latent_dim: int | None
+    value_glu: bool | None
+    qk_norm: str | None
+    qk_scale: float | str | None
+    softcap: float | None
+    hidden: int | None
+    hidden_mult: float | None
+    activation: str | None
+    optimizer_name: str | None
+    lr: float | None
+    gradient_transform_mode: str | None
+    gradient_transform_ns_steps: int | None
+    gradient_transform_eps: float | None
+    update_filter_mode: str | None
+    update_filter_keep_ratio: float | None
+    update_filter_granularity: str | None
+    update_filter_block_size: int | None
+    update_filter_momentum_blend: float | None
+    warmup: int | None
+    clip: float | None
+    tail_blocks: int | None
+    start_fraction: float | None
+    end_fraction: float | None
+    start: int | None
+    end: int | None
+    adapter: str | None
+    concat_prelude: bool | None
+    train_recurrence: int | None
+    max_train_recurrence: int | None
+    test_recurrences: list[int] | None
 
 
 ActionMap = dict[str, TemplateAction]
@@ -76,6 +110,21 @@ ActionMap = dict[str, TemplateAction]
 
 def _new_origin_id(rng: random.Random) -> str:
     return f"o{rng.getrandbits(48):012x}"
+
+
+def _clamp_int(value: int, *, lo: int, hi: int) -> int:
+    return max(int(lo), min(int(hi), int(value)))
+
+
+def _round_hidden(value: float, *, step: int = 128) -> int:
+    rounded = int(round(float(value) / float(step)) * step)
+    return max(step, rounded)
+
+
+def _ensure_softmax(attn: AttentionConfig) -> SoftmaxConfig:
+    if attn.softmax is None:
+        attn.softmax = SoftmaxConfig()
+    return attn.softmax
 
 
 @dataclass
@@ -318,12 +367,18 @@ def _matches_conditions(spec: ArchitectureSpec, conditions: dict[str, Any]) -> b
     blocks = spec.model.blocks
     if not conditions:
         return True
+    if conditions.get("parameter_golf_only") and spec.parameter_golf is None:
+        return False
     if conditions.get("requires_ssm_block"):
         if not any(block.ssm for block in blocks):
             return False
     if conditions.get("requires_dense_ffn"):
         if not any(isinstance(block.ffn, DenseFFNConfig) for block in blocks):
             return False
+    if conditions.get("requires_recurrence") and not spec.model.recurrences:
+        return False
+    if conditions.get("requires_no_recurrence") and spec.model.recurrences:
+        return False
     if conditions.get("min_blocks"):
         if len(blocks) < int(conditions["min_blocks"]):
             return False
@@ -341,6 +396,12 @@ def _apply_action(spec: ArchitectureSpec, action: ActionMap, rng: random.Random)
         _remove_block(spec, action["remove_block"], rng)
     elif "tune_attn" in action:
         _tune_attn(spec, dict(action["tune_attn"]), rng)
+    elif "tune_ffn" in action:
+        _tune_ffn(spec, dict(action["tune_ffn"]), rng)
+    elif "tune_optimizer" in action:
+        _tune_optimizer(spec, dict(action["tune_optimizer"]))
+    elif "set_recurrence" in action:
+        _set_recurrence(spec, dict(action["set_recurrence"]))
     elif "tune_router" in action:
         _tune_router(spec, dict(action["tune_router"]), rng)
 
@@ -659,6 +720,9 @@ def _mutate_template(template: MutationTemplate, rng: random.Random) -> Mutation
 
 
 def _generate_random_template(spec: ArchitectureSpec, rng: random.Random) -> MutationTemplate:
+    if spec.parameter_golf is not None:
+        return _generate_parameter_golf_template(spec, rng)
+
     action_type = rng.choice(["add_extra", "insert_block", "replace_ffn"])
     # Occasionally tune stability/router knobs
     if rng.random() < 0.2:
@@ -745,6 +809,104 @@ def _generate_random_template(spec: ArchitectureSpec, rng: random.Random) -> Mut
     )
 
 
+def _generate_parameter_golf_template(
+    spec: ArchitectureSpec, rng: random.Random
+) -> MutationTemplate:
+    builders = [
+        _random_parameter_golf_attn_action,
+        _random_parameter_golf_ffn_action,
+        _random_parameter_golf_optimizer_action,
+        _random_parameter_golf_recurrence_action,
+    ]
+    first_builder = rng.choice(builders)
+    actions: list[ActionMap] = [first_builder(spec, rng)]
+    if rng.random() < 0.35:
+        remaining = [builder for builder in builders if builder is not first_builder]
+        actions.append(rng.choice(remaining)(spec, rng))
+    return MutationTemplate(
+        name=f"pg-auto-{rng.randrange(10_000)}",
+        weight=1.0,
+        conditions={"parameter_golf_only": True},
+        actions=actions,
+    )
+
+
+def _random_parameter_golf_attn_action(spec: ArchitectureSpec, rng: random.Random) -> ActionMap:
+    kind = rng.choice(["GQA", "MQA", "MLA"])
+    params: TemplateAction = {
+        "selector": rng.choice(["random", "random_dense"]),
+        "kind": kind,
+        "qk_norm": rng.choice(["none", "rms", "layer"]),
+        "softcap": rng.choice([8.0, 12.0, 16.0, 24.0]),
+    }
+    if kind == "GQA":
+        params["kv_groups"] = rng.choice([1, 2, 4])
+    else:
+        params["kv_latent_dim"] = rng.choice([64, 96, 128, 160])
+        params["value_glu"] = rng.choice([True, False])
+    return {"tune_attn": params}
+
+
+def _random_parameter_golf_ffn_action(spec: ArchitectureSpec, rng: random.Random) -> ActionMap:
+    return {
+        "tune_ffn": {
+            "selector": rng.choice(["random", "random_dense"]),
+            "hidden_mult": rng.choice([2.0, 2.5, 3.0, 3.5, 4.0]),
+            "activation": rng.choice(["swiglu", "gelu", "relu_squared", "silu"]),
+        }
+    }
+
+
+def _random_parameter_golf_optimizer_action(
+    spec: ArchitectureSpec, rng: random.Random
+) -> ActionMap:
+    return {
+        "tune_optimizer": {
+            "optimizer_name": rng.choice(["adamw", "muon"]),
+            "lr": rng.choice([7.0e-4, 8.5e-4, 1.0e-3, 1.15e-3]),
+            "matrix_lr": rng.choice([0.02, 0.03, 0.04, 0.05]),
+            "scalar_lr": rng.choice([0.02, 0.03, 0.04, 0.05]),
+            "tied_embedding_lr": rng.choice([0.03, 0.04, 0.05, 0.06]),
+            "tied_embedding_export_dtype": rng.choice(["int8", "fp16"]),
+            "tied_embed_init_std": rng.choice([0.003, 0.004, 0.005, 0.006, 0.0075]),
+            "gradient_transform_mode": rng.choice(
+                ["identity", "normalize", "orthogonalize_2d", "sign_orthogonalize_2d"]
+            ),
+            "gradient_transform_ns_steps": rng.choice([3, 5, 7]),
+            "gradient_transform_eps": rng.choice([1.0e-8, 1.0e-7, 1.0e-6]),
+            "update_filter_mode": rng.choice(["none", "bernoulli", "topk"]),
+            "update_filter_keep_ratio": rng.choice([0.5, 0.65, 0.8, 1.0]),
+            "update_filter_granularity": rng.choice(["element", "block"]),
+            "update_filter_block_size": rng.choice([64, 128, 256]),
+            "update_filter_momentum_blend": rng.choice([0.0, 0.25, 0.5]),
+            "warmup": rng.choice([16, 32, 48, 64, 96]),
+            "warmdown_steps": rng.choice([0, 200, 600, 1200, 2000]),
+            "muon_momentum_warmup_start": rng.choice([0.75, 0.8, 0.85, 0.9]),
+            "muon_momentum_warmup_steps": rng.choice([0, 100, 250, 500, 1000]),
+            "clip": rng.choice([0.75, 1.0, 1.25]),
+        }
+    }
+
+
+def _random_parameter_golf_recurrence_action(
+    spec: ArchitectureSpec, rng: random.Random
+) -> ActionMap:
+    tail_cap = max(2, min(6, len(spec.model.blocks)))
+    tail_blocks = rng.choice(list(range(2, tail_cap + 1)))
+    train_recurrence = rng.choice([1, 2])
+    max_train_recurrence = max(train_recurrence, rng.choice([2, 3, 4]))
+    return {
+        "set_recurrence": {
+            "tail_blocks": tail_blocks,
+            "adapter": rng.choice(["linear", "gated"]),
+            "concat_prelude": rng.choice([True, False]),
+            "train_recurrence": train_recurrence,
+            "max_train_recurrence": max_train_recurrence,
+            "test_recurrences": [1, 2, 4],
+        }
+    }
+
+
 def _tune_attn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Random) -> None:
     idx = _select_block_index(spec, params.get("selector", "random"), rng)
     if idx is None:
@@ -752,6 +914,31 @@ def _tune_attn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Rando
     block = spec.model.blocks[idx]
     if not block.attn:
         return
+    kind = params.get("kind")
+    if kind is not None:
+        resolved_kind = str(kind).upper()
+        if resolved_kind in {"MHA", "GQA", "MQA", "LINEAR", "MLA"}:
+            block.attn.kind = resolved_kind
+            if resolved_kind == "MQA":
+                block.attn.kv_groups = max(1, int(block.attn.heads))
+                block.attn.kv_latent_dim = None
+            elif resolved_kind == "GQA":
+                kv_groups = params.get("kv_groups")
+                if kv_groups is None:
+                    kv_groups = max(1, int(block.attn.heads) // 4)
+                block.attn.kv_groups = _clamp_int(
+                    int(kv_groups), lo=1, hi=max(1, int(block.attn.heads))
+                )
+                block.attn.kv_latent_dim = None
+            elif resolved_kind == "MLA":
+                latent_dim = params.get("kv_latent_dim")
+                if latent_dim is None:
+                    latent_dim = max(int(block.attn.head_dim), int(spec.model.emb.dim) // 4)
+                block.attn.kv_latent_dim = max(1, int(latent_dim))
+                block.attn.kv_groups = None
+            else:
+                block.attn.kv_groups = 1
+                block.attn.kv_latent_dim = None
     qk_val = params.get("qk_norm_max")
     if qk_val is not None:
         block.attn.qk_norm_max = float(qk_val)
@@ -773,6 +960,139 @@ def _tune_attn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Rando
         block.attn.global_stride = int(params["global_stride"])
     if "dilation" in params and params["dilation"] is not None and block.attn is not None:
         block.attn.dilation = int(params["dilation"])
+    if "kv_groups" in params and params["kv_groups"] is not None:
+        block.attn.kv_groups = _clamp_int(
+            int(params["kv_groups"]), lo=1, hi=max(1, int(block.attn.heads))
+        )
+    if "kv_latent_dim" in params and params["kv_latent_dim"] is not None:
+        block.attn.kv_latent_dim = max(1, int(params["kv_latent_dim"]))
+    if "value_glu" in params and params["value_glu"] is not None:
+        block.attn.value_glu = bool(params["value_glu"])
+    if any(key in params for key in ("qk_norm", "qk_scale", "softcap")):
+        softmax = _ensure_softmax(block.attn)
+        if "qk_norm" in params and params["qk_norm"] is not None:
+            softmax.qk_norm = str(params["qk_norm"]).lower()
+        if "qk_scale" in params and params["qk_scale"] is not None:
+            softmax.qk_scale = params["qk_scale"]
+        if "softcap" in params and params["softcap"] is not None:
+            softmax.softcap = float(params["softcap"])
+
+
+def _tune_ffn(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Random) -> None:
+    idx = _select_block_index(spec, params.get("selector", "random"), rng)
+    if idx is None:
+        return
+    block = spec.model.blocks[idx]
+    if not isinstance(block.ffn, DenseFFNConfig):
+        return
+    hidden = params.get("hidden")
+    if hidden is None and params.get("hidden_mult") is not None:
+        hidden = _round_hidden(float(spec.model.emb.dim) * float(params["hidden_mult"]))
+    if hidden is not None:
+        block.ffn.hidden = max(128, int(hidden))
+    if params.get("activation") is not None:
+        block.ffn.activation = str(params["activation"]).lower()
+
+
+def _tune_optimizer(spec: ArchitectureSpec, params: dict[str, Any]) -> None:
+    optimizer = spec.train.optimizer
+    if params.get("optimizer_name") is not None:
+        optimizer.name = str(params["optimizer_name"]).lower()
+    if params.get("lr") is not None:
+        spec.train.lr = float(params["lr"])
+    if params.get("matrix_lr") is not None:
+        spec.train.matrix_lr = max(1.0e-9, float(params["matrix_lr"]))
+    if params.get("scalar_lr") is not None:
+        spec.train.scalar_lr = max(1.0e-9, float(params["scalar_lr"]))
+    if params.get("tied_embedding_lr") is not None:
+        spec.train.tied_embedding_lr = max(1.0e-9, float(params["tied_embedding_lr"]))
+    if params.get("tied_embedding_export_dtype") is not None and spec.parameter_golf is not None:
+        spec.parameter_golf.tied_embedding_export_dtype = str(
+            params["tied_embedding_export_dtype"]
+        ).lower()
+    if params.get("tied_embed_init_std") is not None:
+        spec.model.emb.init_std = max(1.0e-9, float(params["tied_embed_init_std"]))
+    if params.get("warmup") is not None:
+        spec.train.warmup = max(0, int(params["warmup"]))
+    if params.get("warmdown_steps") is not None:
+        spec.train.warmdown_steps = max(0, int(params["warmdown_steps"]))
+    if params.get("clip") is not None:
+        spec.train.clip = max(0.0, float(params["clip"]))
+    if params.get("muon_momentum_warmup_start") is not None:
+        optimizer.muon_momentum_warmup_start = max(
+            0.0,
+            min(1.0, float(params["muon_momentum_warmup_start"])),
+        )
+    if params.get("muon_momentum_warmup_steps") is not None:
+        optimizer.muon_momentum_warmup_steps = max(0, int(params["muon_momentum_warmup_steps"]))
+    if params.get("gradient_transform_mode") is not None:
+        optimizer.gradient_transform.mode = str(params["gradient_transform_mode"]).lower()
+    if params.get("gradient_transform_ns_steps") is not None:
+        optimizer.gradient_transform.ns_steps = max(1, int(params["gradient_transform_ns_steps"]))
+    if params.get("gradient_transform_eps") is not None:
+        optimizer.gradient_transform.eps = max(1.0e-12, float(params["gradient_transform_eps"]))
+    if params.get("update_filter_mode") is not None:
+        optimizer.update_filter.mode = str(params["update_filter_mode"]).lower()
+    if params.get("update_filter_keep_ratio") is not None:
+        optimizer.update_filter.keep_ratio = max(
+            1.0e-3,
+            min(1.0, float(params["update_filter_keep_ratio"])),
+        )
+    if params.get("update_filter_granularity") is not None:
+        optimizer.update_filter.granularity = str(params["update_filter_granularity"]).lower()
+    if params.get("update_filter_block_size") is not None:
+        optimizer.update_filter.block_size = max(1, int(params["update_filter_block_size"]))
+    if params.get("update_filter_momentum_blend") is not None:
+        optimizer.update_filter.momentum_blend = max(
+            0.0,
+            min(1.0, float(params["update_filter_momentum_blend"])),
+        )
+
+
+def _set_recurrence(spec: ArchitectureSpec, params: dict[str, Any]) -> None:
+    n_blocks = len(spec.model.blocks)
+    if n_blocks <= 1:
+        return
+    recurrence = (
+        spec.model.recurrences[0].model_copy(deep=True)
+        if spec.model.recurrences
+        else RecurrenceConfig(start=max(0, n_blocks - 2), end=n_blocks)
+    )
+
+    start = params.get("start")
+    end = params.get("end")
+    if params.get("tail_blocks") is not None:
+        tail = _clamp_int(int(params["tail_blocks"]), lo=1, hi=n_blocks)
+        start = max(0, n_blocks - tail)
+        end = n_blocks
+    if params.get("start_fraction") is not None:
+        start = int(float(params["start_fraction"]) * float(n_blocks))
+    if params.get("end_fraction") is not None:
+        end = int(round(float(params["end_fraction"]) * float(n_blocks)))
+    if start is None:
+        start = recurrence.start
+    if end is None:
+        end = recurrence.end
+    recurrence.start = _clamp_int(int(start), lo=0, hi=max(0, n_blocks - 1))
+    recurrence.end = _clamp_int(int(end), lo=recurrence.start + 1, hi=n_blocks)
+
+    if params.get("adapter") is not None:
+        recurrence.adapter = str(params["adapter"]).lower()
+    if "concat_prelude" in params and params["concat_prelude"] is not None:
+        recurrence.concat_prelude = bool(params["concat_prelude"])
+    if params.get("train_recurrence") is not None:
+        recurrence.train_recurrence = max(1, int(params["train_recurrence"]))
+    if params.get("max_train_recurrence") is not None:
+        recurrence.max_train_recurrence = max(1, int(params["max_train_recurrence"]))
+    if recurrence.max_train_recurrence < recurrence.train_recurrence:
+        recurrence.max_train_recurrence = recurrence.train_recurrence
+    if params.get("test_recurrences") is not None:
+        recurrence.test_recurrences = [max(1, int(item)) for item in params["test_recurrences"]]
+
+    if spec.model.recurrences:
+        spec.model.recurrences[0] = recurrence
+        return
+    spec.model.recurrences.append(recurrence)
 
 
 def _tune_router(spec: ArchitectureSpec, params: dict[str, Any], rng: random.Random) -> None:

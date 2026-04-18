@@ -24,6 +24,7 @@ class Candidate:
     rung: int = 0
     status: Status = "pending"
     metrics: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     checkpoint: Path | None = None
     mutation_trace: list[str] = field(default_factory=list)
     crossover_report: dict[str, Any] | None = None
@@ -57,6 +58,7 @@ class Candidate:
             "rung": self.rung,
             "status": self.status,
             "metrics": self.metrics,
+            "metadata": self.metadata,
             "spec": self.spec.model_dump(mode="python"),
             "checkpoint": str(self.checkpoint) if self.checkpoint else None,
             "mutation_trace": self.mutation_trace,
@@ -79,6 +81,9 @@ class Candidate:
         metrics = data.get("metrics", {}) or {}
         if not isinstance(metrics, dict):
             metrics = {}
+        metadata = data.get("metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
         mutation_trace = data.get("mutation_trace", []) or []
         if not isinstance(mutation_trace, list):
             mutation_trace = []
@@ -95,6 +100,7 @@ class Candidate:
             rung=int(data.get("rung", 0)),
             status=data.get("status", "pending"),
             metrics=metrics,
+            metadata=metadata,
             checkpoint=checkpoint,
             mutation_trace=mutation_trace,
             crossover_report=crossover_report,

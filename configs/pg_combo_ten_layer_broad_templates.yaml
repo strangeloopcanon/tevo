@@ -1,0 +1,49 @@
+templates:
+  - name: combo-ten-layer-anchor
+    weight: 1.2
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.05
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 1200
+          clip: 0.0
+  - name: combo-ten-layer-lr-split
+    weight: 1.15
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.05
+          scalar_lr: 0.03
+          tied_embedding_lr: 0.06
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.0045
+          warmup: 24
+          warmdown_steps: 1800
+          clip: 0.0
+  - name: combo-ten-layer-fp16-lr-split
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.05
+          scalar_lr: 0.03
+          tied_embedding_lr: 0.06
+          tied_embedding_export_dtype: fp16
+          tied_embed_init_std: 0.004
+          warmup: 24
+          warmdown_steps: 1800
+          clip: 0.0

@@ -28,6 +28,7 @@ from .attention import (
 )
 from .dsl import (
     AssociativeMemoryConfig,
+    BigramHashConfig,
     BlockConfig,
     BranchRouterConfig,
     ChunkMemoryConfig,
@@ -45,6 +46,7 @@ from .dsl import (
     RecurrenceConfig,
     RetroConfig,
     SSMConfig,
+    SmearGateConfig,
 )
 from .memory import (
     AssociativeMemoryModule,
@@ -76,6 +78,8 @@ __all__ = [
     "RecurrenceAdapter",
     "RetroModule",
     "RotaryPositionalEncoding",
+    "SharedBlockProxy",
+    "SmearGateModule",
     "SSMLayer",
     "_build_alibi_bias",
     "_norm_layer",
@@ -346,6 +350,32 @@ class GatedModule(nn.Module):
         return x * self.weight
 
 
+class SmearGateModule(nn.Module):
+    def __init__(self, cfg: SmearGateConfig, dim: int):
+        super().__init__()
+        self.width = max(1, int(cfg.width))
+        self.proj = nn.Linear(dim, dim, bias=False)
+        init = max(1e-6, min(1.0 - 1e-6, float(cfg.init_weight)))
+        logit = torch.log(torch.tensor(init / (1.0 - init), dtype=torch.float32))
+        if cfg.learnable:
+            self.logit = nn.Parameter(logit)
+        else:
+            self.register_buffer("logit", logit)
+
+    def forward(self, x: Tensor) -> Tensor:
+        t = int(x.shape[1])
+        csum = x.cumsum(dim=1)
+        if self.width >= t:
+            numer = csum
+        else:
+            prefix = torch.cat([torch.zeros_like(csum[:, :1]), csum[:, :-self.width]], dim=1)
+            numer = csum - prefix
+        denom = torch.arange(1, t + 1, device=x.device, dtype=x.dtype).clamp(max=self.width)
+        smear = numer / denom.view(1, t, 1)
+        gate = torch.sigmoid(self.logit).to(dtype=x.dtype, device=x.device)
+        return cast(Tensor, self.proj(smear) * gate)
+
+
 class EvolutionBlock(nn.Module):
     def __init__(self, dim: int, cfg: BlockConfig, norm_type: str = "layernorm"):
         super().__init__()
@@ -411,6 +441,8 @@ class EvolutionBlock(nn.Module):
                 router_cfgs.append(extra)
             elif isinstance(extra, LayerScaleConfig):
                 layerscale_cfgs.append(extra)
+            elif isinstance(extra, SmearGateConfig):
+                self.extras.append(SmearGateModule(extra, dim))
             elif isinstance(extra, CustomModuleConfig):
                 builder = get_component(extra.name)
                 if builder is not None:
@@ -554,6 +586,30 @@ class EvolutionBlock(nn.Module):
         return cast(Tensor, x - x_in)
 
 
+class SharedBlockProxy(nn.Module):
+    """Logical block wrapper that reuses an earlier block's weights."""
+
+    def __init__(self, target: EvolutionBlock, *, source_idx: int):
+        super().__init__()
+        object.__setattr__(self, "_target", target)
+        self.source_idx = int(source_idx)
+
+    def __getattr__(self, name: str) -> object:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            target = object.__getattribute__(self, "_target")
+            return getattr(target, name)
+
+    def forward(self, x: Tensor, x0: Tensor | None = None) -> Tensor:
+        target = object.__getattribute__(self, "_target")
+        return cast(Tensor, target(x, x0))
+
+    def delta(self, x: Tensor, *, x0: Tensor | None = None) -> Tensor:
+        target = object.__getattribute__(self, "_target")
+        return cast(Tensor, target.delta(x, x0=x0))
+
+
 class HyperConnections(nn.Module):
     """Hyper-residual controller: N residual lanes + per-layer mixing."""
 
@@ -627,10 +683,34 @@ class EvolutionModel(nn.Module):
         self.embed = nn.Embedding(vocab, cfg.emb.dim)
         init_std = float(getattr(cfg.emb, "init_std", 0.02) or 0.02)
         nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
+        self.bigram_hash_cfg = cfg.bigram_hash
+        self.bigram_hash_embed: nn.Embedding | None = None
+        self.bigram_hash_scale: nn.Parameter | None = None
+        if isinstance(cfg.bigram_hash, BigramHashConfig):
+            self.bigram_hash_embed = nn.Embedding(cfg.bigram_hash.buckets, cfg.emb.dim)
+            nn.init.normal_(
+                self.bigram_hash_embed.weight,
+                mean=0.0,
+                std=float(cfg.bigram_hash.init_std),
+            )
+            self.bigram_hash_scale = nn.Parameter(torch.tensor(float(cfg.bigram_hash.scale)))
         self.emb_dropout = nn.Dropout(float(getattr(cfg.emb, "dropout", 0.0) or 0.0))
-        self.blocks = nn.ModuleList(
-            [EvolutionBlock(cfg.emb.dim, block, norm_type=cfg.norm) for block in cfg.blocks]
-        )
+        built_blocks: dict[int, EvolutionBlock] = {}
+        logical_blocks: list[nn.Module] = []
+        for idx, block_cfg in enumerate(cfg.blocks):
+            share_source = cfg.resolve_share_source(idx)
+            if share_source == idx:
+                block = EvolutionBlock(cfg.emb.dim, block_cfg, norm_type=cfg.norm)
+                built_blocks[idx] = block
+                logical_blocks.append(block)
+                continue
+            target = built_blocks.get(share_source)
+            if target is None:
+                raise ValueError(
+                    f"Block {idx} shares with block {share_source}, but the source block was not built"
+                )
+            logical_blocks.append(SharedBlockProxy(target, source_idx=share_source))
+        self.blocks = nn.ModuleList(logical_blocks)
         self.hyper: HyperConnections | None = None
         hyper_cfg = getattr(cfg, "hyper", None)
         if isinstance(hyper_cfg, HyperConnectionsConfig) and hyper_cfg.streams > 1:
@@ -667,6 +747,15 @@ class EvolutionModel(nn.Module):
 
     def forward(self, input_ids: Tensor) -> Tensor:
         x = self.embed(input_ids)
+        if self.bigram_hash_embed is not None and self.bigram_hash_cfg is not None:
+            prev = torch.zeros_like(input_ids)
+            prev[:, 1:] = input_ids[:, :-1]
+            hashed = (
+                prev.to(torch.int64) * 1_315_423_911 + input_ids.to(torch.int64) * 2_654_435_761
+            ) % int(self.bigram_hash_cfg.buckets)
+            bigram = self.bigram_hash_embed(hashed)
+            scale = cast(torch.Tensor, self.bigram_hash_scale).to(dtype=x.dtype, device=x.device)
+            x = x + bigram * scale
         x = cast(Tensor, self.emb_dropout(x))
         x0 = x
         if self.hyper is not None and self.hyper.enabled():

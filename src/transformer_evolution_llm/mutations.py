@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from .dsl import (
     ArchitectureSpec,
     AssociativeMemoryConfig,
+    BigramHashConfig,
     BranchRouterConfig,
     ChunkMemoryConfig,
     CustomModuleConfig,
@@ -29,6 +30,7 @@ from .dsl import (
     RetroConfig,
     SoftmaxConfig,
     SSMConfig,
+    SmearGateConfig,
     UpdateFilterConfig,
 )
 from .template_mutation import (
@@ -227,8 +229,14 @@ def _clamp_feedback_sources(spec: ArchitectureSpec) -> None:
             if str(params.get("type", "")).lower() != "feedback":
                 continue
             src = params.get("source_block")
-            if isinstance(src, (int, float)):
+            if isinstance(src, int | float):
                 params["source_block"] = int(max(0, min(max_idx, int(src))))
+
+
+def _block_payload_without_share(block: Any) -> dict[str, Any]:
+    payload = block.describe()
+    payload.pop("share_with", None)
+    return payload
 
 
 def sanitize_topology(spec: ArchitectureSpec) -> ArchitectureSpec:
@@ -236,6 +244,17 @@ def sanitize_topology(spec: ArchitectureSpec) -> ArchitectureSpec:
     n_blocks = len(spec.model.blocks)
     if n_blocks <= 0:
         return spec
+
+    for idx, block in enumerate(spec.model.blocks):
+        share_with = getattr(block, "share_with", None)
+        if share_with is None:
+            continue
+        if share_with >= idx or share_with >= n_blocks:
+            block.share_with = None
+            continue
+        source = spec.model.blocks[int(share_with)]
+        if _block_payload_without_share(block) != _block_payload_without_share(source):
+            block.share_with = None
 
     for rec in spec.model.recurrences:
         start = int(max(0, min(n_blocks - 1, int(rec.start))))
@@ -483,12 +502,17 @@ def tune_optimizer(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSp
             opt.muon_nesterov = not bool(opt.muon_nesterov)
         if rng.random() < 0.5:
             opt.muon_ns_steps = int(rng.choice([2, 3, 4, 5, 6, 7]))
+        if rng.random() < 0.6:
+            opt.muon_momentum_warmup_start = float(rng.choice([0.75, 0.8, 0.85, 0.9, 0.93]))
+            opt.muon_momentum_warmup_steps = int(rng.choice([0, 100, 250, 500, 1000]))
     else:
         opt.betas = rng.choice([None, (0.9, 0.99), (0.9, 0.98), (0.95, 0.98)])
         opt.eps = None
         opt.muon_momentum = None
         opt.muon_nesterov = True
         opt.muon_ns_steps = 5
+        opt.muon_momentum_warmup_start = None
+        opt.muon_momentum_warmup_steps = 0
 
     return child
 
@@ -499,6 +523,8 @@ def mix_optimizer_recipe(spec: ArchitectureSpec, rng: random.Random) -> Architec
     ops: list[MutationFn] = [
         resample_optimizer_base,
         tune_optimizer,
+        tune_parameter_group_lrs,
+        tune_muon_momentum_warmup,
         toggle_gradient_transform_mode,
         tune_gradient_transform_ns_steps,
         tune_gradient_transform_eps,
@@ -598,11 +624,176 @@ def tune_warmup(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
 
 def tune_clip(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     child = clone_spec(spec)
-    choices = [0.5, 0.8, 1.0, 1.5, 2.0, 4.0]
+    choices = [0.0, 0.5, 0.8, 1.0, 1.5, 2.0, 4.0]
     current = float(getattr(child.train, "clip", 1.0) or 1.0)
     # Avoid a no-op when possible.
     options = [v for v in choices if abs(v - current) > 1e-9]
     child.train.clip = float(rng.choice(options or [current]))
+    return child
+
+
+def tune_warmdown(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    choices = [0, 200, 600, 1200, 2000, 3600]
+    current = int(getattr(child.train, "warmdown_steps", 0) or 0)
+    options = [v for v in choices if v != current]
+    child.train.warmdown_steps = int(rng.choice(options or [current]))
+    return child
+
+
+def tune_parameter_group_lrs(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    fields = ["matrix_lr", "scalar_lr"]
+    if bool(getattr(child.model.head, "tie_embeddings", True)):
+        fields.append("tied_embedding_lr")
+    else:
+        fields.extend(["embed_lr", "head_lr"])
+
+    field_options: dict[str, list[float | None]] = {
+        "tied_embedding_lr": [None, 0.03, 0.04, 0.05, 0.06, 0.08],
+        "embed_lr": [None, 0.3, 0.45, 0.6, 0.8],
+        "head_lr": [None, 0.004, 0.006, 0.008, 0.012],
+        "matrix_lr": [None, 0.02, 0.03, 0.04, 0.05, 0.06],
+        "scalar_lr": [None, 0.02, 0.03, 0.04, 0.05, 0.06],
+    }
+    tweaks = max(1, min(len(fields), int(rng.choice([1, 1, 2]))))
+    for field_name in rng.sample(fields, k=tweaks):
+        current = getattr(child.train, field_name, None)
+        choices = [
+            value
+            for value in field_options[field_name]
+            if not (
+                value is None
+                and current is None
+                or isinstance(value, float)
+                and current is not None
+                and abs(float(value) - float(current)) < 1e-12
+            )
+        ]
+        chosen = rng.choice(choices or field_options[field_name])
+        setattr(child.train, field_name, chosen)
+    return child
+
+
+def tune_tied_embedding_export_dtype(
+    spec: ArchitectureSpec,
+    rng: random.Random,
+) -> ArchitectureSpec:
+    del rng
+    child = clone_spec(spec)
+    if child.parameter_golf is None:
+        return child
+    if not bool(getattr(child.model.head, "tie_embeddings", True)):
+        child.parameter_golf.tied_embedding_export_dtype = "int8"
+        return child
+    current = str(child.parameter_golf.tied_embedding_export_dtype or "int8").lower()
+    child.parameter_golf.tied_embedding_export_dtype = "fp16" if current == "int8" else "int8"
+    return child
+
+
+def tune_parameter_golf_export_quant_mode(
+    spec: ArchitectureSpec,
+    rng: random.Random,
+) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    if child.parameter_golf is None:
+        return child
+    current = str(getattr(child.parameter_golf, "export_quant_mode", "int8") or "int8").lower()
+    options = [mode for mode in ("int8", "int6", "int5", "mixed_i5_i6") if mode != current]
+    child.parameter_golf.export_quant_mode = str(rng.choice(options or [current]))
+    return child
+
+
+def tune_embedding_init_std(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    choices = [0.003, 0.004, 0.005, 0.006, 0.0075, 0.01]
+    current = float(getattr(child.model.emb, "init_std", 0.02) or 0.02)
+    options = [value for value in choices if abs(value - current) > 1e-12]
+    child.model.emb.init_std = float(rng.choice(options or [current]))
+    return child
+
+
+def tune_parameter_golf_context(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    if child.parameter_golf is None:
+        return child
+    choices = [1024, 1536, 2048]
+    current = int(getattr(child.data, "seq_len", 1024) or 1024)
+    options = [value for value in choices if value != current]
+    seq_len = int(rng.choice(options or [current]))
+    target_batch_tokens = int(
+        getattr(child.train, "batch_tokens", 0) or (child.data.seq_len * child.data.batch_size)
+    )
+    batch_size_choices = [1, 2, 4, 8, 16, 32, 64]
+    feasible = [value for value in batch_size_choices if value * seq_len <= target_batch_tokens]
+    child.data.seq_len = seq_len
+    child.data.batch_size = int(max(feasible) if feasible else 1)
+    child.train.batch_tokens = max(target_batch_tokens, child.data.batch_size * child.data.seq_len)
+    if child.data.eval_tokens is not None:
+        child.data.eval_tokens = max(int(child.data.eval_tokens), child.data.seq_len)
+    if child.parameter_golf.val_batch_tokens is not None:
+        child.parameter_golf.val_batch_tokens = max(
+            int(child.parameter_golf.val_batch_tokens),
+            child.data.batch_size * child.data.seq_len,
+        )
+    return child
+
+
+def tune_optimizer_weight_decay(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    choices = [0.0, 0.0025, 0.005, 0.01, 0.02, 0.04]
+    current = float(
+        child.train.optimizer.weight_decay
+        if child.train.optimizer.weight_decay is not None
+        else child.train.weight_decay
+    )
+    options = [value for value in choices if abs(value - current) > 1e-12]
+    chosen = float(rng.choice(options or [current]))
+    child.train.optimizer.weight_decay = chosen
+    child.train.weight_decay = chosen
+    return child
+
+
+def tune_muon_momentum(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    optimizer = child.train.optimizer
+    if str(getattr(optimizer, "name", "adamw") or "adamw").lower() != "muon":
+        return child
+    choices = [0.9, 0.93, 0.95, 0.97, 0.98]
+    current = float(getattr(optimizer, "muon_momentum", 0.95) or 0.95)
+    options = [value for value in choices if abs(value - current) > 1e-12]
+    optimizer.muon_momentum = float(rng.choice(options or [current]))
+    return child
+
+
+def tune_muon_momentum_warmup(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    optimizer = child.train.optimizer
+    if str(getattr(optimizer, "name", "adamw") or "adamw").lower() != "muon":
+        return child
+
+    start_choices = [None, 0.75, 0.8, 0.85, 0.9, 0.93]
+    step_choices = [0, 100, 250, 500, 1000]
+    current_start = getattr(optimizer, "muon_momentum_warmup_start", None)
+    current_steps = int(getattr(optimizer, "muon_momentum_warmup_steps", 0) or 0)
+
+    start_options = [
+        value
+        for value in start_choices
+        if not (
+            value is None
+            and current_start is None
+            or isinstance(value, float)
+            and current_start is not None
+            and abs(float(value) - float(current_start)) < 1e-12
+        )
+    ]
+    step_options = [value for value in step_choices if int(value) != current_steps]
+
+    optimizer.muon_momentum_warmup_start = rng.choice(start_options or start_choices)
+    optimizer.muon_momentum_warmup_steps = int(rng.choice(step_options or step_choices))
+    if optimizer.muon_momentum_warmup_start is None:
+        optimizer.muon_momentum_warmup_steps = 0
     return child
 
 
@@ -642,6 +833,68 @@ def insert_graph_module(spec: ArchitectureSpec, rng: random.Random) -> Architect
         params={"ops": [{"op": "rmsnorm"}, {"op": "mlp", "hidden_mult": 2.0}]},
     )
     block.extras.append(module)
+    return child
+
+
+def insert_bigram_hash(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    if child.model.bigram_hash is not None:
+        return tune_bigram_hash(child, rng)
+    child.model.bigram_hash = BigramHashConfig(
+        buckets=int(rng.choice([2048, 4096, 8192, 10_240])),
+        scale=float(rng.choice([0.05, 0.1, 0.15, 0.2])),
+        init_std=float(rng.choice([0.01, 0.02, 0.03])),
+    )
+    return child
+
+
+def tune_bigram_hash(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    cfg = child.model.bigram_hash
+    if cfg is None:
+        return insert_bigram_hash(child, rng)
+    choice = rng.choice(["buckets", "scale", "init_std", "remove"])
+    if choice == "buckets":
+        cfg.buckets = int(rng.choice([2048, 4096, 8192, 10_240, 16_384]))
+    elif choice == "scale":
+        cfg.scale = float(rng.choice([0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3]))
+    elif choice == "init_std":
+        cfg.init_std = float(rng.choice([0.005, 0.01, 0.02, 0.03]))
+    else:
+        child.model.bigram_hash = None
+    return child
+
+
+def insert_smear_gate(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    block = rng.choice(child.model.blocks)
+    if any(isinstance(extra, SmearGateConfig) for extra in block.extras):
+        return tune_smear_gate(child, rng)
+    block.extras.append(
+        SmearGateConfig(
+            width=int(rng.choice([2, 4, 8, 16])),
+            init_weight=float(rng.choice([0.05, 0.1, 0.15, 0.2])),
+            learnable=True,
+        )
+    )
+    return child
+
+
+def tune_smear_gate(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    child = clone_spec(spec)
+    candidates: list[SmearGateConfig] = []
+    for block in child.model.blocks:
+        for extra in block.extras:
+            if isinstance(extra, SmearGateConfig):
+                candidates.append(extra)
+    if not candidates:
+        return insert_smear_gate(child, rng)
+    cfg = rng.choice(candidates)
+    choice = rng.choice(["width", "init_weight"])
+    if choice == "width":
+        cfg.width = int(rng.choice([2, 4, 8, 16, 32]))
+    else:
+        cfg.init_weight = float(rng.choice([0.03, 0.05, 0.1, 0.15, 0.2, 0.3]))
     return child
 
 
@@ -1827,6 +2080,41 @@ def add_additional_recurrence(spec: ArchitectureSpec, rng: random.Random) -> Arc
     return child
 
 
+def share_block_with_previous(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Reuse an earlier physical block while preserving logical depth."""
+    child = clone_spec(spec)
+    if len(child.model.blocks) < 2:
+        return child
+    target_idx = rng.randrange(1, len(child.model.blocks))
+    source_candidates = [idx for idx in child.model.physical_block_indices() if idx < target_idx]
+    if not source_candidates:
+        return child
+    source_idx = int(rng.choice(source_candidates))
+    target = child.model.blocks[target_idx]
+    source = child.model.blocks[source_idx].model_copy(deep=True)
+    source.share_with = source_idx
+    if getattr(target, "origin_id", None):
+        source.origin_id = target.origin_id
+    source.parent_origin = getattr(child.model.blocks[source_idx], "origin_id", None)
+    child.model.blocks[target_idx] = source
+    return sanitize_topology(child)
+
+
+def unshare_block(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
+    """Turn a shared logical block back into an independent physical block."""
+    child = clone_spec(spec)
+    shared_indices = [
+        idx
+        for idx, block in enumerate(child.model.blocks)
+        if getattr(block, "share_with", None) is not None
+    ]
+    if not shared_indices:
+        return child
+    target_idx = int(rng.choice(shared_indices))
+    child.model.blocks[target_idx].share_with = None
+    return sanitize_topology(child)
+
+
 def add_extra_combo(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec:
     """Attach multiple extras (retro + gated mix) to encourage hybrid blocks."""
     child = clone_spec(spec)
@@ -1854,6 +2142,8 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
     jitter_ops = [
         "duplicate_block_span",
         "shuffle_block_span",
+        "share_block_with_previous",
+        "unshare_block",
         "add_recurrence",
         "add_additional_recurrence",
         "toggle_hyper_connections",
@@ -1862,6 +2152,10 @@ def graph_jitter(spec: ArchitectureSpec, rng: random.Random) -> ArchitectureSpec
         "insert_retro_module",
         "insert_custom_module",
         "insert_graph_module",
+        "insert_bigram_hash",
+        "tune_bigram_hash",
+        "insert_smear_gate",
+        "tune_smear_gate",
         "insert_assoc_memory",
         "tune_assoc_memory",
         "insert_memory_tokens",
@@ -1907,7 +2201,11 @@ def mix_method_recipe(spec: ArchitectureSpec, rng: random.Random) -> Architectur
     ops: list[MutationFn] = [
         mix_optimizer_recipe,
         tune_warmup,
+        tune_warmdown,
         tune_clip,
+        tune_parameter_group_lrs,
+        tune_muon_momentum_warmup,
+        tune_parameter_golf_export_quant_mode,
         toggle_linear_attention,
         toggle_mla_attention,
         tune_softmax_policy,
@@ -1918,6 +2216,8 @@ def mix_method_recipe(spec: ArchitectureSpec, rng: random.Random) -> Architectur
         tune_router,
         shift_moe,
         make_gqa,
+        share_block_with_previous,
+        unshare_block,
         add_recurrence,
         tune_recurrence,
         insert_assoc_memory,
@@ -1928,6 +2228,10 @@ def mix_method_recipe(spec: ArchitectureSpec, rng: random.Random) -> Architectur
         tune_chunk_memory,
         insert_lookup_memory,
         tune_lookup_memory,
+        insert_bigram_hash,
+        tune_bigram_hash,
+        insert_smear_gate,
+        tune_smear_gate,
         toggle_branch_router,
         tune_branch_router,
         insert_layer_scale,
@@ -1949,6 +2253,8 @@ BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "duplicate_block_span": duplicate_block_span,
     "shuffle_block_span": shuffle_block_span,
     "remove_block_span": remove_block_span,
+    "share_block_with_previous": share_block_with_previous,
+    "unshare_block": unshare_block,
     "add_additional_recurrence": add_additional_recurrence,
     "remove_recurrence": remove_recurrence,
     "add_extra_combo": add_extra_combo,
@@ -1975,10 +2281,23 @@ BUILTIN_MUTATIONS: dict[str, MutationFn] = {
     "tune_update_filter_momentum_blend": tune_update_filter_momentum_blend,
     "tune_update_filter_block_size": tune_update_filter_block_size,
     "tune_warmup": tune_warmup,
+    "tune_warmdown": tune_warmdown,
     "tune_clip": tune_clip,
+    "tune_parameter_group_lrs": tune_parameter_group_lrs,
+    "tune_tied_embedding_export_dtype": tune_tied_embedding_export_dtype,
+    "tune_parameter_golf_export_quant_mode": tune_parameter_golf_export_quant_mode,
+    "tune_embedding_init_std": tune_embedding_init_std,
+    "tune_parameter_golf_context": tune_parameter_golf_context,
+    "tune_optimizer_weight_decay": tune_optimizer_weight_decay,
+    "tune_muon_momentum": tune_muon_momentum,
+    "tune_muon_momentum_warmup": tune_muon_momentum_warmup,
     "insert_retro_module": insert_retro_module,
     "insert_custom_module": insert_custom_module,
     "insert_graph_module": insert_graph_module,
+    "insert_bigram_hash": insert_bigram_hash,
+    "tune_bigram_hash": tune_bigram_hash,
+    "insert_smear_gate": insert_smear_gate,
+    "tune_smear_gate": tune_smear_gate,
     "insert_assoc_memory": insert_assoc_memory,
     "tune_assoc_memory": tune_assoc_memory,
     "insert_memory_tokens": insert_memory_tokens,

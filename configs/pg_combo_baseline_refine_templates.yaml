@@ -1,0 +1,69 @@
+templates:
+  - name: combo-baseline-refine-anchor
+    weight: 1.2
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+  - name: combo-baseline-refine-fp16
+    weight: 1.1
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.075
+          tied_embedding_export_dtype: fp16
+          tied_embed_init_std: 0.0045
+          warmup: 20
+          warmdown_steps: 900
+          clip: 0.0
+  - name: combo-baseline-refine-longer-tail
+    weight: 1.0
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.085
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 24
+          warmdown_steps: 1200
+          clip: 0.0
+  - name: combo-baseline-refine-softer-attn
+    weight: 0.95
+    conditions:
+      parameter_golf_only: true
+    actions:
+      - tune_optimizer:
+          optimizer_name: muon
+          lr: 0.04
+          matrix_lr: 0.04
+          scalar_lr: 0.04
+          tied_embedding_lr: 0.08
+          tied_embedding_export_dtype: int8
+          tied_embed_init_std: 0.005
+          warmup: 20
+          warmdown_steps: 600
+          clip: 0.0
+      - tune_attn:
+          selector: random
+          qk_norm: rms
+          softcap: 24.0

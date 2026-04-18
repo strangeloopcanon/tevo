@@ -21,6 +21,7 @@ from transformer_evolution_llm.dsl import (
     MacroConfig,
     MixerConfig,
     MixUnitConfig,
+    ParameterGolfConfig,
     ProjectionConfig,
     ResidualConfig,
     SoftmaxConfig,
@@ -156,4 +157,88 @@ def test_mutation_weights_must_be_positive(tiny_spec: ArchitectureSpec) -> None:
     spec = tiny_spec.model_copy(deep=True)
     spec.evolution.mutation_weights = {"mix_optimizer_recipe": 0.0}
     with pytest.raises(ValueError, match="must be > 0"):
+        ArchitectureSpec.model_validate(spec.model_dump(mode="python"))
+
+
+def test_parameter_golf_roundtrip(tiny_spec: ArchitectureSpec, tmp_path: Path) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    spec.train.clip = 0.0
+    spec.train.matrix_lr = 0.04
+    spec.train.scalar_lr = 0.03
+    spec.train.tied_embedding_lr = 0.05
+    spec.train.optimizer.muon_momentum_warmup_start = 0.85
+    spec.train.optimizer.muon_momentum_warmup_steps = 500
+    spec.parameter_golf = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        artifact_budget_bytes=16_000_000,
+        code_bytes=50_000,
+        track="10min",
+        seed_family="fp16_tied_embedding",
+        lane_kind="exportable",
+        exportable_family="fp16_tied_embedding",
+        tied_embedding_export_dtype="fp16",
+        max_wallclock_seconds=600.0,
+        val_batch_tokens=524_288,
+        val_loss_every=200,
+        train_log_every=50,
+    )
+
+    spec_path = tmp_path / "parameter_golf.yaml"
+    api.save_spec(spec, spec_path)
+    loaded = api.load_spec(spec_path)
+    assert loaded.parameter_golf is not None
+    assert loaded.parameter_golf.track == "10min"
+    assert loaded.parameter_golf.max_wallclock_seconds == pytest.approx(600.0)
+    assert loaded.parameter_golf.val_batch_tokens == 524_288
+    assert loaded.parameter_golf.val_loss_every == 200
+    assert loaded.parameter_golf.seed_family == "fp16_tied_embedding"
+    assert loaded.parameter_golf.exportable_family == "fp16_tied_embedding"
+    assert loaded.parameter_golf.tied_embedding_export_dtype == "fp16"
+    assert loaded.parameter_golf.export_quant_mode == "int8"
+    assert loaded.parameter_golf.eval_protocol == "mid_fidelity"
+    assert loaded.parameter_golf.report_eval_modes == ["standard"]
+    assert loaded.train.clip == pytest.approx(0.0)
+    assert loaded.train.matrix_lr == pytest.approx(0.04)
+    assert loaded.train.scalar_lr == pytest.approx(0.03)
+    assert loaded.train.tied_embedding_lr == pytest.approx(0.05)
+    assert loaded.train.optimizer.muon_momentum_warmup_start == pytest.approx(0.85)
+    assert loaded.train.optimizer.muon_momentum_warmup_steps == 500
+    assert loaded.summary()["physical_layers"] == loaded.model.physical_block_count()
+
+
+def test_parameter_golf_short_budget_defaults_to_scout_fast() -> None:
+    cfg = ParameterGolfConfig(
+        train_shards_glob="data/pg/train_*.bin",
+        val_shards_glob="data/pg/val_*.bin",
+        tokenizer_path="data/pg/sp1024.model",
+        max_wallclock_seconds=180.0,
+        report_eval_modes=["sliding64"],
+    )
+    assert cfg.eval_protocol == "scout_fast"
+    assert cfg.report_eval_modes == ["standard", "sliding64"]
+
+
+def test_midfidelity_parameter_golf_configs_load_with_600_second_protocols() -> None:
+    growth = api.load_spec(Path("configs/pg_midfidelity_growth_search.yaml"))
+    leader_overlap = api.load_spec(Path("configs/pg_midfidelity_public_leader_overlap_search.yaml"))
+
+    assert growth.parameter_golf is not None
+    assert growth.parameter_golf.max_wallclock_seconds == pytest.approx(600.0)
+    assert growth.parameter_golf.eval_protocol == "mid_fidelity"
+
+    assert leader_overlap.parameter_golf is not None
+    assert leader_overlap.parameter_golf.max_wallclock_seconds == pytest.approx(600.0)
+    assert leader_overlap.parameter_golf.eval_protocol == "mid_fidelity"
+    assert leader_overlap.parameter_golf.report_eval_modes == ["standard", "sliding64"]
+
+
+def test_shared_block_must_match_source(tiny_spec: ArchitectureSpec) -> None:
+    spec = tiny_spec.model_copy(deep=True)
+    block = spec.model.blocks[0].model_copy(deep=True)
+    block.ffn = DenseFFNConfig(type="dense", hidden=1024)
+    block.share_with = 0
+    spec.model.blocks.append(block)
+    with pytest.raises(ValueError, match="shares weights"):
         ArchitectureSpec.model_validate(spec.model_dump(mode="python"))
